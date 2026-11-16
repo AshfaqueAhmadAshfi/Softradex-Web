@@ -803,6 +803,7 @@ export function loadModule(): void {
       }).join('') || '<div class="slz-empty">No unmitigated ' + (side === 'buy' ? 'BUY demand OB/FVG' : 'SELL supply OB/FVG') + ' confirmed yet.</div>';
       if (listEl.innerHTML !== html) listEl.innerHTML = html;
     });
+    notifyChartModules();
   }
 
   function paintProfitRadar() {
@@ -899,9 +900,31 @@ export function loadModule(): void {
   }
 
   var lastRefreshSig = '';
+  var lastChartNotifySig = '';
   var lastSmcPrice = 0;
   var refreshTimer = null;
   var smcWorkerGen = 0;
+
+  function smcZoneSig(z) {
+    return [
+      z.id, z.kind, z.tf, z.entry, z.stop, z.tp1, z.tp2,
+      z.zoneLow, z.zoneHigh,
+      Array.isArray(z.tags) ? z.tags.join('+') : ''
+    ].join(':');
+  }
+
+  function notifyChartModules() {
+    if (typeof root.dispatchEvent !== 'function') return;
+    var b = (smcZones && smcZones.buy) || [];
+    var s = (smcZones && smcZones.sell) || [];
+    var sig = symbol + '|' +
+      b.map(smcZoneSig).join(',') + '|' +
+      s.map(smcZoneSig).join(',') + '|' +
+      (radarPlan ? [radarPlan.side, radarPlan.entry, radarPlan.stop, radarPlan.beTrigger, radarPlan.tp1, radarPlan.tp2, radarPlan.edgePct].join(':') : '');
+    if (sig === lastChartNotifySig) return;
+    lastChartNotifySig = sig;
+    root.dispatchEvent(new CustomEvent('chart:smc-radar-update'));
+  }
 
   function scheduleRefresh() {
     if (document && document.hidden) return;
@@ -974,6 +997,7 @@ export function loadModule(): void {
               }
               paintSmartMoney();
               paintProfitRadar();
+              notifyChartModules();
             })
             .catch(function () {});
         } else {
@@ -993,6 +1017,7 @@ export function loadModule(): void {
     }
     paintSmartMoney();
     paintProfitRadar();
+    notifyChartModules();
   }
 
   function setSymbol(next) {
@@ -1001,6 +1026,7 @@ export function loadModule(): void {
     symbol = s;
     smcWorkerGen++;
     lastRefreshSig = '';
+    lastChartNotifySig = '';
     lastSmcPrice = 0;
     quote = null;
     smcZones = { buy: [], sell: [] };

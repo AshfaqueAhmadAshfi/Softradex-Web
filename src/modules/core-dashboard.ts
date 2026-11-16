@@ -2007,9 +2007,31 @@ export function loadModule(): void {
     const priceUp = $('chart-price-up');
     const priceDown = $('chart-price-down');
     const priceReset = $('chart-price-reset');
-    if (priceUp) priceUp.addEventListener('click', () => { pricePan += 0.15; scheduleChartRender(); });
-    if (priceDown) priceDown.addEventListener('click', () => { pricePan -= 0.15; scheduleChartRender(); });
-    if (priceReset) priceReset.addEventListener('click', () => { priceZoom = 1; pricePan = 0; scheduleChartRender(); });
+    if (priceUp) priceUp.addEventListener('click', () => {
+      if (window.ChartIndicators && window.ChartIndicators.active && window.ChartIndicators.active().length && window.ChartIndicators.scaleYBy) {
+        window.ChartIndicators.scaleYBy(1.22);
+        return;
+      }
+      pricePan += 0.15;
+      scheduleChartRender();
+    });
+    if (priceDown) priceDown.addEventListener('click', () => {
+      if (window.ChartIndicators && window.ChartIndicators.active && window.ChartIndicators.active().length && window.ChartIndicators.scaleYBy) {
+        window.ChartIndicators.scaleYBy(0.82);
+        return;
+      }
+      pricePan -= 0.15;
+      scheduleChartRender();
+    });
+    if (priceReset) priceReset.addEventListener('click', () => {
+      if (window.ChartIndicators && window.ChartIndicators.active && window.ChartIndicators.active().length) {
+        window.ChartIndicators.resetZoom();
+        return;
+      }
+      priceZoom = 1;
+      pricePan = 0;
+      scheduleChartRender();
+    });
 
     // --- Click: Handle "▶ TO LIVE" Button ---
     canvas.addEventListener('click', function (e) {

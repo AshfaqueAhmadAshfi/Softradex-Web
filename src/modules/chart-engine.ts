@@ -1994,10 +1994,14 @@ export function loadModule(): void {
   var STORE_KEY = 'softradex.chart.ind2';   // v2: the study bar now opens with MSB · OB on
   var ZOOM_KEY = 'softradex.chart.ind.zoom';
   var TF_SECONDS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
-  var CANDLE_COUNT = 500;
+  var CANDLE_COUNT = 1500;
+  var MAX_HISTORY_COUNT = 5000;
   var REFRESH_MS = 12000;
   var lastRenderKey = '';
   var paneSizes = new WeakMap();
+  var paneRadar = new WeakMap();
+  var paneHover = new WeakMap();
+  var fvgCache = { key: '', res: null };
   var paneObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(function (entries) {
     var changed = false;
     entries.forEach(function (entry) {
@@ -2044,9 +2048,17 @@ export function loadModule(): void {
     text: '#1f2937',
     muted: '#64748b',
     grid: '#e6edf9',
-    tagBg: 'rgba(255, 255, 255, 0.88)',
-    zoneBuyFill: '#e6f5ef',
-    zoneSellFill: '#fdebef'
+    tagBg: 'rgba(255, 255, 255, 0.90)',
+    fvgUpLine: 'rgba(5, 150, 105, 0.85)',
+    fvgDownLine: 'rgba(220, 38, 38, 0.85)',
+    obUpLine: 'rgba(4, 120, 87, 0.85)',
+    obDownLine: 'rgba(185, 28, 28, 0.85)',
+    radarEntry: '#2563eb',
+    radarSl: '#dc2626',
+    radarBe: '#d97706',
+    radarTp1: '#059669',
+    radarTp2: '#0d9488',
+    radarRingBg: '#ffffff'
   };
   var DARK_COLORS = {
     background: '#0b1220',
@@ -2060,9 +2072,17 @@ export function loadModule(): void {
     text: '#e2e8f0',
     muted: '#94a3b8',
     grid: 'rgba(148, 163, 184, 0.14)',
-    tagBg: 'rgba(15, 23, 42, 0.88)',
-    zoneBuyFill: 'rgba(16, 185, 129, 0.16)',
-    zoneSellFill: 'rgba(239, 68, 68, 0.16)'
+    tagBg: 'rgba(15, 23, 42, 0.90)',
+    fvgUpLine: 'rgba(52, 211, 153, 0.88)',
+    fvgDownLine: 'rgba(248, 113, 113, 0.88)',
+    obUpLine: 'rgba(52, 211, 153, 0.90)',
+    obDownLine: 'rgba(248, 113, 113, 0.90)',
+    radarEntry: '#60a5fa',
+    radarSl: '#f87171',
+    radarBe: '#fbbf24',
+    radarTp1: '#34d399',
+    radarTp2: '#2dd4bf',
+    radarRingBg: '#0b1220'
   };
   var COLORS = Object.assign({}, LIGHT_COLORS);
   function syncIndicatorTheme() {
@@ -2104,17 +2124,24 @@ export function loadModule(): void {
   var livePriceAt = 0;
   var dataToken = 0;
   var loading = false;
+  var historyTarget = CANDLE_COUNT;
+  var historyLoading = false;
+  var historyMaxed = false;
   var refreshTimer = null;
 
   var geometry = null;        // chart:geometry (bar slot, price band, pan)
   var stack = null;           // #chart-indicator-stack
   // shared viewport for every pane: how many bars are in view and how far
-  // back the reader panned (TradingView style wheel zoom + drag pan)
-  // 78 bars fills the pane like a TradingView chart; 140 made every candle a
-  // hairline. offset 0 = the newest bar sits on the right edge.
-  var view = { bars: 78, offset: 0 };
-  var MIN_BARS = 24;
-  var MAX_BARS = 500;
+  // back the reader panned (TradingView style wheel zoom + drag pan + y-scale drag)
+  // 78 bars fills the pane like a TradingView chart. offset 0 = newest bar sits on right edge.
+  function defaultRightOffset(barCount) {
+    var b = isFinite(barCount) ? barCount : (view.bars || 78);
+    return -Math.max(4, Math.min(20, Math.round(b * 0.13)));
+  }
+
+  var view = { bars: 78, offset: -10, yZoom: 1, yPan: 0 };
+  var MIN_BARS = 6;
+  var MAX_BARS = 800;
   (function restoreZoom() {
     try {
       var savedBars = Number(localStorage.getItem(ZOOM_KEY));
@@ -2122,12 +2149,264 @@ export function loadModule(): void {
         view.bars = Math.round(savedBars);
       }
     } catch (e) {}
+    view.offset = defaultRightOffset(view.bars);
   })();
   function saveZoom() {
     try { localStorage.setItem(ZOOM_KEY, String(Math.round(view.bars))); } catch (e) {}
   }
   var rafPending = false;
   var toastTimer = null;
+  var signalStack = [];       // [{ id, kind, side, label, price, stop, tp1, tp2, zoneLow, zoneHigh, showSl, touchPrice, extremeAnchor }]
+  var dismissedSignals = {};  // { [id]: { side, bandLow, bandHigh, slBreach } }
+  var lastSignalPrice = 0;
+  var beaconTimer = null;
+
+  function stopBeaconPulse() {
+    if (beaconTimer) {
+      clearInterval(beaconTimer);
+      beaconTimer = null;
+    }
+  }
+
+  function syncBeaconPulse() {
+    if (signalStack.length > 0 && !document.hidden) {
+      if (!beaconTimer) {
+        beaconTimer = setInterval(function () {
+          if (signalStack.length > 0 && !document.hidden) schedule();
+          else stopBeaconPulse();
+        }, 90);
+      }
+    } else {
+      stopBeaconPulse();
+    }
+  }
+
+  function currentBeaconPulse() {
+    if (!signalStack.length) return 0;
+    return 0.5 + 0.5 * Math.sin(Date.now() * 0.0065);
+  }
+
+  function collectSmartMoneyLevels() {
+    var engine = window.SmartMoneyZones;
+    var st = engine && typeof engine.state === 'function' ? engine.state() : null;
+    var levels = [];
+    if (st && sameMarket(st.symbol, dataSymbol) && st.smc) {
+      ['buy', 'sell'].forEach(function (side) {
+        var rows = Array.isArray(st.smc[side]) ? st.smc[side] : [];
+        rows.forEach(function (z) {
+          var lbl = zoneLabelKind(z);
+          var zLo = Number(z.zoneLow), zHi = Number(z.zoneHigh);
+          var px = Number(z.entry) || ((zLo + zHi) * 0.5);
+          if (!lbl || !isFinite(px) || px <= 0) return;
+          var fallbackRisk = Math.max(px * 0.0015, Math.abs(zHi - zLo));
+          var sl = isFinite(Number(z.stop)) && Number(z.stop) > 0
+            ? Number(z.stop) : (side === 'buy' ? px - fallbackRisk : px + fallbackRisk);
+          var risk = Math.max(px * 0.0004, Math.abs(px - sl));
+          var tp1 = isFinite(Number(z.tp1)) && Number(z.tp1) > 0
+            ? Number(z.tp1) : (side === 'buy' ? px + risk * 1.5 : px - risk * 1.5);
+          var tp2 = isFinite(Number(z.tp2)) && Number(z.tp2) > 0
+            ? Number(z.tp2) : (side === 'buy' ? px + risk * 2.5 : px - risk * 2.5);
+          levels.push({
+            id: 'smc:' + (z.id || (side + ':' + lbl + ':' + px.toFixed(4))),
+            kind: 'smc',
+            side: side,
+            isFvg: lbl.indexOf('FVG') >= 0,
+            label: lbl,
+            price: px,
+            stop: sl,
+            tp1: tp1,
+            tp2: tp2,
+            zoneLow: isFinite(zLo) ? zLo : px,
+            zoneHigh: isFinite(zHi) ? zHi : px,
+            dist: isFinite(Number(z.distPct)) ? Number(z.distPct) : 99
+          });
+        });
+      });
+    }
+    return levels;
+  }
+
+  function collectSignalLevels() {
+    var out = collectSmartMoneyLevels();
+    var pr = window.ProfitRadar && typeof window.ProfitRadar.state === 'function' ? window.ProfitRadar.state() : null;
+    var radar = pr && pr.radar;
+    if (radar && sameMarket(pr.symbol, dataSymbol) && Number(radar.entry) > 0 && Number(radar.stop) > 0) {
+      var side = String(radar.side || 'BUY').toLowerCase() === 'sell' ? 'sell' : 'buy';
+      var entry = Number(radar.entry);
+      out.push({
+        id: 'radar:entry',
+        kind: 'radar',
+        side: side,
+        isFvg: false,
+        label: 'PROFIT RADAR · ' + (side === 'buy' ? 'BUY' : 'SELL'),
+        price: entry,
+        stop: Number(radar.stop),
+        tp1: Number(radar.tp1),
+        tp2: Number(radar.tp2),
+        zoneLow: entry,
+        zoneHigh: entry,
+        dist: livePrice > 0 ? Math.abs(livePrice - entry) / livePrice * 100 : 0
+      });
+    }
+    return out;
+  }
+
+  function levelMetrics(lv) {
+    var risk = Math.max(lv.price * 0.00035, Math.abs(lv.price - lv.stop));
+    var touchPad = Math.max(lv.price * 0.00018, Math.min(risk * 0.22, 1.4));
+    var bandPad = lv.kind === 'radar'
+      ? Math.max(lv.price * 0.00014, Math.min(risk * 0.14, 0.90))
+      : touchPad * 0.45;
+    var bandLow = Math.min(lv.price, isFinite(lv.zoneLow) ? lv.zoneLow : lv.price) - bandPad;
+    var bandHigh = Math.max(lv.price, isFinite(lv.zoneHigh) ? lv.zoneHigh : lv.price) + bandPad;
+    var tpConfirmMove = Math.max(lv.price * 0.00022, Math.min(risk * 0.16, 1.3));
+    var slMargin = Math.max(lv.price * 0.00022, risk * 0.30);
+    var slBreach;
+    if (lv.side === 'buy') {
+      var bLow = Math.min(lv.price, isFinite(lv.zoneLow) ? lv.zoneLow : lv.price);
+      slBreach = Math.max(lv.stop, Math.min(lv.price - slMargin, bLow - Math.max(lv.price * 0.00012, risk * 0.14)));
+    } else {
+      var bHigh = Math.max(lv.price, isFinite(lv.zoneHigh) ? lv.zoneHigh : lv.price);
+      slBreach = Math.min(lv.stop, Math.max(lv.price + slMargin, bHigh + Math.max(lv.price * 0.00012, risk * 0.14)));
+    }
+    return {
+      risk: risk, touchPad: touchPad, bandLow: bandLow, bandHigh: bandHigh,
+      tpConfirmMove: tpConfirmMove, slBreach: slBreach
+    };
+  }
+
+  function isSlDirection(lv, m, price) {
+    return lv.side === 'buy' ? price <= m.slBreach : price >= m.slBreach;
+  }
+
+  function hasArrivedAtLevel(lv, m, price, prevPrice) {
+    if (price >= m.bandLow && price <= m.bandHigh) return true;
+    if (prevPrice > 0 && isFinite(prevPrice) && !isSlDirection(lv, m, prevPrice)) {
+      if ((prevPrice - lv.price) * (price - lv.price) <= 0) return true;
+    }
+    return false;
+  }
+
+  function evaluateLiveSignal(price) {
+    if (!(price > 0) || !isFinite(price)) {
+      if (signalStack.length) { signalStack = []; syncBeaconPulse(); }
+      return;
+    }
+    var levels = collectSignalLevels();
+    var byId = Object.create(null);
+    levels.forEach(function (lv) { byId[lv.id] = lv; });
+
+    // Sync stack entries with live panel data and prune any vanished zones
+    var pruned = [];
+    for (var si = 0; si < signalStack.length; si++) {
+      var cur = signalStack[si];
+      var fresh = byId[cur.id];
+      if (!fresh) continue;
+      pruned.push(Object.assign({}, cur, {
+        label: fresh.label,
+        side: fresh.side,
+        price: fresh.price,
+        stop: fresh.stop,
+        tp1: fresh.tp1,
+        tp2: fresh.tp2,
+        zoneLow: fresh.zoneLow,
+        zoneHigh: fresh.zoneHigh
+      }));
+    }
+    signalStack = pruned;
+
+    // Remember which IDs were already dismissed entering this tick so clearing a cooldown never re-arms on the same tick.
+    var blockedThisTick = Object.create(null);
+    Object.keys(dismissedSignals).forEach(function (id) {
+      blockedThisTick[id] = true;
+      var d = dismissedSignals[id];
+      var rearmPad = d.touchPad * 0.25;
+      var stillInSameZones = (d.side === 'buy' ? price <= d.bandHigh + rearmPad : price >= d.bandLow - rearmPad);
+      if (!byId[id] || !stillInSameZones) delete dismissedSignals[id];
+    });
+
+    // Rule 2, Rule 3 & Rule 4b: prune ANY stacked level whose SL was breached, and update TP progress
+    var surviving = [];
+    for (var si2 = 0; si2 < signalStack.length; si2++) {
+      var sItem = signalStack[si2];
+      var sM = levelMetrics(sItem);
+      if (isSlDirection(sItem, sM, price)) {
+        dismissedSignals[sItem.id] = {
+          side: sItem.side, bandLow: sM.bandLow, bandHigh: sM.bandHigh, touchPad: sM.touchPad
+        };
+        blockedThisTick[sItem.id] = true;
+        continue;
+      }
+      if (sItem.side === 'buy') {
+        sItem.extremeAnchor = Math.min(sItem.extremeAnchor, price);
+        if ((price - sItem.extremeAnchor) >= sM.tpConfirmMove || price >= sItem.price + sM.tpConfirmMove) {
+          sItem.showSl = true;
+        }
+      } else {
+        sItem.extremeAnchor = Math.max(sItem.extremeAnchor, price);
+        if ((sItem.extremeAnchor - price) >= sM.tpConfirmMove || price <= sItem.price - sM.tpConfirmMove) {
+          sItem.showSl = true;
+        }
+      }
+      surviving.push(sItem);
+    }
+    signalStack = surviving;
+
+    // Rule 1 & Rule 4a: check if market arrived at a new SMART MONEY or PROFIT RADAR level
+    var curTop = signalStack.length ? signalStack[signalStack.length - 1] : null;
+    var curTopM = curTop ? levelMetrics(curTop) : null;
+    var candidates = [];
+    for (var li = 0; li < levels.length; li++) {
+      var lv = levels[li];
+      if (dismissedSignals[lv.id] || blockedThisTick[lv.id]) continue;
+      if (signalStack.some(function (s) { return s.id === lv.id; })) continue;
+      var m = levelMetrics(lv);
+      if (isSlDirection(lv, m, price)) continue;
+      if (curTop && curTopM) {
+        var minSep = Math.max(price * 0.0003, Math.min(m.risk, curTopM.risk) * 0.40);
+        if (Math.abs(lv.price - curTop.price) < minSep) continue;
+      }
+      if (hasArrivedAtLevel(lv, m, price, lastSignalPrice)) {
+        candidates.push({ lv: lv, m: m, d: Math.abs(price - lv.price) });
+      }
+    }
+    if (candidates.length) {
+      candidates.sort(function (a, b) {
+        if (curTop && (a.lv.side !== curTop.side) !== (b.lv.side !== curTop.side)) {
+          return a.lv.side !== curTop.side ? -1 : 1;
+        }
+        return a.d - b.d;
+      });
+      var chosen = candidates[0].lv;
+      signalStack.push({
+        id: chosen.id,
+        kind: chosen.kind,
+        side: chosen.side,
+        label: chosen.label,
+        price: chosen.price,
+        stop: chosen.stop,
+        tp1: chosen.tp1,
+        tp2: chosen.tp2,
+        zoneLow: chosen.zoneLow,
+        zoneHigh: chosen.zoneHigh,
+        showSl: false,
+        touchPrice: price,
+        extremeAnchor: price
+      });
+      if (signalStack.length > 4) signalStack.shift();
+    }
+
+    lastSignalPrice = price;
+    syncBeaconPulse();
+  }
+
+  function liveSignalSig() {
+    if (!signalStack.length) return '0';
+    var top = signalStack[signalStack.length - 1];
+    var pulseBucket = Math.round(currentBeaconPulse() * 5);
+    return signalStack.length + ':' + top.id + ':' + (top.showSl ? '1' : '0') + ':' +
+      top.price.toFixed(3) + ':' + pulseBucket;
+  }
 
   function $(id) { return document.getElementById(id); }
 
@@ -2183,6 +2462,7 @@ export function loadModule(): void {
         now - at > 30000 || at > now + 5000) return false;
     livePrice = price;
     livePriceAt = at;
+    evaluateLiveSignal(livePrice);
     // Keep the live forming candle synchronized with TradingView ticks in-place
     // so historical references remain intact and studies only recalculate tail updates.
     var last = bars[bars.length - 1];
@@ -2222,12 +2502,14 @@ export function loadModule(): void {
     return out;
   }
 
-  function loadBars() {
+  function loadBars(requestedCount) {
     var symbol = currentSymbol();
     var tf = currentTf();
     if (!symbol) return;
     var instrument = mappedInstrument(symbol);
-    var key = symbol + '|' + tf + '|' + instrument;
+    var wanted = Math.max(CANDLE_COUNT, Math.min(MAX_HISTORY_COUNT, Number(requestedCount) || historyTarget || CANDLE_COUNT));
+    var isBackfill = wanted > Math.max(CANDLE_COUNT, bars.length) && dataSymbol === symbol && dataTf === tf && dataInstrument === instrument;
+    var key = symbol + '|' + tf + '|' + instrument + '|' + wanted;
     if (barsRequest && barsRequestKey === key) return;
     if (barsRequest) barsRequest.abort();
     var token = ++dataToken;
@@ -2237,17 +2519,21 @@ export function loadModule(): void {
     if (dataSymbol !== symbol || dataTf !== tf || dataInstrument !== instrument) {
       bars = [];
       livePrice = livePriceAt = 0;
+      historyTarget = CANDLE_COUNT;
+      historyMaxed = false;
+      wanted = CANDLE_COUNT;
     }
     dataSymbol = symbol;
     dataTf = tf;
     dataInstrument = instrument;
     dataError = '';
-    loading = true;
+    if (isBackfill) historyLoading = true;
+    else loading = true;
     syncButtons();
     schedule();
-    var timeout = setTimeout(function () { controller.abort(); }, 25000);
+    var timeout = setTimeout(function () { controller.abort(); }, wanted > 1500 ? 30000 : 25000);
     var url = (instrument ? '/api/chart/tvcandles' : '/api/chart/candles') +
-      '?symbol=' + encodeURIComponent(symbol) + '&tf=' + encodeURIComponent(tf) + '&count=' + CANDLE_COUNT;
+      '?symbol=' + encodeURIComponent(symbol) + '&tf=' + encodeURIComponent(tf) + '&count=' + wanted;
     if (instrument) url += '&tv_symbol=' + encodeURIComponent(instrument);
     fetch(url, { cache: 'no-store', signal: controller.signal })
       .then(function (response) { return response.ok ? response.json() : null; })
@@ -2257,6 +2543,7 @@ export function loadModule(): void {
             data.tf !== tf || data.tv_symbol !== instrument)) throw new Error('TradingView candles unavailable');
         var next = normalise(data && data.bars);
         if (!next.length) throw new Error('Candles unavailable');
+        var prevLen = bars.length;
         // Never allow a smaller background response to shrink existing history and trigger auto zoom-in.
         if (bars.length >= 250 && next.length < bars.length * 0.8 &&
             dataSymbol === symbol && dataTf === tf && dataInstrument === instrument) {
@@ -2266,9 +2553,12 @@ export function loadModule(): void {
             if (bars[pi].t < firstNextT) prefix.push(bars[pi]);
             else break;
           }
-          bars = prefix.concat(next).slice(-CANDLE_COUNT);
+          bars = prefix.concat(next).slice(-MAX_HISTORY_COUNT);
         } else {
           bars = next;
+        }
+        if (wanted > CANDLE_COUNT && bars.length < Math.min(wanted * 0.85, MAX_HISTORY_COUNT) && bars.length <= prevLen) {
+          historyMaxed = true;
         }
         view.offset = clampOffset(view.offset);
         if (!acceptQuote(window.SOFT_TV_QUOTE) && !(livePrice > 0)) {
@@ -2279,17 +2569,24 @@ export function loadModule(): void {
       })
       .catch(function () {
         if (token !== dataToken) return;
-        dataError = instrument ? 'TradingView candles unavailable' : 'Market candles unavailable';
-        // Keep only this instrument's cached bars. No proxy-feed fallback.
+        if (!bars.length) dataError = instrument ? 'TradingView candles unavailable' : 'Market candles unavailable';
       })
       .finally(function () {
         clearTimeout(timeout);
         if (token !== dataToken) return;
         barsRequest = null;
         loading = false;
+        historyLoading = false;
         syncButtons();
         schedule();
       });
+  }
+
+  function maybeLoadMoreHistory(visibleStart) {
+    if (!bars.length || loading || historyLoading || historyMaxed) return;
+    if (visibleStart > 80 || historyTarget >= MAX_HISTORY_COUNT) return;
+    historyTarget = Math.min(MAX_HISTORY_COUNT, Math.max(bars.length, historyTarget) + 1500);
+    loadBars(historyTarget);
   }
 
   function armRefresh() {
@@ -2681,24 +2978,29 @@ export function loadModule(): void {
   // pixels (scaled to the pane width). The price band is per pane, from the
   // candles it actually has on screen.
   function candleView(w, h) {
-    var axisW = 56;
-    var padT = 6;
+    var axisW = 68;
+    var padT = 8;
     var padB = 12;
     var chartW = Math.max(48, w - axisW);
-    // the panes show more history than the main chart: the studies need
-    // enough swings (zigzag 9) for their structure to read at this size
     var total = bars.length;
-    var wantBars = isFinite(view.bars) ? view.bars : 140;
-    var wantBack = isFinite(view.offset) ? Math.max(0, view.offset) : 0;
-    var visible = Math.max(8, Math.min(wantBars, total));
-    var slot = chartW / Math.max(8, visible);
-    var rightEdgeX = chartW - slot;
-    var end = Math.max(visible, Math.min(total, total - wantBack));
-    var start = Math.max(0, Math.min(end, total) - visible);
+    var wantBars = isFinite(view.bars) ? view.bars : 78;
+    var visible = Math.max(4, Math.min(wantBars, total || wantBars));
+    var slot = chartW / Math.max(4, visible);
+    var minBack = -Math.max(4, visible - 5);
+    var maxBack = Math.max(0, total - 5);
+    var wantBack = isFinite(view.offset)
+      ? Math.max(minBack, Math.min(maxBack, view.offset))
+      : defaultRightOffset(wantBars);
+    var baseRightX = chartW - slot;
+    var rightFloat = (total - 1) - wantBack;
 
-    // index mapping only: no clock arithmetic, so the candles always land
-    // inside the pane even when the feed's stamps and the chart's differ
-    function xAt(index) { return rightEdgeX - (end - 1 - index) * slot; }
+    // Continuous float index mapping: supports both panning back into history (> 0)
+    // and TradingView-style leftward dragging into right-side future margin (< 0).
+    function xAt(index) { return baseRightX - (rightFloat - index) * slot; }
+    var rightEdgeX = total ? xAt(total - 1) : baseRightX;
+
+    var start = total ? Math.max(0, Math.min(total - 1, Math.floor(rightFloat - visible))) : 0;
+    var end = total ? Math.max(start + 1, Math.min(total, Math.ceil(rightFloat + 1.5))) : 0;
 
     var min = Infinity, max = -Infinity;
     for (var i = start; i < end && i < total; i++) {
@@ -2715,15 +3017,21 @@ export function loadModule(): void {
       max = isFinite(max) ? max * 1.001 : 1;
       if (max <= min) max = min + 1;
     }
-    var pad = (max - min) * 0.04;   // tighter price band = bigger candles
-    var plotMin = min - pad;
-    var plotMax = max + pad;
+    var basePad = (max - min) * 0.05;
+    var baseSpan = Math.max(1e-8, (max - min) + basePad * 2);
+    var baseMid = (max + min) * 0.5;
+    var yZoom = Math.max(0.15, Math.min(8, Number(view.yZoom) || 1));
+    var yPan = Number(view.yPan) || 0;
+    var scaledSpan = baseSpan / yZoom;
+    var center = baseMid + yPan * baseSpan;
+    var plotMin = center - scaledSpan * 0.5;
+    var plotMax = center + scaledSpan * 0.5;
     var plotH = Math.max(20, h - padT - padB);
 
     return {
       w: w, h: h, chartW: chartW, axisW: axisW, padT: padT, plotH: plotH,
       slot: slot, rightEdgeX: rightEdgeX, start: start, end: end,
-      plotMin: plotMin, plotMax: plotMax,
+      plotMin: plotMin, plotMax: plotMax, baseSpan: baseSpan, yZoom: yZoom,
       xAt: xAt,
       yOf: function (p) {
         return padT + plotH - ((p - plotMin) / (plotMax - plotMin)) * plotH;
@@ -2797,8 +3105,10 @@ export function loadModule(): void {
   }
 
   function drawLivePrice(c, v, digits) {
-    if (!livePrice || v.end !== bars.length) return;
+    if (!livePrice) return;
+    if (v.end !== bars.length && (livePrice < v.plotMin || livePrice > v.plotMax)) return;
     var y = v.yOf(livePrice);
+    if (!isFinite(y) || y < v.padT - 8 || y > v.padT + v.plotH + 8) return;
     var last = bars[bars.length - 1];
     var color = last && livePrice < last.o ? COLORS.down : COLORS.up;
     line(c, 0, y, v.chartW, y, color, 1, [3, 3]);
@@ -2809,82 +3119,679 @@ export function loadModule(): void {
     c.textAlign = 'left';
     c.textBaseline = 'middle';
     c.fillStyle = '#ffffff';
-    c.fillText(livePrice.toFixed(digits), v.chartW + 3, y);
+    c.fillText(formatChartPx(livePrice, digits), v.chartW + 5, y);
     c.restore();
   }
 
-  function liquidityLevels() {
-    var engine = window.StopLiquidity;
-    if (!engine || typeof engine.state !== 'function') return [];
-    var state = engine.state();
-    if (!state || state.symbol !== dataSymbol || state.tvSymbol !== dataInstrument || !dataInstrument ||
-        currentSymbol() !== dataSymbol || currentTf() !== dataTf) return [];
-    // Exactly the top four BUY and SELL levels shown by the side panel.
-    return (state.visibleZones || []).filter(function (z) {
-      return (z.side === 'buy' || z.side === 'sell') && isFinite(Number(z.price)) && Number(z.price) > 0;
-    }).map(function (z) {
-      return {id:z.id, side:z.side, price:Number(z.price), touches:z.touches, fresh:state.fresh};
-    });
+  function normMarketKey(sym) {
+    return String(sym || '').trim().toUpperCase().replace(/M$/i, '').replace(/[^A-Z0-9]/g, '');
   }
 
-  function drawLiquidityZones(c, v, digits) {
-    var levels = liquidityLevels();
-    if (!levels.length) return;
-    var top = v.padT + 9, bottom = v.padT + v.plotH - 9;
-    var rows = levels.map(function (z) {
-      var y = v.yOf(z.price);
-      return {zone:z, y:y, target:Math.max(top, Math.min(bottom, y)), labelY:0};
-    }).sort(function (a,b) {return a.target-b.target || b.zone.price-a.zone.price;});
-    var gap = Math.min(18, (bottom-top) / Math.max(1, rows.length-1));
-    rows.forEach(function (r,i) { r.labelY = Math.max(r.target, i ? rows[i-1].labelY+gap : top); });
-    rows[rows.length-1].labelY = Math.min(bottom, rows[rows.length-1].labelY);
-    for (var i=rows.length-2; i>=0; i--) rows[i].labelY = Math.min(rows[i].labelY, rows[i+1].labelY-gap);
-    rows.forEach(function (r) {
-      var z = r.zone, color = z.side === 'buy' ? COLORS.up : COLORS.down;
-      var inRange = r.y >= v.padT && r.y <= v.padT+v.plotH;
-      var price = z.price.toLocaleString('en-US', {minimumFractionDigits:digits, maximumFractionDigits:digits});
-      var text = (inRange ? '' : (r.y < top ? '↑ ' : '↓ ')) +
-        z.side.toUpperCase() + ' SL · ' + price;
-      c.save();
-      if (!z.fresh) c.globalAlpha = 0.5;
-      c.font = '600 9px "JetBrains Mono", monospace';
-      var labelW = c.measureText(text).width + 10;
-      var labelX = Math.max(2, v.chartW - labelW - 6);
-      if (inRange) {
-        // Keep only a compact right-edge price pointer instead of a full-width line across candles.
-        line(c, labelX + labelW, r.labelY, v.chartW, r.y, color, 1.2);
+  function sameMarket(a, b) {
+    var left = normMarketKey(a), right = normMarketKey(b);
+    return !!(left && right && (left === right ||
+      (left === 'GOLD' && right === 'XAUUSD') || (left === 'XAUUSD' && right === 'GOLD')));
+  }
+
+  function formatChartPx(value, digits) {
+    var n = Number(value);
+    if (!isFinite(n) || n <= 0) return '—';
+    return n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  }
+
+  function computeChartFVGs(series) {
+    var sk = seriesKey(series);
+    if (sk && fvgCache.key === sk && fvgCache.res) return fvgCache.res;
+    var n = series ? series.length : 0;
+    if (n < 15) {
+      var empty = [];
+      fvgCache = { key: sk, res: empty };
+      return empty;
+    }
+    var trSum = 0, trCount = 0;
+    for (var t = Math.max(1, n - 20); t < n; t++) {
+      var prevC = series[t - 1].c;
+      var tr = Math.max(series[t].h - series[t].l, Math.abs(series[t].h - prevC), Math.abs(series[t].l - prevC));
+      if (isFinite(tr) && tr > 0) { trSum += tr; trCount++; }
+    }
+    var atr = trCount ? trSum / trCount : 0;
+    if (!(atr > 0)) {
+      var none = [];
+      fvgCache = { key: sk, res: none };
+      return none;
+    }
+
+    var out = [];
+    var scanFrom = Math.max(1, n - 120);
+    for (var i = scanFrom; i < n - 1; i++) {
+      var prev = series[i - 1], next = series[i + 1];
+      if (next.l > prev.h && (next.l - prev.h) >= atr * 0.14) {
+        var bullFilled = false;
+        for (var k1 = i + 2; k1 < n; k1++) {
+          if (series[k1].l <= prev.h) { bullFilled = true; break; }
+        }
+        if (!bullFilled) {
+          var bEntry = (prev.h + next.l) * 0.5;
+          var bStop = Math.min(prev.l, prev.h - atr * 0.35);
+          var bRisk = Math.max(atr * 0.4, bEntry - bStop);
+          out.push({
+            side: 'buy',
+            label: 'FVG',
+            entry: bEntry,
+            stop: bStop,
+            tp1: bEntry + bRisk * 1.5,
+            tp2: bEntry + bRisk * 2.5,
+            zoneLow: prev.h,
+            zoneHigh: next.l,
+            fromIdx: Math.max(0, i - 1),
+            rightIdx: n - 1
+          });
+        }
       }
-      c.fillStyle = z.side === 'buy' ? COLORS.zoneBuyFill : COLORS.zoneSellFill;
-      c.fillRect(labelX, r.labelY-7, labelW, 14);
-      c.strokeStyle = color;
-      c.lineWidth = 1;
-      c.strokeRect(labelX, r.labelY-7, labelW, 14);
-      c.fillStyle = color;
+      if (next.h < prev.l && (prev.l - next.h) >= atr * 0.14) {
+        var bearFilled = false;
+        for (var k2 = i + 2; k2 < n; k2++) {
+          if (series[k2].h >= prev.l) { bearFilled = true; break; }
+        }
+        if (!bearFilled) {
+          var sEntry = (next.h + prev.l) * 0.5;
+          var sStop = Math.max(prev.h, prev.l + atr * 0.35);
+          var sRisk = Math.max(atr * 0.4, sStop - sEntry);
+          out.push({
+            side: 'sell',
+            label: 'FVG',
+            entry: sEntry,
+            stop: sStop,
+            tp1: sEntry - sRisk * 1.5,
+            tp2: sEntry - sRisk * 2.5,
+            zoneLow: next.h,
+            zoneHigh: prev.l,
+            fromIdx: Math.max(0, i - 1),
+            rightIdx: n - 1
+          });
+        }
+      }
+    }
+    var trimmed = out.slice(-10);
+    fvgCache = { key: sk, res: trimmed };
+    return trimmed;
+  }
+
+  function zoneLabelKind(zone) {
+    var tags = Array.isArray(zone.tags) ? zone.tags.join(' ') : '';
+    var text = (String(zone.kind || '') + ' ' + tags).toUpperCase();
+    var hasOb = text.indexOf('OB') >= 0;
+    var hasFvg = text.indexOf('FVG') >= 0;
+    if (!hasOb && !hasFvg) return '';
+    var core = hasOb && hasFvg ? 'OB + FVG' : (hasFvg ? 'FVG' : 'OB');
+    return zone.tf ? (core + ' · ' + zone.tf) : core;
+  }
+
+  function overlapsPrice(aLow, aHigh, bLow, bHigh) {
+    var hi = Math.min(aHigh, bHigh), lo = Math.max(aLow, bLow);
+    if (hi <= lo) return false;
+    var span = Math.min(aHigh - aLow, bHigh - bLow);
+    return span > 0 && (hi - lo) / span >= 0.55;
+  }
+
+  function drawBeaconBulb(c, x, y, color, pulse) {
+    if (!isFinite(x) || !isFinite(y)) return;
+    c.save();
+    c.beginPath();
+    c.arc(x, y, 7.5 + pulse * 3.5, 0, Math.PI * 2);
+    c.fillStyle = hexAlpha(color, 0.22 + pulse * 0.16);
+    c.fill();
+    c.shadowColor = color;
+    c.shadowBlur = 12 + pulse * 8;
+    c.beginPath();
+    c.arc(x, y, 4.2 + pulse * 0.6, 0, Math.PI * 2);
+    c.fillStyle = color;
+    c.fill();
+    c.shadowBlur = 0;
+    c.beginPath();
+    c.arc(x, y, 1.7, 0, Math.PI * 2);
+    c.fillStyle = '#ffffff';
+    c.fill();
+    c.restore();
+  }
+
+  function drawZoneGuides(c, v, digits, z, lineLeft, includeSl, entryY) {
+    var usedTagY = [entryY - 6];
+    var items = [];
+    if (includeSl) items.push({ key: 'SL', val: z.stop, col: COLORS.down, dash: [4, 3] });
+    items.push({ key: 'TP1', val: z.tp1, col: COLORS.up, dash: [2, 3] });
+    items.push({ key: 'TP2', val: z.tp2, col: COLORS.up, dash: [2, 3] });
+    var guides = [];
+    items.forEach(function (gd) {
+      if (!isFinite(gd.val) || gd.val <= 0) return;
+      var gy = v.yOf(gd.val);
+      if (!isFinite(gy)) return;
+      var inView = gy >= v.padT + 6 && gy <= v.padT + v.plotH - 6;
+      if (inView) {
+        line(c, lineLeft + 10, gy, v.chartW, gy, gd.col, 1.2, gd.dash);
+        var tagY = gy - 7;
+        if (usedTagY.some(function (py) { return Math.abs(py - tagY) < 12; })) tagY = gy + 8;
+        tagY = Math.max(v.padT + 7, Math.min(v.padT + v.plotH - 7, tagY));
+        usedTagY.push(tagY);
+        tag(c, gd.key + ' · ' + formatChartPx(gd.val, digits), v.chartW - 6, tagY, gd.col, 'right', v.chartW);
+        guides.push({ key: gd.key, val: gd.val, onScreen: true });
+      } else {
+        var arrow = gy < v.padT + 6 ? ' ↑' : ' ↓';
+        var edgeY = gy < v.padT + 6 ? (v.padT + 8) : (v.padT + v.plotH - 8);
+        while (usedTagY.some(function (py) { return Math.abs(py - edgeY) < 12; })) {
+          edgeY += gy < v.padT + 6 ? 12 : -12;
+        }
+        edgeY = Math.max(v.padT + 7, Math.min(v.padT + v.plotH - 7, edgeY));
+        usedTagY.push(edgeY);
+        tag(c, gd.key + ' · ' + formatChartPx(gd.val, digits) + arrow, v.chartW - 6, edgeY, gd.col, 'right', v.chartW);
+        guides.push({ key: gd.key, val: gd.val, onScreen: false });
+      }
+    });
+    return guides;
+  }
+
+  function drawSmartMoneyZones(c, v, digits, holder) {
+    var levels = collectSmartMoneyLevels();
+    if (!levels.length) return [];
+
+    var liveFocus = signalStack.length ? signalStack[signalStack.length - 1] : null;
+    levels.forEach(function (z) {
+      z.dist = livePrice > 0 ? Math.abs(livePrice - z.price) / livePrice * 100 : (z.dist || 99);
+    });
+    levels.sort(function (a, b) {
+      if (liveFocus) {
+        if (a.id === liveFocus.id && b.id !== liveFocus.id) return -1;
+        if (b.id === liveFocus.id && a.id !== liveFocus.id) return 1;
+      }
+      return a.dist - b.dist;
+    });
+
+    var lineLeft = Math.max(8, v.chartW - Math.min(160, Math.round(v.chartW * 0.24)));
+    var hoverId = holder ? (paneHover.get(holder) || '') : '';
+    if (hoverId && hoverId.indexOf('smc:') !== 0) {
+      var pr = window.ProfitRadar && typeof window.ProfitRadar.state === 'function' ? window.ProfitRadar.state() : null;
+      if (pr && pr.radar && sameMarket(pr.symbol, dataSymbol) &&
+          (hoverId === 'sl' || hoverId === 'entry' || hoverId === 'be' || hoverId === 'tp1' || hoverId === 'tp2')) {
+        return [];
+      }
+    }
+    var hoverIsSmc = hoverId.indexOf('smc:') === 0 && levels.some(function (lvl) { return lvl.id === hoverId; });
+    if (hoverId.indexOf('smc:') === 0 && !hoverIsSmc && holder) {
+      paneHover.set(holder, '');
+      hoverId = '';
+    }
+
+    var usedY = [];
+    var visibleLevels = [];
+    levels.forEach(function (z) {
+      if (hoverIsSmc && z.id !== hoverId) return;
+      if (z.price < v.plotMin || z.price > v.plotMax) return;
+      var y = v.yOf(z.price);
+      if (!isFinite(y) || y < v.padT + 10 || y > v.padT + v.plotH - 8) return;
+      // Keep spacing clean so labels & thin right-side rays never overlap.
+      if (!hoverIsSmc && usedY.some(function (py) { return Math.abs(py - y) < 15; })) return;
+      usedY.push(y);
+      visibleLevels.push({ z: z, y: y });
+    });
+
+    if (hoverIsSmc && !visibleLevels.length) {
+      hoverIsSmc = false;
+      hoverId = '';
+      if (holder) paneHover.set(holder, '');
+      levels.forEach(function (z) {
+        if (z.price < v.plotMin || z.price > v.plotMax) return;
+        var y = v.yOf(z.price);
+        if (!isFinite(y) || y < v.padT + 10 || y > v.padT + v.plotH - 8) return;
+        if (usedY.some(function (py) { return Math.abs(py - y) < 15; })) return;
+        usedY.push(y);
+        visibleLevels.push({ z: z, y: y });
+      });
+    }
+
+    var pulse = currentBeaconPulse();
+    var orderedLevels = visibleLevels.slice().sort(function (a, b) {
+      var aFocus = (hoverId === a.z.id) || (!hoverId && liveFocus && liveFocus.kind === 'smc' && liveFocus.id === a.z.id);
+      var bFocus = (hoverId === b.z.id) || (!hoverId && liveFocus && liveFocus.kind === 'smc' && liveFocus.id === b.z.id);
+      if (aFocus !== bFocus) return aFocus ? 1 : -1;
+      return 0;
+    });
+    var targets = [];
+    orderedLevels.forEach(function (entry) {
+      var z = entry.z;
+      var y = entry.y;
+      var active = hoverId === z.id;
+      var isLit = !hoverId && liveFocus && liveFocus.kind === 'smc' && liveFocus.id === z.id;
+      var dimmed = !hoverId && liveFocus && !isLit;
+      var up = z.side === 'buy';
+      var stroke = z.isFvg ? (up ? COLORS.fvgUpLine : COLORS.fvgDownLine) : (up ? COLORS.obUpLine : COLORS.obDownLine);
+      var textColor = up ? COLORS.up : COLORS.down;
+
+      c.save();
+      if (isLit) {
+        // Glowing beam under the active lit zone line
+        c.save();
+        c.globalAlpha = 0.22 + pulse * 0.16;
+        c.strokeStyle = textColor;
+        c.lineWidth = 4.5 + pulse * 2.5;
+        c.beginPath();
+        c.moveTo(lineLeft, y);
+        c.lineTo(v.chartW, y);
+        c.stroke();
+        c.restore();
+      }
+
+      c.globalAlpha = (active || isLit) ? 0.98 : (dimmed ? 0.30 : 0.56);
+      c.strokeStyle = stroke;
+      c.lineWidth = (active || isLit) ? 1.7 : 1;
+      if (z.isFvg) c.setLineDash([4, 4]);
+      c.beginPath();
+      c.moveTo(lineLeft, y);
+      c.lineTo(v.chartW, y);
+      c.stroke();
+      c.setLineDash([]);
+
+      c.font = ((active || isLit) ? '700 ' : '600 ') + '8.5px "JetBrains Mono", monospace';
+      var tw = c.measureText(z.label).width + 6;
+      var lx = Math.max(4, Math.min(v.chartW - tw - 48, lineLeft));
+      var ly = Math.max(v.padT + 7, y - 6);
+      c.globalAlpha = (active || isLit) ? 0.98 : (dimmed ? 0.45 : 0.88);
+      c.fillStyle = COLORS.tagBg;
+      c.fillRect(lx, ly - 5.5, tw, 11);
+      if (active || isLit) {
+        c.save();
+        if (isLit) {
+          c.shadowColor = textColor;
+          c.shadowBlur = 10 + pulse * 6;
+        }
+        c.strokeStyle = textColor;
+        c.lineWidth = 1;
+        c.strokeRect(lx + 0.5, ly - 5.5, tw - 1, 11);
+        c.restore();
+      }
+      c.globalAlpha = (active || isLit) ? 1 : (dimmed ? 0.5 : 0.92);
+      c.fillStyle = textColor;
       c.textAlign = 'left';
       c.textBaseline = 'middle';
-      c.fillText(text, labelX+5, r.labelY);
+      c.fillText(z.label, lx + 3, ly);
+
+      if (isLit) drawBeaconBulb(c, Math.max(8, lx - 9), ly, textColor, pulse);
+
+      var guides = [];
+      if (active || isLit) {
+        c.globalAlpha = 1;
+        c.fillStyle = textColor;
+        c.fillRect(v.chartW, y - 8, v.axisW, 16);
+        c.font = '600 9px "JetBrains Mono", monospace';
+        c.fillStyle = '#ffffff';
+        c.fillText(formatChartPx(z.price, digits), v.chartW + 3, y);
+
+        var showSl = active ? true : !!(liveFocus && liveFocus.showSl);
+        guides = drawZoneGuides(c, v, digits, z, lineLeft, showSl, y);
+      }
+      c.restore();
+
+      var slStr = formatChartPx(z.stop, digits);
+      var tp1Str = formatChartPx(z.tp1, digits);
+      var tp2Str = formatChartPx(z.tp2, digits);
+      targets.push({
+        id: z.id,
+        kind: 'smc',
+        lit: !!isLit,
+        showSl: isLit ? !!(liveFocus && liveFocus.showSl) : active,
+        y: y,
+        lineLeft: lineLeft,
+        lineRight: v.chartW,
+        lx: lx,
+        ly: ly,
+        tw: tw,
+        cx: lx + tw * 0.5,
+        cy: ly,
+        color: textColor,
+        title: 'SMART MONEY · ' + z.label,
+        tag: (up ? 'TP UP ↑' : 'TP DOWN ↓') + ' · 1.5R / 2.5R',
+        pxText: 'SL: ' + slStr + '  |  TP1: ' + tp1Str + '  |  TP2: ' + tp2Str,
+        clipped: false,
+        guides: guides,
+        sub: 'Entry ' + formatChartPx(z.price, digits) + ' · Zone ' + formatChartPx(z.zoneLow, digits) + '–' + formatChartPx(z.zoneHigh, digits)
+      });
+    });
+    return targets;
+  }
+
+  function radarSignature() {
+    var engine = window.SmartMoneyZones;
+    var st = engine && typeof engine.state === 'function' ? engine.state() : null;
+    if (!st || !sameMarket(st.symbol, dataSymbol)) return '';
+    var zoneSig = function (z) {
+      return [z.id, z.kind, z.tf, z.entry, z.stop, z.tp1, z.tp2, z.zoneLow, z.zoneHigh, Array.isArray(z.tags) ? z.tags.join('+') : ''].join(':');
+    };
+    var b = st.smc && Array.isArray(st.smc.buy) ? st.smc.buy.map(zoneSig).join(',') : '';
+    var s = st.smc && Array.isArray(st.smc.sell) ? st.smc.sell.map(zoneSig).join(',') : '';
+    var r = st.radar;
+    var rk = r ? [r.side, r.edgePct, r.entry, r.stop, r.beTrigger, r.tp1, r.tp2].join(':') : '';
+    return b + '|' + s + '|' + rk;
+  }
+
+  function buildRadarMarkers(v, digits) {
+    var pr = window.ProfitRadar && typeof window.ProfitRadar.state === 'function' ? window.ProfitRadar.state() : null;
+    var radar = pr && pr.radar;
+    if (!radar || !sameMarket(pr.symbol, dataSymbol) || !(radar.entry > 0)) return [];
+    var passedChecks = Array.isArray(radar.checks) ? radar.checks.filter(function (ck) { return ck && ck.ok; }).length : 0;
+    var totalChecks = Array.isArray(radar.checks) ? radar.checks.length : 6;
+    var rrText = isFinite(radar.rr) ? ('1:' + Number(radar.rr).toFixed(2)) : '1:2.50';
+    var sideEdge = radar.side + ' EDGE ' + radar.edgePct + '%';
+
+    var slStr = formatChartPx(radar.stop, digits);
+    var tp1Str = formatChartPx(radar.tp1, digits);
+    var tp2Str = formatChartPx(radar.tp2, digits);
+    var tpSlSummary = 'SL ' + slStr + ' · TP1 ' + tp1Str + ' · TP2 ' + tp2Str;
+
+    var raw = [
+      {
+        id: 'sl',
+        code: 'SL',
+        badge: 'SAFE SL',
+        price: Number(radar.stop),
+        color: COLORS.radarSl,
+        tag: '-' + Number(radar.stopPct || 0).toFixed(2) + '%',
+        title: 'PROFIT RADAR · SAFE SL',
+        sub: (radar.slPoolProtected ? 'Pool-protected SL' : '1.35x ATR structural SL') + ' · TP1 ' + tp1Str + ' · TP2 ' + tp2Str
+      },
+      {
+        id: 'entry',
+        code: 'E',
+        badge: radar.side + ' ENTRY',
+        price: Number(radar.entry),
+        color: COLORS.radarEntry,
+        tag: sideEdge,
+        title: 'PROFIT RADAR · ' + radar.side + ' ENTRY',
+        sub: passedChecks + '/' + totalChecks + ' checks · ' + rrText + ' · ' + tpSlSummary
+      },
+      {
+        id: 'be',
+        code: 'BE',
+        badge: 'BE (+1R)',
+        price: Number(radar.beTrigger),
+        color: COLORS.radarBe,
+        tag: '+1.0R',
+        title: 'PROFIT RADAR · BREAK-EVEN (+1R)',
+        sub: 'SL->Entry (' + formatChartPx(radar.entry, digits) + ') · ' + tpSlSummary
+      },
+      {
+        id: 'tp1',
+        code: 'T1',
+        badge: 'TP1',
+        price: Number(radar.tp1),
+        color: COLORS.radarTp1,
+        tag: '+' + Number(radar.tp1R || 1.5).toFixed(1) + 'R',
+        title: 'PROFIT RADAR · TP1 LOCK',
+        sub: 'Close 50% (' + Number(radar.tp1R || 1.5).toFixed(1) + 'R) · SL ' + slStr + ' · TP2 ' + tp2Str
+      },
+      {
+        id: 'tp2',
+        code: 'T2',
+        badge: 'TP2',
+        price: Number(radar.tp2),
+        color: COLORS.radarTp2,
+        tag: rrText + ' R:R',
+        title: 'PROFIT RADAR · TP2 TARGET',
+        sub: 'Final ' + rrText + ' target · SL ' + slStr + ' · TP1 ' + tp1Str
+      }
+    ].filter(function (m) { return isFinite(m.price) && m.price > 0; });
+
+    var baseX = Math.max(24, Math.min(v.chartW - 14, v.rightEdgeX + Math.max(11, v.slot * 1.35)));
+    var minY = v.padT + 10, maxY = v.padT + v.plotH - 10;
+    var items = raw.map(function (m) {
+      var rawY = v.yOf(m.price);
+      var clipped = rawY < v.padT ? 'up' : (rawY > v.padT + v.plotH ? 'down' : false);
+      var cy = Math.max(minY, Math.min(maxY, rawY));
+      return Object.assign(m, {
+        pxText: formatChartPx(m.price, digits),
+        rawY: rawY,
+        cy: cy,
+        cx: baseX,
+        clipped: clipped,
+        r: 5
+      });
+    }).sort(function (a, b) { return a.cy - b.cy; });
+
+    // Stagger horizontally when markers sit close in Y so every small circle stays crisp and hoverable.
+    for (var i = 0; i < items.length; i++) {
+      for (var step = 0; step < 5; step++) {
+        var collide = false;
+        for (var j = 0; j < i; j++) {
+          if (Math.hypot(items[i].cx - items[j].cx, items[i].cy - items[j].cy) < 15) {
+            collide = true;
+            break;
+          }
+        }
+        if (!collide) break;
+        var nextX = baseX - (step + 1) * 16;
+        if (nextX >= 20) {
+          items[i].cx = nextX;
+        } else {
+          items[i].cy = Math.max(minY, Math.min(maxY, items[i].cy + (items[i].cy < (minY + maxY) * 0.5 ? 14 : -14)));
+        }
+      }
+    }
+    return items;
+  }
+
+  function syncRadarTooltip(holder, marker, w, h) {
+    if (!holder) return;
+    var tip = holder.querySelector('.chart-radar-tooltip');
+    if (!marker) {
+      if (tip) {
+        tip.hidden = true;
+        tip.dataset.sig = '';
+      }
+      return;
+    }
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.className = 'chart-radar-tooltip';
+      tip.setAttribute('role', 'status');
+      tip.setAttribute('aria-live', 'polite');
+      holder.appendChild(tip);
+    }
+    var clipHint = marker.clipped === 'up' ? ' ↑ above view' : (marker.clipped === 'down' ? ' ↓ below view' : '');
+    var sig = marker.id + '|' + marker.pxText + '|' + marker.tag + '|' + clipHint + '|' + marker.sub;
+    if (tip.dataset.sig !== sig) {
+      tip.dataset.sig = sig;
+      tip.innerHTML =
+        '<div class="crt-head">' +
+          '<span class="crt-dot" style="background:' + marker.color + '"></span>' +
+          '<span class="crt-title">' + marker.title + '</span>' +
+          '<span class="crt-tag" style="color:' + marker.color + ';border-color:' + hexAlpha(marker.color, 0.4) + ';background:' + hexAlpha(marker.color, 0.14) + '">' + marker.tag + '</span>' +
+        '</div>' +
+        '<div class="crt-price">' + marker.pxText + (clipHint ? '<small>' + clipHint + '</small>' : '') + '</div>' +
+        '<div class="crt-sub">' + marker.sub + '</div>';
+    }
+    tip.hidden = false;
+    var tipW = tip.offsetWidth || 235;
+    var tipH = tip.offsetHeight || 64;
+    var left = marker.kind === 'smc'
+      ? (marker.lx - tipW - 10 >= 6 ? marker.lx - tipW - 10 : marker.cx + 14)
+      : marker.cx + 14;
+    if (left + tipW > w - 8) left = (marker.kind === 'smc' ? marker.lx : marker.cx) - tipW - 14;
+    left = Math.max(8, Math.min(Math.max(8, w - tipW - 8), left));
+    var top = Math.max(8, Math.min(Math.max(8, h - tipH - 10), marker.cy - tipH * 0.5));
+    tip.style.left = Math.round(left) + 'px';
+    tip.style.top = Math.round(top) + 'px';
+  }
+
+  function drawProfitRadarCircles(c, v, digits, holder, w, h, smcTargets) {
+    var markers = buildRadarMarkers(v, digits);
+    var hoverId = holder ? (paneHover.get(holder) || '') : '';
+    var hoveredSmc = (hoverId.indexOf('smc:') === 0 && Array.isArray(smcTargets))
+      ? (smcTargets.find(function (t) { return t.id === hoverId; }) || null)
+      : null;
+
+    // While hovering an OB / FVG item, hide all Profit Radar circles so only that focused OB / FVG remains.
+    if (hoveredSmc) {
+      if (holder) {
+        paneRadar.set(holder, { markers: [], smcTargets: smcTargets || [], w: w, h: h, chartW: v.chartW });
+        syncRadarTooltip(holder, hoveredSmc, w, h);
+      }
+      return;
+    }
+
+    var hovered = hoverId ? (markers.find(function (m) { return m.id === hoverId; }) || null) : null;
+    var liveFocus = signalStack.length ? signalStack[signalStack.length - 1] : null;
+    var liveRadarLit = !hovered && liveFocus && liveFocus.kind === 'radar';
+    var pulse = currentBeaconPulse();
+
+    var visibleMarkers;
+    if (hovered) {
+      visibleMarkers = markers.filter(function (m) {
+        return m.id === hoverId || m.id === 'sl' || m.id === 'tp1' || m.id === 'tp2';
+      });
+    } else if (liveRadarLit) {
+      visibleMarkers = markers.filter(function (m) {
+        return m.id === 'entry' || m.id === 'tp1' || m.id === 'tp2' || (liveFocus.showSl && m.id === 'sl');
+      });
+    } else {
+      visibleMarkers = markers;
+    }
+
+    if (holder) {
+      paneRadar.set(holder, {
+        markers: visibleMarkers,
+        smcTargets: hovered ? [] : (smcTargets || []),
+        w: w,
+        h: h,
+        chartW: v.chartW
+      });
+    }
+
+    var usedTagY = [];
+    visibleMarkers.forEach(function (m) {
+      var active = hovered && m.id === hoverId;
+      var isLitEntry = liveRadarLit && m.id === 'entry';
+      var isLitTarget = liveRadarLit && (m.id === 'tp1' || m.id === 'tp2' || (liveFocus.showSl && m.id === 'sl'));
+      c.save();
+      if (hovered || isLitEntry || isLitTarget) {
+        var guideLeft = Math.max(8, Math.min(m.cx - 18, v.chartW - 145));
+        if (!m.clipped) {
+          line(c, guideLeft, m.cy, v.chartW, m.cy, m.color, (active || isLitEntry) ? 1.45 : 1.05, [3, 3]);
+        }
+        var arrow = m.clipped === 'up' ? ' ↑' : (m.clipped === 'down' ? ' ↓' : '');
+        var tagY = m.clipped ? (m.clipped === 'up' ? v.padT + 8 : v.padT + v.plotH - 8) : (m.cy - 8);
+        while (usedTagY.some(function (py) { return Math.abs(py - tagY) < 13; })) {
+          tagY += m.clipped === 'down' ? -13 : 13;
+        }
+        tagY = Math.max(v.padT + 7, Math.min(v.padT + v.plotH - 7, tagY));
+        usedTagY.push(tagY);
+        var tagLabel = (m.id === 'sl' ? 'SL' : m.id === 'tp1' ? 'TP1' : m.id === 'tp2' ? 'TP2' : m.badge) +
+          ' · ' + m.pxText + arrow;
+        tag(c, tagLabel, Math.min(m.cx - 8, v.chartW - 6), tagY, m.color, 'right', v.chartW);
+
+        if ((active || isLitEntry) && !m.clipped) {
+          c.fillStyle = m.color;
+          c.fillRect(v.chartW, m.cy - 8, v.axisW, 16);
+          c.font = '600 9px "JetBrains Mono", monospace';
+          c.textAlign = 'left';
+          c.textBaseline = 'middle';
+          c.fillStyle = '#ffffff';
+          c.fillText(m.pxText, v.chartW + 3, m.cy);
+        }
+      }
+
+      if (isLitEntry) {
+        drawBeaconBulb(c, m.cx, m.cy, m.color, pulse);
+      } else {
+        if (!hovered && liveFocus && !liveRadarLit) c.globalAlpha = 0.45;
+        // Subtle radar halo ring around each small dot
+        c.beginPath();
+        c.arc(m.cx, m.cy, (active || isLitTarget) ? 10 : 7.5, 0, Math.PI * 2);
+        c.strokeStyle = hexAlpha(m.color, (active || isLitTarget) ? 0.62 : 0.34);
+        c.lineWidth = (active || isLitTarget) ? 1.5 : 1;
+        c.stroke();
+
+        // Main small Profit Radar circle
+        c.beginPath();
+        c.arc(m.cx, m.cy, (active || isLitTarget) ? 6.5 : 4.8, 0, Math.PI * 2);
+        c.fillStyle = m.color;
+        c.fill();
+        c.lineWidth = 1.5;
+        c.strokeStyle = COLORS.radarRingBg;
+        c.stroke();
+
+        // Tiny inner core dot for clean radar bullseye look
+        c.beginPath();
+        c.arc(m.cx, m.cy, (active || isLitTarget) ? 2.2 : 1.6, 0, Math.PI * 2);
+        c.fillStyle = COLORS.radarRingBg;
+        c.fill();
+      }
       c.restore();
     });
+
+    if (holder) {
+      if (hoverId && !hovered) paneHover.set(holder, '');
+      syncRadarTooltip(holder, hovered, w, h);
+    }
+  }
+
+  function nicePriceStep(span, plotH, minStep) {
+    var target = Math.max(4, Math.min(12, Math.floor(plotH / 44)));
+    var rough = span / target;
+    if (!(rough > 0) || !isFinite(rough)) return 1;
+    var mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    var norm = rough / mag;
+    var mult = norm <= 1.15 ? 1 : norm <= 2.2 ? 2 : norm <= 2.9 ? 2.5 : norm <= 5.5 ? 5 : 10;
+    var step = mult * mag;
+    return minStep > 0 ? Math.max(minStep, step) : step;
   }
 
   function drawGrid(c, v, digits) {
     c.save();
     c.strokeStyle = COLORS.grid;
     c.lineWidth = 1;
+    c.beginPath();
+    c.moveTo(v.chartW + 0.5, 0);
+    c.lineTo(v.chartW + 0.5, v.h);
+    c.stroke();
+
     c.fillStyle = COLORS.muted;
-    c.font = '600 8px "JetBrains Mono", monospace';
+    c.font = '600 8.5px "JetBrains Mono", monospace';
     c.textAlign = 'left';
     c.textBaseline = 'middle';
-    for (var g = 0; g <= 3; g++) {
-      var y = v.padT + v.plotH * (g / 3);
+
+    if (digits <= 0) {
+      for (var g = 0; g <= 3; g++) {
+        var gy = v.padT + v.plotH * (g / 3);
+        c.beginPath();
+        c.moveTo(0, gy);
+        c.lineTo(v.chartW, gy);
+        c.stroke();
+      }
+      c.restore();
+      return;
+    }
+
+    var span = v.plotMax - v.plotMin;
+    var minStep = Math.pow(10, -digits);
+    var step = nicePriceStep(span, v.plotH, minStep);
+    var stepDecimals = step >= 1 && Math.abs(step - Math.round(step)) < 1e-6
+      ? Math.min(digits, 2)
+      : Math.min(digits, Math.max(0, Math.ceil(-Math.log10(step) - 1e-6) + (Math.abs((step * Math.pow(10, Math.floor(-Math.log10(step)))) - 2.5) < 0.01 ? 1 : 0)));
+    var firstTick = Math.ceil(v.plotMin / step) * step;
+    var maxLines = 28;
+    for (var idx = 0; idx < maxLines; idx++) {
+      var tickPrice = Number((firstTick + idx * step).toFixed(8));
+      if (tickPrice > v.plotMax) break;
+      var y = v.yOf(tickPrice);
+      if (y < v.padT + 8 || y > v.padT + v.plotH - 8) continue;
+      c.strokeStyle = COLORS.grid;
       c.beginPath();
       c.moveTo(0, y);
       c.lineTo(v.chartW, y);
       c.stroke();
-      if (digits > 0) {
-        var price = v.plotMax - (g / 3) * (v.plotMax - v.plotMin);
-        c.fillText(price.toFixed(digits), v.chartW + 5, y);
-      }
+      c.fillStyle = COLORS.muted;
+      c.fillText(tickPrice.toLocaleString('en-US', {
+        minimumFractionDigits: stepDecimals,
+        maximumFractionDigits: stepDecimals
+      }), v.chartW + 6, y);
     }
     c.restore();
   }
@@ -2907,14 +3814,14 @@ export function loadModule(): void {
       if (!isFinite(x1) || !isFinite(x2) || !isFinite(yTop) || !isFinite(yBottom)) continue;
       if (x2 < -20 || x1 > v.chartW) continue;
       var up = b.dir === 1;
-      var boxW = Math.max(2, x2 - x1);
-      var boxH = Math.max(1, yBottom - yTop);
-      c.fillStyle = up ? COLORS.upFill : COLORS.downFill;
-      c.fillRect(x1, yTop, boxW, boxH);
-      c.strokeStyle = up ? COLORS.upLine : COLORS.downLine;
-      c.lineWidth = 1;
-      c.strokeRect(x1 + 0.5, yTop + 0.5, boxW, boxH);
-      tag(c, b.text, Math.min(x2, v.chartW - 2), yBottom - 7, up ? COLORS.up : COLORS.down, 'right', v.chartW);
+      var yLine = up ? yTop : yBottom;
+      if (!isFinite(yLine) || yLine < v.padT || yLine > v.padT + v.plotH) continue;
+      var lx1 = Math.max(0, x1);
+      var lx2 = Math.min(v.chartW, x2);
+      if (lx2 <= lx1) continue;
+      line(c, lx1, yLine, lx2, yLine, up ? COLORS.upLine : COLORS.downLine, 1.25);
+      var labelY = Math.max(v.padT + 7, Math.min(v.padT + v.plotH - 7, yLine - 7));
+      tag(c, b.text, Math.min(x2, v.chartW - 2), labelY, up ? COLORS.up : COLORS.down, 'right', v.chartW);
     }
 
     for (i = 0; i < res.msb.length; i++) {
@@ -3055,9 +3962,27 @@ export function loadModule(): void {
         pane.className = 'chart-ind-pane';
         pane.setAttribute('data-pane', ind.id);
         pane.innerHTML = '<div class="chart-ind-pane-head"><b>' + ind.label + '</b><span>' + ind.sub + '</span>' +
+          '<div class="chart-ind-controls" role="group" aria-label="Chart scale controls">' +
+            '<button type="button" class="chart-ind-ctl" data-ctl="x-out" title="Zoom out (smaller candles)">&minus;</button>' +
+            '<button type="button" class="chart-ind-ctl" data-ctl="x-in" title="Zoom in (larger candles)">+</button>' +
+            '<button type="button" class="chart-ind-ctl" data-ctl="y-out" title="Compress price height">&updownarrow;&minus;</button>' +
+            '<button type="button" class="chart-ind-ctl" data-ctl="y-in" title="Stretch price height">&updownarrow;+</button>' +
+            '<button type="button" class="chart-ind-ctl" data-ctl="auto" title="Auto fit &amp; reset view">Auto</button>' +
+          '</div>' +
           '<em class="chart-ind-pane-zoom">scroll = zoom · drag = pan</em></div>' +
           '<div class="chart-ind-pane-canvas"><canvas></canvas></div>';
         el.appendChild(pane);
+      });
+      el.querySelectorAll('.chart-ind-ctl').forEach(function (btn) {
+        btn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          var ctl = btn.getAttribute('data-ctl');
+          if (ctl === 'x-in') applyZoomBars(view.bars <= 12 ? view.bars - 2 : Math.round(view.bars * 0.78));
+          else if (ctl === 'x-out') applyZoomBars(Math.max(view.bars + 6, Math.round(view.bars * 1.28)));
+          else if (ctl === 'y-in') scaleYBy(1.25);
+          else if (ctl === 'y-out') scaleYBy(0.8);
+          else if (ctl === 'auto') resetView();
+        });
       });
       el.querySelectorAll('.chart-ind-pane-canvas').forEach(function (holder) {
         bindPaneInput(holder);
@@ -3074,30 +3999,66 @@ export function loadModule(): void {
     return el;
   }
 
-  // TradingView-style navigation: the wheel zooms (shift/wheel-x pans) and a
-  // drag moves the window back through history. Every pane shares the view.
+  // TradingView-style navigation: wheel zooms (shift/wheel-x pans, axis/alt scales Y)
+  // and dragging moves smoothly both left (future blank space) and right (history).
   function clampOffset(value) {
-    if (!isFinite(value)) return 0;
-    var maxOffset = Math.max(0, bars.length - Math.max(MIN_BARS, Math.min(view.bars, bars.length)));
-    return Math.max(0, Math.min(maxOffset, Math.round(value)));
+    if (!isFinite(value)) return defaultRightOffset(view.bars);
+    var visible = Math.max(4, Math.min(view.bars, bars.length || view.bars));
+    var minOffset = -Math.max(4, visible - 5);
+    var maxOffset = Math.max(0, (bars.length || visible) - 5);
+    var clamped = Math.max(minOffset, Math.min(maxOffset, Number(value)));
+    if (bars.length) {
+      var nextStart = Math.max(0, Math.floor((bars.length - 1) - clamped - visible));
+      if (nextStart <= 80) maybeLoadMoreHistory(nextStart);
+    }
+    return clamped;
   }
 
   function paneSlot(holder) {
     if (!holder) return 8;
-    var chartW = Math.max(48, holder.clientWidth - 56);
-    var visible = Math.max(8, Math.min(view.bars, bars.length || view.bars));
-    return chartW / visible;
+    var chartW = Math.max(48, holder.clientWidth - 68);
+    var visible = Math.max(4, Math.min(view.bars, bars.length || view.bars));
+    return chartW / Math.max(4, visible);
   }
 
-  function applyZoomBars(nextBars) {
+  function applyZoomBars(nextBars, anchorFrac) {
     var clamped = Math.max(MIN_BARS, Math.min(MAX_BARS, Math.round(nextBars)));
     if (!isFinite(clamped)) return;
     if (clamped !== view.bars) {
+      var oldBars = view.bars;
+      var nextOffset;
+      if (typeof anchorFrac === 'number' && isFinite(anchorFrac)) {
+        var frac = Math.max(0, Math.min(1, anchorFrac));
+        nextOffset = view.offset + (1 - frac) * (oldBars - clamped);
+      } else if (view.offset <= 0) {
+        nextOffset = view.offset * (clamped / Math.max(4, oldBars));
+      } else {
+        nextOffset = view.offset + 0.5 * (oldBars - clamped);
+      }
       view.bars = clamped;
-      view.offset = clampOffset(view.offset);
+      view.offset = clampOffset(nextOffset);
       saveZoom();
       schedule();
     }
+  }
+
+  function scaleYBy(factor) {
+    var next = Math.max(0.15, Math.min(8, (Number(view.yZoom) || 1) * (Number(factor) || 1)));
+    if (!isFinite(next)) return;
+    if (Math.abs(next - view.yZoom) > 1e-4) {
+      view.yZoom = next;
+      schedule();
+    }
+  }
+
+  function resetView() {
+    view.bars = 78;
+    view.offset = defaultRightOffset(78);
+    view.yZoom = 1;
+    view.yPan = 0;
+    saveZoom();
+    lastRenderKey = '';
+    schedule();
   }
 
   function bindPaneInput(holder) {
@@ -3105,17 +4066,27 @@ export function loadModule(): void {
     holder.dataset.bound = '1';
 
     holder.addEventListener('wheel', function (ev) {
+      var rect = holder.getBoundingClientRect();
+      var mx = ev.clientX - rect.left;
+      var chartW = Math.max(48, rect.width - 68);
+      var onAxis = rect.width > 0 && mx >= chartW;
       var modeScale = ev.deltaMode === 1 ? 16 : (ev.deltaMode === 2 ? 120 : 1);
       var dx = (Number(ev.deltaX) || 0) * modeScale;
       var dy = (Number(ev.deltaY) || 0) * modeScale;
       var absX = Math.abs(dx);
       var absY = Math.abs(dy);
+      if ((onAxis || ev.altKey) && !ev.ctrlKey) {
+        ev.preventDefault();
+        if (absY < 0.75) return;
+        scaleYBy(Math.exp(Math.max(-0.45, Math.min(0.45, -dy * 0.0018))));
+        return;
+      }
       var horizontal = ev.shiftKey || (absX > absY * 1.15 && absX >= 2);
       if (horizontal) {
         ev.preventDefault();
         var panDelta = ev.shiftKey ? (dy || dx) : dx;
         if (Math.abs(panDelta) < 0.5) return;
-        view.offset = clampOffset(view.offset + (panDelta / paneSlot(holder)));
+        view.offset = clampOffset(view.offset - (panDelta / paneSlot(holder)));
         schedule();
         return;
       }
@@ -3125,8 +4096,19 @@ export function loadModule(): void {
       var factor = Math.exp(Math.max(-0.45, Math.min(0.45, dy * 0.0014)));
       var target = Math.round(view.bars * factor);
       if (target === view.bars) target = dy > 0 ? view.bars + 1 : view.bars - 1;
-      applyZoomBars(target);
+      applyZoomBars(target, chartW > 0 ? mx / chartW : 1);
     }, { passive: false });
+
+    holder.addEventListener('dblclick', function (ev) {
+      var rect = holder.getBoundingClientRect();
+      var mx = ev.clientX - rect.left;
+      var chartW = Math.max(48, rect.width - 68);
+      if (rect.width > 0 && mx >= chartW) {
+        view.yZoom = 1;
+        view.yPan = 0;
+        schedule();
+      }
+    });
 
     var drag = null;
     var activePointers = new Map();
@@ -3147,10 +4129,22 @@ export function loadModule(): void {
           pinchStart = { dist: pointerDistance(), bars: view.bars };
           return;
         }
+      } else {
+        if (ev.button !== 0) return;
+        ev.preventDefault();
       }
-      if (ev.button !== 0 && ev.pointerType !== 'touch') return;
-      drag = { x: ev.clientX, offset: view.offset };
-      holder.classList.add('dragging');
+      paneHover.set(holder, '');
+      syncRadarTooltip(holder, null, 0, 0);
+      var rect = holder.getBoundingClientRect();
+      var mx = ev.clientX - rect.left;
+      var chartW = Math.max(48, rect.width - 68);
+      if (rect.width > 0 && mx >= chartW) {
+        drag = { mode: 'yaxis', x: ev.clientX, y: ev.clientY, yZoom: view.yZoom };
+        holder.style.cursor = 'ns-resize';
+      } else {
+        drag = { mode: 'pan', x: ev.clientX, y: ev.clientY, offset: view.offset, yPan: view.yPan };
+        holder.classList.add('dragging');
+      }
       if (holder.setPointerCapture) {
         try { holder.setPointerCapture(ev.pointerId); } catch (e) {}
       }
@@ -3167,9 +4161,70 @@ export function loadModule(): void {
         }
         return;
       }
-      if (!drag) return;
-      view.offset = clampOffset(drag.offset + ((ev.clientX - drag.x) / paneSlot(holder)));
-      schedule();
+      if (drag) {
+        if (drag.mode === 'yaxis') {
+          var dyAxis = ev.clientY - drag.y;
+          var yFactor = Math.exp(Math.max(-2.2, Math.min(2.2, -dyAxis * 0.008)));
+          view.yZoom = Math.max(0.15, Math.min(8, drag.yZoom * yFactor));
+          schedule();
+          return;
+        }
+        view.offset = clampOffset(drag.offset + ((ev.clientX - drag.x) / paneSlot(holder)));
+        if (Math.abs(view.yZoom - 1) > 0.015 || Math.abs(drag.yPan) > 0.001) {
+          var plotHDrag = Math.max(20, holder.clientHeight - 20);
+          var panDeltaY = ((ev.clientY - drag.y) / plotHDrag) / Math.max(0.15, view.yZoom);
+          view.yPan = Math.max(-2, Math.min(2, drag.yPan + panDeltaY));
+        }
+        schedule();
+        return;
+      }
+      var rect = holder.getBoundingClientRect();
+      var mx = ev.clientX - rect.left;
+      var my = ev.clientY - rect.top;
+      var chartW = Math.max(48, rect.width - 68);
+      if (rect.width > 0 && mx >= chartW) {
+        holder.style.cursor = 'ns-resize';
+        if (paneHover.get(holder)) {
+          paneHover.set(holder, '');
+          syncRadarTooltip(holder, null, 0, 0);
+          schedule();
+        }
+        return;
+      }
+      var info = paneRadar.get(holder);
+      var markers = info && Array.isArray(info.markers) ? info.markers : [];
+      var smcTargets = info && Array.isArray(info.smcTargets) ? info.smcTargets : [];
+      if (!info || (!markers.length && !smcTargets.length)) {
+        holder.style.cursor = '';
+        return;
+      }
+      var hit = null, bestD = 15;
+      markers.forEach(function (m) {
+        var d = Math.hypot(mx - m.cx, my - m.cy);
+        if (d <= bestD) { bestD = d; hit = m; }
+      });
+      if (!hit && smcTargets.length) {
+        var bestSmcDist = 14;
+        smcTargets.forEach(function (t) {
+          var onPill = mx >= t.lx - 8 && mx <= t.lx + t.tw + 8 && Math.abs(my - t.ly) <= 13;
+          var onRay = mx >= t.lineLeft - 14 && mx <= t.lineRight && Math.abs(my - t.y) <= 12;
+          if (!onPill && !onRay) return;
+          var d = onPill ? Math.abs(my - t.ly) * 0.5 : Math.abs(my - t.y);
+          if (d < bestSmcDist) {
+            bestSmcDist = d;
+            hit = Object.assign({}, t, { cx: Math.max(24, Math.min(info.chartW - 14, mx)), cy: t.y });
+          }
+        });
+      }
+      var nextHover = hit ? hit.id : '';
+      holder.style.cursor = hit ? 'pointer' : '';
+      if (nextHover !== (paneHover.get(holder) || '')) {
+        paneHover.set(holder, nextHover);
+        syncRadarTooltip(holder, hit, info.w, info.h);
+        schedule();
+      } else if (hit) {
+        syncRadarTooltip(holder, hit, info.w, info.h);
+      }
     });
     function stopDrag(ev) {
       if (ev && activePointers.has(ev.pointerId)) activePointers.delete(ev.pointerId);
@@ -3179,7 +4234,15 @@ export function loadModule(): void {
     }
     holder.addEventListener('pointerup', stopDrag);
     holder.addEventListener('pointercancel', stopDrag);
-    holder.addEventListener('pointerleave', function () { if (drag && activePointers.size === 0) stopDrag(); });
+    holder.addEventListener('pointerleave', function () {
+      if (drag && activePointers.size === 0) stopDrag();
+      holder.style.cursor = '';
+      if (paneHover.get(holder)) {
+        paneHover.set(holder, '');
+        syncRadarTooltip(holder, null, 0, 0);
+        schedule();
+      }
+    });
   }
 
   /* The TradingView overlay layer (large-flow tape, market news, pressure)
@@ -3191,7 +4254,9 @@ export function loadModule(): void {
     var el = document.getElementById('chart-indicator-stack');
     if (!wrap) return;
     if (wrap.classList.contains('ind-stack-on') && el) {
-      wrap.style.setProperty('--ind-stack-top', el.offsetTop + 'px');
+      var firstHead = el.querySelector('.chart-ind-pane.on .chart-ind-pane-head');
+      var headH = firstHead && firstHead.offsetHeight > 0 ? (firstHead.offsetHeight + 2) : 26;
+      wrap.style.setProperty('--ind-stack-top', (el.offsetTop + headH) + 'px');
     } else {
       wrap.style.removeProperty('--ind-stack-top');
     }
@@ -3262,6 +4327,7 @@ export function loadModule(): void {
       c.font = '12px sans-serif';
       c.textAlign = 'center';
       c.fillText(dataError || (loading ? 'Loading candles…' : 'Waiting for market data…'), w / 2, h / 2);
+      if (holder) syncRadarTooltip(holder, null, 0, 0);
       return;
     }
 
@@ -3273,13 +4339,15 @@ export function loadModule(): void {
     }
 
     var v = candleView(w, h);
+    maybeLoadMoreHistory(v.start);
     var digits = digitsFor((v.plotMax + v.plotMin) / 2);
     drawGrid(c, v, digits);
     drawCandles(c, v);
     if (id === 'msb') drawMSB(c, v);
     else if (id === 'killzones') drawKillzones(c, v);
-    drawLiquidityZones(c, v, digits);
+    var smcTargets = drawSmartMoneyZones(c, v, digits, holder);
     drawLivePrice(c, v, digits);
+    drawProfitRadarCircles(c, v, digits, holder, w, h, smcTargets);
   }
 
   function render() {
@@ -3292,21 +4360,44 @@ export function loadModule(): void {
       if (!loading) loadBars();
       return;
     }
+    evaluateLiveSignal(livePrice);
     var activeMask = INDICATORS.map(function (ind) { return enabled[ind.id] ? '1' : '0'; }).join('');
     var firstPane = el.querySelector('.chart-ind-pane.on .chart-ind-pane-canvas');
     var firstSize = firstPane ? paneSizes.get(firstPane) : null;
-    var rKey = seriesKey(bars) + '|' + livePrice + '|' + view.bars + '|' + view.offset + '|' +
+    var hoverSig = INDICATORS.map(function (ind) {
+      var p = el.querySelector('[data-pane="' + ind.id + '"] .chart-ind-pane-canvas');
+      return p ? (paneHover.get(p) || '') : '';
+    }).join(',');
+    var themeSig = document.documentElement.classList.contains('sx-dark') ? 'D' : 'L';
+    var rKey = seriesKey(bars) + '|' + bars.length + '|' + livePrice + '|' + view.bars + '|' + view.offset.toFixed(2) + '|' +
+      view.yZoom.toFixed(3) + '|' + view.yPan.toFixed(4) + '|' +
       activeMask + '|' + (firstSize ? firstSize.width + 'x' + firstSize.height : '') + '|' +
-      (loading ? 'L' : '') + '|' + (dataError || '');
+      radarSignature() + '|' + liveSignalSig() + '|' + hoverSig + '|' + themeSig + '|' +
+      (loading ? 'L' : '') + (historyLoading ? 'H' : '') + '|' + (dataError || '');
     if (rKey === lastRenderKey) return;
     lastRenderKey = rKey;
+    syncStackTop();
     INDICATORS.forEach(function (ind) {
       if (!enabled[ind.id]) return;
       var pane = el.querySelector('[data-pane="' + ind.id + '"]');
       var canvas = pane && pane.querySelector('canvas');
       if (canvas) paintPane(canvas, ind.id);
       var zoom = pane && pane.querySelector('.chart-ind-pane-zoom');
-      if (zoom) zoom.textContent = view.bars + (view.offset ? ' bars · ' + Math.round(view.offset) + ' back' : ' bars');
+      if (zoom) {
+        var meta = [view.bars + ' bars'];
+        var offInt = Math.round(view.offset);
+        if (offInt >= 1) meta.push(offInt + ' back');
+        else if (view.offset < defaultRightOffset(view.bars) - 2) meta.push(Math.abs(offInt) + ' fwd');
+        if (Math.abs(view.yZoom - 1) > 0.03) meta.push('Y ' + Math.round(view.yZoom * 100) + '%');
+        if (historyLoading) meta.push('loading…');
+        zoom.textContent = meta.join(' · ');
+      }
+      var autoBtn = pane && pane.querySelector('[data-ctl="auto"]');
+      if (autoBtn) {
+        autoBtn.classList.toggle('is-manual',
+          Math.abs(view.yZoom - 1) > 0.02 || Math.abs(view.yPan) > 0.002 ||
+          Math.abs(view.offset - defaultRightOffset(view.bars)) > 2);
+      }
     });
   }
 
@@ -3348,9 +4439,9 @@ export function loadModule(): void {
   function toggle(id) {
     if (enabled[id]) delete enabled[id];
     else enabled[id] = true;
-    // Opening a study starts on the latest candle offset while preserving the user's zoom level.
-    view.offset = 0;
+    // Opening a study starts with TradingView-style right breathing room while preserving zoom.
     if (!isFinite(view.bars) || view.bars < MIN_BARS || view.bars > MAX_BARS) view.bars = 78;
+    view.offset = defaultRightOffset(view.bars);
     lastRenderKey = '';
     savePrefs();
     syncButtons();
@@ -3380,7 +4471,7 @@ export function loadModule(): void {
   });
 
   window.addEventListener('chart:tv-quote', function (ev) { acceptQuote(ev.detail); });
-  window.addEventListener('chart:liquidity-zones', function () {
+  window.addEventListener('chart:smc-radar-update', function () {
     lastRenderKey = '';
     if (anyEnabled()) schedule();
   });
@@ -3401,10 +4492,19 @@ export function loadModule(): void {
       if (barsRequest) barsRequest.abort();
       barsRequest = null;
       loading = false;
+      historyLoading = false;
+      historyMaxed = false;
+      historyTarget = CANDLE_COUNT;
       bars = [];
       livePrice = livePriceAt = 0;
       lastRenderKey = '';
-      view.offset = 0;
+      signalStack = [];
+      dismissedSignals = {};
+      lastSignalPrice = 0;
+      stopBeaconPulse();
+      view.offset = defaultRightOffset(view.bars);
+      view.yZoom = 1;
+      view.yPan = 0;
       if (anyEnabled()) loadBars();
     }
     schedule();
@@ -3417,10 +4517,19 @@ export function loadModule(): void {
       if (barsRequest) barsRequest.abort();
       barsRequest = null;
       loading = false;
+      historyLoading = false;
+      historyMaxed = false;
+      historyTarget = CANDLE_COUNT;
       bars = [];
       livePrice = livePriceAt = 0;
       lastRenderKey = '';
-      view.offset = 0;
+      signalStack = [];
+      dismissedSignals = {};
+      lastSignalPrice = 0;
+      stopBeaconPulse();
+      view.offset = defaultRightOffset(view.bars);
+      view.yZoom = 1;
+      view.yPan = 0;
       if (anyEnabled()) loadBars();
     }
     schedule();
@@ -3451,8 +4560,8 @@ export function loadModule(): void {
     setEnabled: function (id, on) {
       if (on) enabled[id] = true;
       else delete enabled[id];
-      view.offset = 0;
       if (!isFinite(view.bars) || view.bars < MIN_BARS || view.bars > MAX_BARS) view.bars = 78;
+      view.offset = defaultRightOffset(view.bars);
       lastRenderKey = '';
       savePrefs();
       syncButtons();
@@ -3467,26 +4576,67 @@ export function loadModule(): void {
       else if (next === view.bars && factor < 1) next = view.bars - 6;
       applyZoomBars(next);
     },
-    resetZoom: function () {
-      view.offset = 0;
-      applyZoomBars(78);
+    scaleYBy: scaleYBy,
+    panBackBy: function (delta) {
+      view.offset = clampOffset(view.offset + (Number(delta) || 0));
+      schedule();
     },
-    liquidity: liquidityLevels,
+    resetZoom: resetView,
     debug: function () {
       var pane = document.querySelector('[data-pane="msb"] canvas');
       if (!pane) return null;
+      var holder = pane.parentNode;
+      var info = holder ? paneRadar.get(holder) : null;
       var v = candleView(pane.clientWidth, pane.clientHeight);
+      var digits = digitsFor((v.plotMax + v.plotMin) / 2);
+      var step = nicePriceStep(v.plotMax - v.plotMin, v.plotH, Math.pow(10, -digits));
+      var niceTicks = [];
+      if (step > 0 && isFinite(step)) {
+        var tFirst = Math.ceil(v.plotMin / step) * step;
+        for (var tk = tFirst; tk <= v.plotMax + step * 1e-6 && niceTicks.length < 24; tk += step) {
+          var tickY = v.yOf(tk);
+          if (tickY >= v.padT + 2 && tickY <= v.h - 4) niceTicks.push(formatChartPx(tk, digits));
+        }
+      }
       return {
         bars: bars.length,
+        historyTarget: historyTarget,
         first: bars[0] || null,
         last: bars[bars.length - 1] || null,
         tf: dataTf,
-        view: { bars: view.bars, offset: view.offset, slot: v.slot, start: v.start, end: v.end },
+        view: {
+          bars: view.bars, offset: view.offset, yZoom: v.yZoom, yPan: view.yPan,
+          slot: v.slot, start: v.start, end: v.end
+        },
         plotMin: v.plotMin,
         plotMax: v.plotMax,
+        niceStep: step,
+        niceTicks: niceTicks,
         slot: v.slot,
         rightEdgeX: v.rightEdgeX,
-        paneSize: [pane.clientWidth, pane.clientHeight]
+        paneSize: [pane.clientWidth, pane.clientHeight],
+        radarMarkers: info ? info.markers.map(function (m) {
+          var liveTop = signalStack.length ? signalStack[signalStack.length - 1] : null;
+          var rLit = !!(liveTop && liveTop.kind === 'radar' &&
+            (m.id === 'entry' || m.id === 'tp1' || m.id === 'tp2' || (liveTop.showSl && m.id === 'sl')));
+          return { id: m.id, price: m.price, cx: m.cx, cy: m.cy, badge: m.badge, lit: rLit };
+        }) : [],
+        smcTargets: info && Array.isArray(info.smcTargets) ? info.smcTargets.map(function (t) {
+          return { id: t.id, title: t.title, cx: t.cx, cy: t.cy, pxText: t.pxText, guides: t.guides || [], lit: !!t.lit, showSl: !!t.showSl };
+        }) : [],
+        liveSignal: signalStack.length ? (function () {
+          var top = signalStack[signalStack.length - 1];
+          var actGuides = ['TP1', 'TP2'];
+          if (top.showSl) actGuides.unshift('SL');
+          return {
+            id: top.id, kind: top.kind, side: top.side, label: top.label,
+            price: top.price, stop: top.stop, tp1: top.tp1, tp2: top.tp2,
+            showSl: !!top.showSl, guides: actGuides,
+            stackDepth: signalStack.length,
+            stackIds: signalStack.map(function (s) { return s.id; })
+          };
+        })() : null,
+        hoveredRadar: holder ? (paneHover.get(holder) || '') : ''
       };
     },
     // diagnostic view of the ICT session replay (used to verify the pane and

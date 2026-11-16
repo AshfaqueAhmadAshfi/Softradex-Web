@@ -12133,7 +12133,7 @@ body {
 
 .chart-ind-pane-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
   flex: 0 0 auto;
   padding: 2px 8px 3px;
@@ -12163,17 +12163,55 @@ body {
   min-height: 0;
   cursor: crosshair;
   touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .chart-ind-pane-canvas.dragging { cursor: grabbing; }
 
-.chart-ind-pane-head .chart-ind-pane-zoom {
+.chart-ind-pane-head .chart-ind-controls {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+
+.chart-ind-ctl {
+  appearance: none;
+  border: 1px solid rgba(148, 163, 184, 0.34);
+  background: rgba(255, 255, 255, 0.85);
+  color: #334155;
+  font: 700 9.5px/1 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.chart-ind-ctl:hover {
+  background: rgba(37, 99, 235, 0.10);
+  border-color: rgba(37, 99, 235, 0.45);
+  color: #1d4ed8;
+}
+
+.chart-ind-ctl.is-manual {
+  background: rgba(37, 99, 235, 0.12);
+  border-color: rgba(37, 99, 235, 0.48);
+  color: #1d4ed8;
+}
+
+.chart-ind-pane-head .chart-ind-pane-zoom {
+  margin-left: 6px;
   font-style: normal;
-  font-size: 8px;
+  font-size: 8.5px;
   font-weight: 600;
   letter-spacing: 0.02em;
-  color: #94a3b8;
+  color: #64748b;
   white-space: nowrap;
 }
 
@@ -12182,6 +12220,67 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
+}
+
+.chart-radar-tooltip {
+  position: absolute;
+  z-index: 6;
+  pointer-events: none;
+  min-width: 185px;
+  max-width: 295px;
+  padding: 7px 9px;
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.34);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 12px 26px -10px rgba(15, 23, 42, 0.25);
+  color: #0f172a;
+  font-family: "JetBrains Mono", monospace;
+}
+.chart-radar-tooltip .crt-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  white-space: nowrap;
+}
+.chart-radar-tooltip .crt-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  flex: none;
+}
+.chart-radar-tooltip .crt-title {
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  color: #334155;
+  white-space: nowrap;
+}
+.chart-radar-tooltip .crt-tag {
+  margin-left: auto;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  font-size: 8px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.chart-radar-tooltip .crt-price {
+  font-size: 12px;
+  font-weight: 900;
+  color: #0f172a;
+  line-height: 1.25;
+}
+.chart-radar-tooltip .crt-price small {
+  font-size: 8px;
+  font-weight: 700;
+  color: #64748b;
+}
+.chart-radar-tooltip .crt-sub {
+  margin-top: 2px;
+  font-size: 8.2px;
+  line-height: 1.35;
+  color: #475569;
 }
 
 /* One-off note on the chart when a study selection moves the chart from the
@@ -15631,12 +15730,40 @@ html.sx-dark body.softradex-glass-ui #dash .binance-chart-wrapper.ind-stack-on #
   border-color: transparent !important;
 }
 html.sx-dark #dash .chart-ind-pane-head b { color: #60a5fa !important; }
+html.sx-dark #dash .chart-ind-ctl {
+  background: rgba(15, 23, 42, 0.88) !important;
+  border-color: rgba(148, 163, 184, 0.28) !important;
+  color: #cbd5e1 !important;
+}
+html.sx-dark #dash .chart-ind-ctl:hover {
+  background: rgba(59, 130, 246, 0.22) !important;
+  border-color: rgba(96, 165, 250, 0.55) !important;
+  color: #93c5fd !important;
+}
+html.sx-dark #dash .chart-ind-ctl.is-manual {
+  background: rgba(37, 99, 235, 0.24) !important;
+  border-color: rgba(96, 165, 250, 0.62) !important;
+  color: #93c5fd !important;
+}
+html.sx-dark #dash .chart-ind-pane-head .chart-ind-pane-zoom {
+  color: #94a3b8 !important;
+}
 html.sx-dark .chart-ind-note {
   background: rgba(15, 23, 42, 0.96) !important;
   border-color: rgba(96, 165, 250, 0.32) !important;
   color: #cbd5e1 !important;
 }
 html.sx-dark .chart-ind-note b { color: #60a5fa !important; }
+html.sx-dark .chart-radar-tooltip {
+  background: rgba(15, 23, 42, 0.96) !important;
+  border-color: rgba(148, 163, 184, 0.30) !important;
+  box-shadow: 0 14px 32px -10px rgba(0, 0, 0, 0.72) !important;
+  color: #f1f5f9 !important;
+}
+html.sx-dark .chart-radar-tooltip .crt-title { color: #93c5fd !important; }
+html.sx-dark .chart-radar-tooltip .crt-price { color: #f8fafc !important; }
+html.sx-dark .chart-radar-tooltip .crt-price small { color: #94a3b8 !important; }
+html.sx-dark .chart-radar-tooltip .crt-sub { color: #cbd5e1 !important; }
 html.sx-dark #dash .tv-cross-badge,
 html.sx-dark #dash .tv-cross-badge.golden,
 html.sx-dark #dash .tv-cross-badge.death,

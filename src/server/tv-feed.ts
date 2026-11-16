@@ -512,7 +512,7 @@ function fetchWsCandles(tv: string, resolution: string, count: number): Promise<
       }
     };
 
-    const timer = setTimeout(() => finish(new Error(`TradingView WS timeout for ${tv}`)), 10000);
+    const timer = setTimeout(() => finish(new Error(`TradingView WS timeout for ${tv}`)), count > 1200 ? 18000 : 10000);
 
     conn.sessions.set(session, (method, params) => {
       if (method === '__closed__') {
@@ -555,7 +555,7 @@ function fetchWsCandles(tv: string, resolution: string, count: number): Promise<
 export async function fetchTvCandles(symbol: string, tf = '5m', count = 500, target?: string | null) {
   const tv = resolveTvSymbol(symbol, target);
   const resCode = RESOLUTIONS[tf] || '5';
-  const clampedCount = Math.min(2000, Math.max(50, Number(count) || 500));
+  const clampedCount = Math.min(5000, Math.max(50, Number(count) || 500));
   // Always fetch at least 500 bars for canonical shared cache so smaller callers
   // (e.g. SwingAI 140) never overwrite or truncate ChartIndicators' 500-bar view.
   const fetchCount = Math.max(clampedCount, 500);
