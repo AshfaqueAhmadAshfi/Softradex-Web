@@ -1,0 +1,3532 @@
+// @ts-nocheck
+/* Consolidated TypeScript module */
+export function loadModule(): void {
+  (window as any).SOFTRADEX_PUBLIC_ONLY = true;
+
+// ==================== tv-chart.js ====================
+/* ==========================================================================
+   TradingView chart host (tv-chart.js)
+   --------------------------------------------------------------------------
+   The built-in candle chart is drawn by the browser from candles this server
+   has to fetch first - on a busy shared host that first fetch is slow. This
+   module puts TradingView's streaming chart in the same slot instead:
+
+   - the embed is a plain iframe that TradingView's own CDN renders, so the
+     page needs no third-party script and nothing can block it at load time,
+   - our symbol tabs / timeframe tabs rewrite the frame's embed config, so the
+     chart follows the market without touching the rest of the dashboard,
+   - every market is mapped to a real TradingView symbol (exchange:SYMBOL),
+   - a market TradingView has no symbol for keeps the built-in chart,
+   - while TradingView is on screen the candle feed stops being asked for
+     history (window.SOFT_TV_ACTIVE), so the host only serves the small
+     ticker request the price ribbon needs.
+
+   Nothing else changes: the ticker strip, pressure dials, whale tape and
+   order-flow boards keep their own feeds and know nothing about this file.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var STORAGE_KEY = 'softradex.chart.tv';   // '1' TradingView, '0' built-in
+  var FRAME_BASE = 'https://www.tradingview-widget.com/embed-widget/advanced-chart/';
+
+  // The frame is third-party: when it is blocked (ISP/regional filtering, a
+  // captive portal, an ad-blocker, no internet) it either never fires `load`
+  // or fires it over TradingView's own error page. Both used to leave the
+  // chart slot empty forever with the toggle still reading "ON", so the embed
+  // is now watched: no answer inside LOAD_TIMEOUT_MS = fall back to the
+  // built-in candle chart and say why.
+  var LOAD_TIMEOUT_MS = 12000;
+  var RETRY_AFTER_MS = 60000;   // automatic second chance after a failure
+  var MAX_AUTO_RETRIES = 2;     // then only the Retry button / toggle retries
+
+  function $(id) { return document.getElementById(id); }
+
+  /* ---------------------------------------------------- symbol mapping --- */
+  // Markets whose TradingView symbol cannot be derived from the broker name.
+  var EXPLICIT = {
+    // metals
+    XAUUSDm: 'OANDA:XAUUSD',
+    XAGUSDm: 'OANDA:XAGUSD',
+    XAUEURm: 'OANDA:XAUEUR',
+    XAUGBPm: 'OANDA:XAUGBP',
+    XPTUSDm: 'OANDA:XPTUSD',
+    XPDUSDm: 'OANDA:XPDUSD',
+    // energy
+    USOILm: 'TVC:USOIL',
+    UKOILm: 'TVC:UKOIL',
+    XNGUSDm: 'NYMEX:NG1!',
+    // indices
+    USTECm: 'NASDAQ:NDX',
+    US500m: 'SP:SPX',
+    US30m: 'DJ:DJI',
+    DXY: 'TVC:DXY',
+    DE30m: 'XETR:DAX',
+    FR40m: 'EURONEXT:CAC',
+    AUS200m: 'ASX:AXJO',
+    // US stocks - qualified with the exchange they actually trade on
+    AAPLm: 'NASDAQ:AAPL',
+    MSFTm: 'NASDAQ:MSFT',
+    AMZNm: 'NASDAQ:AMZN',
+    GOOGLm: 'NASDAQ:GOOGL',
+    TSLAm: 'NASDAQ:TSLA',
+    NVDAm: 'NASDAQ:NVDA',
+    METAm: 'NASDAQ:META',
+    INTCm: 'NASDAQ:INTC',
+    AMDm: 'NASDAQ:AMD',
+    NEFLm: 'NASDAQ:NFLX',
+    JPMm: 'NYSE:JPM',
+    BAm: 'NYSE:BA',
+    DISm: 'NYSE:DIS',
+    NKEm: 'NYSE:NKE',
+    COINm: 'NASDAQ:COIN',
+    PFEm: 'NYSE:PFE',
+    Vm: 'NYSE:V',
+    MAm: 'NYSE:MA',
+    KOm: 'NYSE:KO',
+    WMTm: 'NASDAQ:WMT',
+    XOMm: 'NYSE:XOM'
+  };
+
+  // Exotic crosses live on the IDC feed rather than on OANDA.
+  var FOREX_EXOTIC = {
+    USDSGD: 1, USDHKD: 1, USDTRY: 1, USDZAR: 1, USDMXN: 1, USDCNH: 1,
+    USDSEK: 1, USDNOK: 1, USDDKK: 1, USDPLN: 1, USDTHB: 1, EURTRY: 1,
+    EURSGD: 1
+  };
+
+  // Our timeframe buttons -> TradingView interval tokens.
+  var TF_MAP = { '1m': '1', '5m': '5', '15m': '15', '1h': '60', '4h': '240', '1d': 'D' };
+
+  // 9 MA + 21 MA + the MT5 ZigZag, drawn on every TradingView frame. The
+  // widget takes studies from the same embed config as the symbol, so all
+  // three follow the market/timeframe automatically.
+  //
+  // `inputs.length` is what sets each MA period: without it both studies load
+  // with the default length (9) and look like a single line.
+  //
+  // ZigZag maps the MT5 parameters: period -> depth 12 and deviation 5 are
+  // real inputs of TradingView's ZigZag (the widget legend shows "Zigzag 5
+  // 12", so both are accepted). MT5's third parameter, backstep 3, has no
+  // counterpart in TradingView's built-in study - it is sent for
+  // completeness and ignored there rather than silently dropped here.
+  var STUDIES = [
+    { id: 'MASimple@tv-basicstudies', inputs: { length: 9 } },
+    { id: 'MASimple@tv-basicstudies', inputs: { length: 21 } },
+    { id: 'ZigZag@tv-basicstudies', inputs: { depth: 12, deviation: 5, backstep: 3 } }
+  ];
+
+  // Returns 'EXCHANGE:SYMBOL', or '' when TradingView has nothing for it -
+  // the caller then leaves the built-in chart in place instead of showing a
+  // TradingView "no data" error.
+  function tvSymbolFor(key, meta) {
+    var k = String(key || '').trim();
+    var bare = k.replace(/m$/i, '').toUpperCase();
+    if (EXPLICIT[k]) return EXPLICIT[k];
+    if (EXPLICIT[bare]) return EXPLICIT[bare];
+    if (EXPLICIT[bare + 'm']) return EXPLICIT[bare + 'm'];
+    var kind = String((meta && meta.kind) || '').toLowerCase();
+    // XAUUSDm -> XAUUSD, BTCUSDTm -> BTCUSDT, Vm -> V, ChinaHm -> ChinaH
+    var base = bare;
+    if (base === 'XAUUSD247' || base === 'XAUUSD') return 'OANDA:XAUUSD';
+
+    if (kind === 'crypto') {
+      // BTCUSDT -> BTC, ETHUSD -> ETH, DOGEUSD -> DOGE
+      var coin = base.replace(/USDT$/, '').replace(/USD$/, '');
+      if (/^[A-Z0-9]{2,10}$/.test(coin)) return 'BINANCE:' + coin + 'USDT';
+      return '';
+    }
+    if (kind === 'forex') {
+      if (!/^[A-Z]{6}$/.test(base)) return '';
+      return (FOREX_EXOTIC[base] ? 'FX_IDC:' : 'OANDA:') + base;
+    }
+    // metals quoted against EUR/GBP/AUD, HK50 / UK100 / JP225 and friends
+    // have no entry we can trust -> '' = built-in chart stays.
+    return '';
+  }
+
+  // The embed reads its whole configuration from the URL fragment, so a new
+  // symbol/timeframe only changes the fragment. That alone does NOT reload the
+  // widget (a fragment-only src change is a same-document navigation), so the
+  // caller passes a one-off marker that changes the document URL instead.
+  function currentTheme() {
+    return document.documentElement.classList.contains('sx-dark') ? 'dark' : 'light';
+  }
+
+  function frameKey() { return tvSymbol + '|' + tvInterval + '|' + currentTheme(); }
+
+  function frameSrc(symbol, interval, marker) {
+    var cfg = encodeURIComponent(JSON.stringify({
+      autosize: true,
+      width: '100%',
+      height: '100%',
+      symbol: symbol,
+      interval: interval,
+      timezone: 'Etc/UTC',
+      style: '1',                 // candles
+      theme: currentTheme(),
+      studies: STUDIES,           // 9 MA and 21 MA overlay
+      hide_side_toolbar: true,    // the dashboard already has the tabs
+      allow_symbol_change: false,
+      withdateranges: false,
+      save_image: false,
+      support_host: 'https://www.tradingview.com'
+    }));
+    return FRAME_BASE + (marker ? '?locale=en&sdx=' + marker : '?locale=en') + '#' + cfg;
+  }
+
+  /* ------------------------------------------------------------ state ---- */
+  var wrapper = null;        // .binance-chart-wrapper (flex column)
+  var box = null;            // #tv-chart-box
+  var frame = null;          // the embed <iframe>
+  var btn = null;            // toolbar toggle
+  var notice = null;         // "TradingView unavailable" banner
+
+  var tvSymbol = 'OANDA:XAUUSD';
+  var tvInterval = '5';
+  var hasMapping = true;     // current market has a TradingView symbol
+  // The dashboard now has a single chart: TradingView. The old built-in
+  // canvas is never brought back (the indicator studies that needed it are
+  // hidden as well).
+  var wantActive = true;
+
+  var frameReady = false;    // the current src actually painted something
+  var tvBroken = false;      // embed unreachable -> the built-in chart draws
+  var brokenReason = '';
+  var loadTimer = null;
+  var retryTimer = null;
+  var autoRetries = 0;
+  var frameSeq = 0;          // bumps on every real chart load (see frameSrc)
+  var lastW = 0;             // last laid-out slot size - the embed is re-fitted
+  var lastH = 0;             // when it changes (see scheduleFit)
+  var frameW = 0;            // ... and its own size, because the indicator
+  var frameH = 0;            // stack hides the frame without resizing the box
+  var frameWatcher = null;
+  var fitTimer = null;
+  var quoteBusy = false;      // one /api/chart/tvquote request at a time
+  var quoteRequest = null;
+
+  function clearLoadTimer() {
+    if (loadTimer) { clearTimeout(loadTimer); loadTimer = null; }
+  }
+
+  function clearRetry() {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+  }
+
+  function armLoadTimer() {
+    clearLoadTimer();
+    loadTimer = setTimeout(function () {
+      loadTimer = null;
+      if (!frameReady) markBroken('timeout');
+    }, LOAD_TIMEOUT_MS);
+  }
+
+  /* -------------------------------------------------- failure handling --- */
+  // Called when the embed never answers. The built-in candle chart is put back
+  // on screen (it draws from this server, so it works without TradingView) and
+  // the reason is shown instead of an empty grey box.
+  function markBroken(reason) {
+    clearLoadTimer();
+    if (tvBroken) return;
+    tvBroken = true;
+    frameReady = false;
+    brokenReason = reason || 'timeout';
+    showNotice();
+    applyVisibility();
+    if (autoRetries < MAX_AUTO_RETRIES) {
+      autoRetries++;
+      clearRetry();
+      retryTimer = setTimeout(function () { retryTimer = null; retryNow(); }, RETRY_AFTER_MS);
+    }
+  }
+
+  function markOk() {
+    clearLoadTimer();
+    clearRetry();
+    frameReady = true;
+    autoRetries = 0;
+    if (tvBroken) {
+      tvBroken = false;
+      brokenReason = '';
+      hideNotice();
+    }
+    syncVisible();
+    // Always refresh the visibility: the loading placeholder is only removed
+    // by the `tv-frame-ready` class, which applyVisibility() owns. Returning
+    // early on a healthy frame left "Loading …" painted on top of a chart that
+    // had already drawn - it disappeared only after toggling TradingView
+    // off and on again.
+    applyVisibility();
+  }
+
+  // Reload the same symbol/timeframe: re-assigning an identical src is a
+  // no-op for the browser, so the dataset guard has to be cleared first.
+  function retryNow() {
+    clearRetry();
+    clearLoadTimer();
+    tvBroken = false;
+    frameReady = false;
+    brokenReason = '';
+    hideNotice();
+    if (frame) {
+      frame.dataset.tv = '';
+      applyFrame();
+    } else {
+      mountWidget();
+    }
+    applyVisibility();
+  }
+
+  function ensureNotice() {
+    if (notice && notice.isConnected) return notice;
+    if (!wrapper) return null;
+    notice = document.createElement('div');
+    notice.className = 'tv-offline-notice';
+    notice.id = 'tv-offline-notice';
+    notice.setAttribute('role', 'status');
+    notice.innerHTML = '<span class="tv-offline-icon">⚠</span>' +
+      '<span class="tv-offline-text">TradingView did not answer.</span>' +
+      '<button type="button" class="tv-offline-retry">Retry TradingView</button>';
+    var retryBtn = notice.querySelector('.tv-offline-retry');
+    if (retryBtn) {
+      retryBtn.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        autoRetries = 0;
+        retryNow();
+      });
+    }
+    wrapper.appendChild(notice);
+    return notice;
+  }
+
+  function showNotice() {
+    var el = ensureNotice();
+    if (!el) return;
+    var text = el.querySelector('.tv-offline-text');
+    if (text) {
+      text.textContent = brokenReason === 'offline'
+        ? 'No internet connection - TradingView cannot load. Retry when the connection is back.'
+        : 'TradingView did not answer (blocked or offline). Retry TradingView.';
+    }
+    el.classList.add('show');
+  }
+
+  function hideNotice() {
+    if (notice) notice.classList.remove('show');
+  }
+
+  function onFrameLoad() {
+    // A freshly appended iframe fires one synthetic load for its blank
+    // document before any src is applied - only the real embed counts.
+    if (!frame) return;
+    var src = frame.getAttribute('src') || '';
+    if (src.indexOf('tradingview-widget.com') === -1) return;
+    markOk();
+  }
+
+  // The dashboard mounts this module while #dash is still display:none (the
+  // unlock gate) and a 0x0 iframe is never painted by TradingView - the slot
+  // stayed on "loading" until the toggle remounted it. Load the embed the
+  // first time the slot has a real size instead.
+  var sizeWatcher = null;
+  var sizePolls = 0;
+
+  function boxHasSize() {
+    return !!(box && box.clientWidth > 4 && box.clientHeight > 4);
+  }
+
+  function watchBoxSize() {
+    if (!box) return;
+    if (typeof ResizeObserver !== 'undefined') {
+      if (sizeWatcher) return;
+      sizeWatcher = new ResizeObserver(function () {
+        if (!boxHasSize() || !wantActive || !hasMapping) return;
+        if (!frame) { mountWidget(); return; }
+        if (frame.dataset.tv !== frameKey() || !frameReady) { applyFrame(); return; }
+        var w = box.clientWidth, h = box.clientHeight;
+        // Once TradingView has loaded cleanly, do not reload its iframe on layout
+        // reflows — reloading resets the user's zoom back to default.
+        if (Math.abs(w - lastW) <= 24 && Math.abs(h - lastH) <= 24) return;
+        lastW = w;
+        lastH = h;
+        if (!frameReady) scheduleFit();
+      });
+      sizeWatcher.observe(box);
+      return;
+    }
+    // no ResizeObserver: poll for a bounded two minutes
+    if (sizePolls >= 120) return;
+    sizePolls++;
+    setTimeout(function () {
+      if (!boxHasSize()) { watchBoxSize(); return; }
+      sizePolls = 0;
+      if (wantActive && hasMapping) applyFrame();
+    }, 1000);
+  }
+
+  /* --------------------------------------------------- re-fit on resize --- */
+  // The embed lays its bars out and fits its price scale once, for the size it
+  // is given. When the dashboard re-flows afterwards (sidebar, workspace dock,
+  // indicator stack, window resize) an already-drawn widget keeps that old
+  // geometry: the live candles slide to the left and the current price ends up
+  // outside the visible scale - the "I have to look below the chart to see the
+  // price" report. Re-opening the embed once the new size has settled makes
+  // TradingView fit the range to the last bar again.
+  function scheduleFit() {
+    if (fitTimer) clearTimeout(fitTimer);
+    fitTimer = setTimeout(function () {
+      fitTimer = null;
+      if (!frame || !wantActive || !hasMapping || !boxHasSize()) return;
+      frame.dataset.tv = '';
+      applyFrame();
+    }, 700);
+  }
+
+  /* ------------------------------------------------- TradingView quote --- */
+  // The header price has to be the price the candles are drawn at. MT5 quotes
+  // the broker's own feed, which sits a few tenths of a percent away from the
+  // OANDA feed the embed shows; this asks the server for the TradingView quote
+  // of the same instrument and publishes it for the ribbon.
+  function pollTvQuote() {
+    if (document.hidden) return;
+    if (quoteBusy || !ourSymbol || !tvSymbol) return;
+    var requestedSymbol = ourSymbol, requestedTv = tvSymbol;
+    var controller = new AbortController();
+    quoteRequest = controller;
+    quoteBusy = true;
+    var timeout = setTimeout(function () { controller.abort(); }, 10000);
+    return fetch('/api/chart/tvquote?symbol=' + encodeURIComponent(requestedSymbol) + '&tv_symbol=' + encodeURIComponent(requestedTv), {
+      cache: 'no-store', signal: controller.signal
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (controller !== quoteRequest || requestedSymbol !== ourSymbol || requestedTv !== tvSymbol) return;
+        if (!d || !d.ok || !(Number(d.price) > 0) || d.tv_symbol !== requestedTv) return;
+        window.SOFT_TV_QUOTE = {
+          symbol: requestedSymbol,
+          tv_symbol: d.tv_symbol,
+          price: Number(d.price),
+          change: Number(d.change) || 0,
+          high: Number(d.high) || 0,
+          low: Number(d.low) || 0,
+          market_open: d.market_open !== false,
+          tv_digits: Number.isInteger(d.tv_digits) ? Number(d.tv_digits) : undefined,
+          exchange_ts: Number(d.exchange_ts) || 0,
+          at: Number(d.updated) > 0 ? Number(d.updated) * 1000 : Date.now(),
+          source: 'TradingView'
+        };
+        window.dispatchEvent(new CustomEvent('chart:tv-quote', { detail: window.SOFT_TV_QUOTE }));
+      })
+      .catch(function () { /* keep the last good quote */ })
+      .finally(function () {
+        clearTimeout(timeout);
+        if (controller === quoteRequest) { quoteBusy = false; quoteRequest = null; }
+      });
+  }
+
+  function startQuoteFeed() {
+    pollTvQuote();
+    setInterval(function () {
+      if (!document.hidden) pollTvQuote();
+    }, 2000);
+  }
+
+  function mountWidget() {
+    if (frame || !box) return;
+    lastW = box.clientWidth;
+    lastH = box.clientHeight;
+    frame = document.createElement('iframe');
+    frame.className = 'tv-chart-frame';
+    frame.setAttribute('title', 'TradingView chart');
+    frame.setAttribute('frameborder', '0');
+    frame.setAttribute('allowtransparency', 'true');
+    // The vendor widget still registers unload handlers. Explicitly opt its
+    // own origin into this deprecated feature, leaving the rest of the page
+    // and unrelated origins under the browser's default permissions policy.
+    frame.setAttribute('allow', "unload 'src'");
+    // TradingView refuses to draw when the embed arrives with a referrer it
+    // does not like (an IP host such as http://192.168.x.x/ or
+    // http://127.0.0.1:8787 shows "Something went wrong" inside the frame).
+    // The chart is read-only, so nothing here needs a referrer.
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.addEventListener('load', onFrameLoad);
+    frame.addEventListener('error', function () { markBroken('blocked'); });
+    box.appendChild(frame);
+    frameW = frame.clientWidth;
+    frameH = frame.clientHeight;
+    // The MSB/OB stack keeps the frame at display:none. TradingView still
+    // answers its load at that 0x0 size, so the widget that is revealed when
+    // the stack is turned off has no usable geometry - the candles sit at the
+    // far left and the live price falls outside the scale. Watch the frame
+    // itself and re-open it the moment it is given a real size.
+    if (typeof ResizeObserver !== 'undefined') {
+      frameWatcher = new ResizeObserver(function () {
+        var w = frame.clientWidth, h = frame.clientHeight;
+        if (w <= 4 || h <= 4) return;
+        if (Math.abs(w - frameW) <= 24 && Math.abs(h - frameH) <= 24) return;
+        frameW = w;
+        frameH = h;
+        syncVisible();
+        if (!frameReady) return;      // the load in flight will paint this size
+        scheduleFit();
+      });
+      frameWatcher.observe(frame);
+    }
+    applyFrame();
+  }
+
+  function isIndicatorStackActive() {
+    return !!(wrapper && wrapper.classList.contains('ind-stack-on'));
+  }
+
+  // Point the frame at the current symbol/timeframe - a no-op when it already
+  // shows them, so a redraw of the dashboard does not reload the chart.
+  function applyFrame() {
+    if (!frame || isIndicatorStackActive()) return;
+    // Still hidden (locked dashboard): wait for the slot to get a size.
+    if (!boxHasSize()) { watchBoxSize(); return; }
+    var key = frameKey();
+    if (frame.dataset.tv === key) {
+      // Already requested - keep the watchdog armed if the frame is still
+      // silent, otherwise a re-entrant applyVisibility() would disarm it.
+      if (!frameReady && !loadTimer) armLoadTimer();
+      return;
+    }
+    frame.dataset.tv = key;
+    frameReady = false;
+    if (box) box.classList.remove('tv-frame-ready');
+    armLoadTimer();
+    // The embed keeps its whole config in the URL fragment, so switching a
+    // symbol only changes the fragment - and a fragment-only src assignment is
+    // a same-document navigation: the widget never reloads and the chart kept
+    // drawing the first market. A one-off query marker makes it a real load.
+    frameSeq++;
+    frame.src = frameSrc(tvSymbol, tvInterval, frameSeq);
+  }
+
+  /* ------------------------------------------- which chart is on screen -- */
+  // Visibility only controls layout. The embed and the indicator stack share
+  // the same TradingView instrument and quote regardless of this flag.
+  function syncVisible() {
+    var shown = !!(frame && frame.isConnected && frame.offsetParent !== null &&
+      getComputedStyle(frame).display !== 'none');
+    if (window.SOFT_TV_VISIBLE === shown) return;
+    window.SOFT_TV_VISIBLE = shown;
+    window.dispatchEvent(new CustomEvent('chart:tv-visible', { detail: { visible: shown } }));
+  }
+
+  function updateButton() {
+    if (!btn) return;
+    var show = wantActive && hasMapping && !tvBroken;
+    btn.classList.toggle('active', show);
+    btn.classList.toggle('tv-na', wantActive && (!hasMapping || tvBroken));
+    var label = $('tv-toggle-text');
+    if (label) {
+      label.textContent = show ? 'TradingView · ON'
+        : (tvBroken ? 'TradingView · retry'
+          : (wantActive ? 'TradingView · n/a' : 'TradingView · OFF'));
+    }
+    btn.title = tvBroken
+      ? 'TradingView could not be reached - the built-in chart is on screen; click to try TradingView again'
+      : (!hasMapping
+        ? 'TradingView has no symbol for this market - the built-in chart stays'
+        : 'Switch the candle chart between TradingView and the built-in chart');
+  }
+
+  // `persist` false = a temporary switch: the indicator layer needs the
+  // built-in chart to draw the ported studies, but the reader's TradingView
+  // preference must survive a reload.
+  function setWantActive(value, persist) {
+    wantActive = !!value;
+    if (persist) {
+      try { localStorage.setItem(STORAGE_KEY, wantActive ? '1' : '0'); } catch (e) {}
+    }
+    applyVisibility();
+  }
+
+  function applyVisibility() {
+    // TradingView is the only chart. Even when the embed fails we keep its
+    // slot and show the retry notice; the built-in canvas never appears.
+    if (wrapper) wrapper.classList.add('tv-mode');
+    if (box) box.classList.toggle('tv-frame-ready', frameReady);
+
+    window.SOFT_TV_ACTIVE = true;
+    updateButton();
+    window.dispatchEvent(new CustomEvent('chart:tv-mode', { detail: { active: true } }));
+
+    if (hasMapping && !isIndicatorStackActive()) {
+      watchBoxSize();      // a hidden slot cannot paint the embed
+      mountWidget();       // mounts + arms the load watchdog
+      applyFrame();
+    }
+    if (box) box.style.display = 'block';
+    var canvasBox = wrapper && wrapper.querySelector('.binance-canvas-box');
+    if (canvasBox) canvasBox.style.display = 'none';
+    syncVisible();
+  }
+
+  /* ------------------------------------------------------- cross chip --- */
+  // The hosted TradingView widget ignores style overrides (`studies_overrides`
+  // changes nothing - checked pixel by pixel), so its two moving averages
+  // cannot be recoloured from here. The crossover, though, is ours to compute:
+  // MA9 vs MA21 from the same candle feed the built-in chart uses, shown as a
+  // chip beside the chart toggle so the golden/death cross is readable at a
+  // glance while the TradingView frame is on screen.
+  var badge = null;
+  var crossTimer = null;
+  var crossSeq = 0;
+  var ourSymbol = '';
+  var ourTf = '';
+
+  function smaAt(closes, i, n) {
+    if (i < n - 1) return null;
+    var sum = 0;
+    for (var k = i - n + 1; k <= i; k++) sum += closes[k];
+    return sum / n;
+  }
+
+  function ensureBadge() {
+    if (badge && badge.isConnected) return badge;
+    var anchor = $('tv-chart-toggle');
+    if (!anchor || !anchor.parentNode) return null;
+    badge = document.createElement('div');
+    badge.className = 'tv-cross-badge pending';
+    badge.id = 'tv-cross-badge';
+    badge.title = 'MA 9 vs MA 21 crossover on the chart you are looking at';
+    badge.innerHTML = '<span class="tv-cross-label">MA 9 / 21</span>' +
+      '<span class="tv-cross-sub">reading candles&hellip;</span>';
+    anchor.parentNode.insertBefore(badge, anchor.nextSibling);
+    return badge;
+  }
+
+  // bars arrive as [time, open, high, low, close, volume]. Returns the current
+  // side of the crossover plus the bar where it last flipped, or null when the
+  // feed gave us too little history to average over.
+  function analyseCross(bars) {
+    if (!Array.isArray(bars)) return null;
+    var closes = [], stamps = [];
+    for (var i = 0; i < bars.length; i++) {
+      var bar = bars[i];
+      var close = Array.isArray(bar) ? bar[4] : Number(bar && bar.c);
+      var time = Array.isArray(bar) ? bar[0] : Number(bar && bar.t);
+      if (!isFinite(close)) return null;
+      closes.push(close);
+      stamps.push(time);
+    }
+    var last = closes.length - 1;
+    if (last < 21) return null;
+
+    function diff(i) {
+      var fast = smaAt(closes, i, 9);
+      var slow = smaAt(closes, i, 21);
+      if (fast === null || slow === null) return 0;
+      return fast - slow;
+    }
+
+    var now = diff(last);
+    var crossAt = 0;
+    for (var j = 21; j <= last; j++) {
+      var d = diff(j), prev = diff(j - 1);
+      if (prev !== 0 && d !== 0 && ((prev < 0 && d > 0) || (prev > 0 && d < 0))) {
+        crossAt = stamps[j];   // the most recent flip inside the window
+      }
+    }
+    return {
+      golden: now > 0,
+      crossAt: crossAt,
+      ma9: smaAt(closes, last, 9),
+      ma21: smaAt(closes, last, 21)
+    };
+  }
+
+  function fmtPrice(value) {
+    if (!isFinite(value)) return '--';
+    return value >= 1000 ? value.toFixed(2) : value.toFixed(value < 10 ? 5 : 3);
+  }
+
+  function paintBadge(result) {
+    var box = ensureBadge();
+    if (!box || !result) return;
+    box.classList.toggle('golden', !!result.golden);
+    box.classList.toggle('death', !result.golden);
+    box.classList.remove('pending');
+    var label = box.querySelector('.tv-cross-label');
+    if (label) label.textContent = result.golden ? 'GOLDEN CROSS' : 'DEATH CROSS';
+    var sub = box.querySelector('.tv-cross-sub');
+    if (sub) {
+      var when = result.crossAt ? new Date(result.crossAt) : null;
+      var hh = when ? ('0' + when.getUTCHours()).slice(-2) + ':' +
+        ('0' + when.getUTCMinutes()).slice(-2) : '';
+      sub.textContent = (hh ? 'crossed ' + hh + ' \u00b7 ' : '') +
+        'MA9 ' + fmtPrice(result.ma9) + ' \u00b7 MA21 ' + fmtPrice(result.ma21);
+    }
+  }
+
+  async function refreshCross() {
+    var box = ensureBadge();
+    if (!box) return;
+    var term = window.SoftradeXTerminal;
+    var sym = (term && typeof term.getCurrentSymbol === 'function')
+      ? term.getCurrentSymbol() : ourSymbol;
+    var tf = (term && typeof term.getInterval === 'function')
+      ? term.getInterval() : ourTf;
+    if (!sym || !tf) return;
+    var token = ++crossSeq;
+    try {
+      var res = await fetch('/api/chart/candles?symbol=' + encodeURIComponent(sym) +
+        '&tf=' + encodeURIComponent(tf) + '&count=60', { cache: 'no-store' });
+      if (!res.ok || token !== crossSeq) return;
+      var data = await res.json();
+      if (token !== crossSeq) return;
+      paintBadge(analyseCross(data && data.bars));
+    } catch (e) {
+      // keep the last label - a dropped request must not blank the chip
+    }
+  }
+
+  function startCrossFeed() {
+    ensureBadge();
+    void refreshCross();
+    if (crossTimer) clearInterval(crossTimer);
+    // 60 bars every 20s is a few KB - the cross only changes on a new bar,
+    // so anything faster would be traffic without information.
+    crossTimer = setInterval(function () {
+      if (!document.hidden) void refreshCross();
+    }, 20000);
+  }
+
+  /* ------------------------------------------------------------- wiring -- */
+  function init() {
+    wrapper = document.querySelector('#binance-terminal-section .binance-chart-wrapper');
+    box = $('tv-chart-box');
+    btn = $('tv-chart-toggle');
+    if (!wrapper || !box) return;
+
+    if (btn) {
+      btn.addEventListener('click', function () {
+        // While the embed is known-bad the button means "try again", so a user
+        // who clicks it is not silently flipped back to a broken preference.
+        if (tvBroken) { autoRetries = 0; retryNow(); return; }
+        setWantActive(!wantActive, true);
+      });
+    }
+
+    // Network state changes are the usual reason a third-party embed dies, so
+    // react to them instead of waiting for the next timer.
+    window.addEventListener('offline', function () {
+      if (window.SOFT_TV_ACTIVE === true || (wantActive && hasMapping)) markBroken('offline');
+    });
+    window.addEventListener('online', function () {
+      if (!tvBroken) return;
+      autoRetries = 0;
+      retryNow();
+    });
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) return;
+      if (tvBroken && autoRetries < MAX_AUTO_RETRIES) {
+        autoRetries++;
+        retryNow();
+        return;
+      }
+      // ResizeObserver notifications only arrive while the page is being
+      // painted, so a chart revealed while the tab was in the background kept
+      // its old geometry until something else resized it. Re-check on return.
+      if (frame && frameReady) {
+        var w = frame.clientWidth, h = frame.clientHeight;
+        if (w > 4 && h > 4 && (Math.abs(w - frameW) > 24 || Math.abs(h - frameH) > 24)) {
+          frameW = w;
+          frameH = h;
+          scheduleFit();
+        }
+      }
+    });
+
+    // The terminal announces every market change - map it and follow along.
+    window.addEventListener('chart:market', function (ev) {
+      var detail = ev.detail || {};
+      var meta = detail.meta || {};
+      var key = detail.symbol || meta.symbol || '';
+      if (key !== ourSymbol) {
+        if (quoteRequest) quoteRequest.abort();
+        quoteRequest = null;
+        quoteBusy = false;
+        window.SOFT_TV_QUOTE = null;
+      }
+      ourSymbol = key;
+      void refreshCross();       // new market = new candles = new crossover
+      var mapped = tvSymbolFor(key, meta);
+      if (mapped) {
+        tvSymbol = mapped;
+        hasMapping = true;
+      } else {
+        tvSymbol = '';
+        hasMapping = false;
+      }
+      applyVisibility();
+      pollTvQuote();
+    });
+
+    window.addEventListener('chart:interval', function (ev) {
+      var tf = (ev.detail && ev.detail.tf) || '';
+      ourTf = tf;
+      void refreshCross();
+      if (TF_MAP[tf]) {
+        tvInterval = TF_MAP[tf];
+        applyVisibility();
+      }
+    });
+
+    // The dashboard opens on the TradingView chart, full stop: a stored
+    // "built-in chart" preference from an older visit no longer hides it.
+    wantActive = true;
+    try { localStorage.setItem(STORAGE_KEY, '1'); } catch (e) {}
+
+    // The indicator stack shows/hides the frame by toggling a class on the
+    // wrapper, so lazy-mount TradingView when the stack turns off.
+    if (typeof MutationObserver !== 'undefined' && wrapper) {
+      new MutationObserver(function () {
+        if (!isIndicatorStackActive() && wantActive && hasMapping) {
+          watchBoxSize();
+          mountWidget();
+          applyFrame();
+        }
+        syncVisible();
+      }).observe(wrapper, {
+        attributes: true,
+        attributeFilter: ['class']
+      });
+    }
+
+    applyVisibility();
+    startCrossFeed();
+    startQuoteFeed();
+    window.addEventListener('softradex:theme', function () {
+      if (box && frame && !isIndicatorStackActive()) applyFrame();
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  // Small surface for debugging from the browser console.
+  window.TvChartHost = {
+    symbolFor: tvSymbolFor,
+    current: function () {
+      return {
+        symbol: tvSymbol,
+        interval: tvInterval,
+        active: window.SOFT_TV_ACTIVE === true,
+        ready: frameReady,
+        broken: tvBroken,
+        reason: brokenReason
+      };
+    },
+    retry: function () { autoRetries = 0; retryNow(); },
+    refreshQuote: pollTvQuote,
+    // Re-open the embed at the size it has now (fresh price scale, last bar in
+    // view). The resize/visibility paths call this on their own.
+    refit: function () { scheduleFit(); },
+    // Switch the chart without touching the saved preference (the indicator
+    // layer uses this so TradingView comes back on the next reload).
+    setActive: function (value, persist) { setWantActive(value, persist !== false); }
+  };
+})();
+
+
+// ==================== chart-overlay.js ====================
+/* ==========================================================================
+   Chart overlay (chart-overlay.js)
+   --------------------------------------------------------------------------
+   Two live cards that sit INSIDE the TradingView chart box, because the
+   TradingView embed draws its own canvas and the built-in overlay (the news
+   rails drawn by chart-news-events.js) cannot paint on top of it:
+
+   1. WHALES - the big prints of the charted market, split into BUY and SELL,
+      with the participation of each side and the last few prints.
+      Source: /api/chart/tape (the same tape the whale board reads).
+
+   2. NEWS - the next economic events that carry a predicted move for THIS
+      market, each with its direction and the amount it is expected to move,
+      plus the summed UP / DOWN expectation.
+      Source: window.ChartNewsOverlay.getEvents() - the calendar the news
+      section already refreshes - with /api/state as the fallback.
+
+   Nothing here invents numbers: a row without a predicted move is not given
+   one, and the card simply stays empty until the feeds answer.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var TAPE_MS = 12000;        // whale tape refresh
+  var NEWS_MS = 20000;        // news card repaint
+  var MAX_NEWS = 50;          // all selected-market events in the 24h window
+  var MAX_WHALES = 6;
+  var HORIZON_SEC = 24 * 3600;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  var root = null;
+  var box = null;
+  var symbol = '';
+  var digits = 2;
+
+  // LARGE FLOW is a floating readout: the reader can park it anywhere over the
+  // chart (TradingView frame or the indicator panes) and the spot survives
+  // reloads. Stored as a fraction of the free travel so it stays put when the
+  // chart box changes size between the two chart modes.
+  var DRAG_KEY = 'softradex.chart.flowcard';
+  var dragPos = null;
+  var dragging = false;
+
+  var prints = [];
+  var tapeAt = 0;
+  var tapeBusy = false;
+
+  var newsRows = [];
+  var newsSig = '';
+  var newsBusy = false;
+
+  /* ----------------------------------------------------------- helpers -- */
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+    });
+  }
+
+  function marketKey(v) {
+    return String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  }
+
+  function marketMatch(a, b) {
+    var x = marketKey(a);
+    var y = marketKey(b);
+    if (!x || !y) return false;
+    if (x === y) return true;
+    var short = x.length <= y.length ? x : y;
+    var long = x.length <= y.length ? y : x;
+    return short.length >= 5 && long.indexOf(short) === 0 && long.length - short.length <= 4;
+  }
+
+  function fmtPrice(p) {
+    var v = Number(p);
+    if (!isFinite(v)) return '—';
+    var d = v >= 1000 ? 2 : digits;
+    return v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+
+  function fmtClock(ms) {
+    var d = new Date(Number(ms) || Date.now());
+    return String(d.getHours()).padStart(2, '0') + ':' +
+      String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0');
+  }
+
+  function fmtMin(ts) {
+    var mins = Math.max(0, Math.round((ts - Date.now() / 1000) / 60));
+    if (mins < 60) return 'in ' + mins + 'm';
+    var h = Math.floor(mins / 60);
+    var m = mins % 60;
+    if (h < 24) return m ? 'in ' + h + 'h ' + m + 'm' : 'in ' + h + 'h';
+    return 'in ' + Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+  }
+
+  function fmtMoney(v) {
+    var n = Math.abs(Number(v) || 0);
+    if (!isFinite(n) || n === 0) return '';
+    var txt = n >= 100 ? n.toFixed(0) : n >= 1 ? n.toFixed(2) : n.toFixed(4);
+    return txt.replace(/\.?0+$/, '');
+  }
+
+  function normSide(v) {
+    var s = String(v || '').toLowerCase();
+    if (s === 'buy' || s === 'up' || s === 'bullish') return 'UP';
+    if (s === 'sell' || s === 'down' || s === 'bearish') return 'DOWN';
+    return '';
+  }
+
+  /* ------------------------------------------------------------- whales -- */
+  function fetchTape() {
+    if (tapeBusy || !symbol) return;
+    tapeBusy = true;
+    fetch('/api/chart/tape?symbol=' + encodeURIComponent(symbol) + '&limit=40', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data || symbol !== (data.symbol || symbol)) return;
+        var meta = data.meta || null;
+        if (meta && meta.digits !== undefined) digits = Number(meta.digits) || digits;
+        prints = Array.isArray(data.prints) ? data.prints : [];
+        tapeAt = Date.now();
+        renderWhales();
+        // The candle chart listens for this and marks the exact candles the
+        // whales bought / sold in (markers cannot be drawn inside the
+        // TradingView frame, so the tape feeds both views).
+        window.dispatchEvent(new CustomEvent('whale:prints', {
+          detail: { symbol: symbol, prints: prints }
+        }));
+      })
+      .catch(function () { /* keep the last tape */ })
+      .finally(function () { tapeBusy = false; });
+  }
+
+  function whaleStats() {
+    var buy = 0;
+    var sell = 0;
+    var buyPart = 0;
+    var sellPart = 0;
+    for (var i = 0; i < prints.length; i++) {
+      var p = prints[i];
+      var side = String(p.side || '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+      var part = Math.max(1, Number(p.ticks) || 1);
+      if (side === 'BUY') { buy++; buyPart += part; } else { sell++; sellPart += part; }
+    }
+    var total = buy + sell;
+    return {
+      buy: buy, sell: sell, buyPart: buyPart, sellPart: sellPart,
+      buyPct: total ? Math.round((buy / total) * 100) : 0,
+      partPct: (buyPart + sellPart) ? Math.round((buyPart / (buyPart + sellPart)) * 100) : 0,
+      total: total
+    };
+  }
+
+  function renderWhales() {
+    var wrap = $('tvo-w-body');
+    if (!wrap) return;
+    var st = whaleStats();
+    if (!st.total) {
+      wrap.innerHTML = '<div class="tvo-empty">waiting for large-flow prints…</div>';
+      return;
+    }
+    var bias = st.partPct >= 56 ? 'BUY' : st.partPct <= 44 ? 'SELL' : 'WAIT';
+    var confidence = Math.min(100, Math.abs(st.partPct - 50) * 2);
+    var rows = prints.slice(0, MAX_WHALES).map(function (p) {
+      var isBuy = String(p.side || '').toUpperCase() !== 'SELL';
+      var part = Math.max(1, Number(p.ticks) || 1);
+      return '<li class="tvo-w-row">' +
+        '<span class="tvo-w-time">' + esc(fmtClock(p.tm)) + '</span>' +
+        '<span class="tvo-w-side ' + (isBuy ? 'buy' : 'sell') + '">' + (isBuy ? '▲ BUY' : '▼ SELL') + '</span>' +
+        '<span class="tvo-w-px">' + esc(fmtPrice(p.px)) + '</span>' +
+        '<span class="tvo-w-part">' + part + 't</span>' +
+        '</li>';
+    }).join('');
+
+    wrap.innerHTML =
+      '<div class="tvo-flow-call ' + bias.toLowerCase() + '"><span>LARGE-FLOW ADVISORY</span><b>' + bias + '</b><em>' + confidence + '% confidence</em></div>' +
+      '<div class="tvo-w-split">' +
+        '<div class="tvo-w-col buy"><span>BUY</span><b>' + st.buy + '</b><em>' + st.buyPart + ' trades</em></div>' +
+        '<div class="tvo-w-col sell"><span>SELL</span><b>' + st.sell + '</b><em>' + st.sellPart + ' trades</em></div>' +
+      '</div>' +
+      '<div class="tvo-bar"><i class="buy" style="width:' + st.partPct + '%"></i><i class="sell" style="width:' + (100 - st.partPct) + '%"></i></div>' +
+      '<div class="tvo-w-cap"><span>BUY ' + st.partPct + '%</span><span>SELL ' + (100 - st.partPct) + '%</span></div>' +
+      '<ul class="tvo-w-list">' + rows + '</ul>';
+  }
+
+  /* --------------------------------------------------------------- news -- */
+  function eventsFromCalendar() {
+    var overlay = window.ChartNewsOverlay;
+    if (overlay && typeof overlay.getEvents === 'function') {
+      var rows = overlay.getEvents();
+      if (rows && rows.length) return rows;
+    }
+    return newsRows;
+  }
+
+  function impactFor(ev) {
+    var impacts = Array.isArray(ev.impacted) ? ev.impacted
+      : (Array.isArray(ev.impacted_markets) ? ev.impacted_markets : []);
+    for (var i = 0; i < impacts.length; i++) {
+      if (marketMatch(impacts[i].market, symbol)) return impacts[i];
+    }
+    return null;
+  }
+
+  function eventSide(ev, imp) {
+    if (imp) {
+      var d = normSide(imp.side) || normSide(imp.direction);
+      if (d) return d;
+    }
+    return normSide(ev.side) || 'WAIT';
+  }
+
+  function eventMove(ev, imp) {
+    if (!imp) return { amount: 0, text: '' };
+    var raw = imp.move_abs !== undefined ? imp.move_abs : imp.move_dollar;
+    var amount = Math.abs(Number(raw) || 0);
+    var text = String(imp.move_text_en || '').replace(/\s*(UP|DOWN)\s*$/i, '').trim();
+    if (!text && amount) text = fmtMoney(amount);
+    return { amount: amount, text: text };
+  }
+
+  function upcomingForMarket() {
+    var nowSec = Date.now() / 1000;
+    var all = eventsFromCalendar() || [];
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i];
+      if (window.DashboardPanels && window.DashboardPanels.newsPhase(e, nowSec) !== 'upcoming') continue;
+      var ts = Number(e.ts);
+      if (!(ts > nowSec - 120) || ts > nowSec + HORIZON_SEC) continue;
+      out.push(e);
+    }
+    // Only events mapped by backend.news_bot.compute_market_impacts onto THIS
+    // market. Keep low + medium + high, sort by release time, and preserve the
+    // complete next-24-hour list; the scrollable terminal owns presentation.
+    return out.filter(function (e) { return !!impactFor(e); })
+      .sort(function (a, b) { return Number(a.ts) - Number(b.ts); })
+      .slice(0, MAX_NEWS);
+  }
+
+  function renderNews() {
+    var wrap = $('tvo-n-body');
+    if (!wrap) return;
+    var rows = upcomingForMarket();
+    var up = 0;
+    var down = 0;
+    var html = rows.map(function (e) {
+      var imp = impactFor(e);
+      var side = eventSide(e, imp);
+      var mv = eventMove(e, imp);
+      var level = String(e.impact || 'low').toLowerCase();
+      if (['low', 'medium', 'high'].indexOf(level) < 0) level = 'low';
+      if (side === 'UP') up += mv.amount;
+      else if (side === 'DOWN') down += mv.amount;
+      var cls = side === 'UP' ? 'buy' : side === 'DOWN' ? 'sell' : 'wait';
+      var chip = side === 'UP' ? '▲ BUY' : side === 'DOWN' ? '▼ SELL' : '• WAIT';
+      var move = mv.text ? '<b class="tvo-n-move ' + cls + '">' + esc(mv.text) + '</b>' : '';
+      var at = new Date(Number(e.ts) * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return '<li class="tvo-n-row impact-' + level + '">' +
+        '<span class="tvo-n-level">' + level.toUpperCase() + '</span>' +
+        '<span class="tvo-n-chip ' + cls + '">' + chip + '</span>' +
+        '<span class="tvo-n-main">' +
+          '<span class="tvo-n-title">' + esc(String(e.title || '—')) + '</span>' +
+          '<span class="tvo-n-sub">' + esc(at) + ' · ' + esc(String(e.currency || '')) + ' · ' + esc(fmtMin(Number(e.ts))) + '</span>' +
+        '</span>' + move +
+        '</li>';
+    }).join('');
+
+    if (!rows.length) {
+      wrap.innerHTML = '<div class="tvo-empty">no news mapped to ' + esc(symbol || 'this market') + ' yet</div>';
+      return;
+    }
+
+    var upTxt = up ? '+$' + fmtMoney(up) : '—';
+    var downTxt = down ? '-$' + fmtMoney(down) : '—';
+    var upPct = (up + down) ? Math.round((up / (up + down)) * 100) : 50;
+
+    wrap.innerHTML =
+      '<div class="tvo-n-totals">' +
+        '<div class="tvo-n-total buy"><span>EST. UP · 24H</span><b>' + upTxt + '</b></div>' +
+        '<div class="tvo-n-total sell"><span>EST. DOWN · 24H</span><b>' + downTxt + '</b></div>' +
+      '</div>' +
+      '<div class="tvo-bar news"><i class="buy" style="width:' + upPct + '%"></i><i class="sell" style="width:' + (100 - upPct) + '%"></i></div>' +
+      '<ul class="tvo-n-list">' + html + '</ul>';
+  }
+
+  function refreshNewsSource() {
+    var access = window.SoftradeXStateAccess;
+    if (!access || !access.ready) return;
+    var overlay = window.ChartNewsOverlay;
+    if (overlay && typeof overlay.getEvents === 'function') {
+      var rows = overlay.getEvents();
+      if (rows && rows.length) { renderNews(); return; }
+    }
+    if (newsBusy) return;
+    newsBusy = true;
+    var revision = access.revision;
+    fetch('/api/state' + (newsSig ? '?have=' + encodeURIComponent(newsSig) : ''),
+      { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (st) {
+        if (!access.ready || access.revision !== revision) return;
+        // "news_omitted" means the feed left the calendar out because this
+        // browser already has it - keep the last list rather than clearing it.
+        if (!(st && st.bot5 && Array.isArray(st.bot5.news))) { renderNews(); return; }
+        var rows = st.bot5.news;
+        if (st.bot5.news_sig) newsSig = st.bot5.news_sig;
+        newsRows = rows.map(function (r) {
+          return Object.assign({}, r, {
+            ts: Number(r.ts) || 0,
+            title: r.title || r.event || '—',
+            currency: r.currency || '',
+            impact: String(r.impact || 'low').toLowerCase(),
+            side: r.side || '',
+            impacted: Array.isArray(r.impacted_markets) ? r.impacted_markets : []
+          });
+        }).filter(function (r) { return r.ts > 0; });
+        renderNews();
+      })
+      .catch(function () { if (access.ready && access.revision === revision) renderNews(); })
+      .finally(function () {
+        newsBusy = false;
+        if (access.ready && access.revision !== revision) refreshNewsSource();
+      });
+  }
+
+  /* -------------------------------------------------------------- mount -- */
+  function build() {
+    box = $('tv-chart-box');
+    if (!box || root) return;
+    root = document.createElement('div');
+    root.className = 'tvo';
+    root.id = 'tv-chart-overlay';
+    root.innerHTML =
+        '<div class="tvo-card tvo-whales">' +
+        '<div class="tvo-head"><span class="tvo-dot"></span>LARGE FLOW · CHART' +
+          '<button type="button" class="tvo-hint" id="tvo-candle-hint"' +
+            ' title="Whale buy/sell arrows on the candles - opens the candle chart">🐋 arrows</button>' +
+          '<em id="tvo-w-src">TAPE</em></div>' +
+        '<div id="tvo-w-body"><div class="tvo-empty">loading big prints…</div></div>' +
+      '</div>' +
+        '<div class="tvo-card tvo-news">' +
+        '<div class="tvo-head"><span class="tvo-dot news"></span>MARKET NEWS · NEXT 24H' +
+          '<em id="tvo-n-src">AI ESTIMATE</em></div>' +
+        '<div id="tvo-n-body"><div class="tvo-empty">loading the calendar…</div></div>' +
+      '</div>';
+    box.appendChild(root);
+  }
+
+  /* ------------------------------------------------------ drag position -- */
+  function loadDragPos() {
+    try {
+      var raw = JSON.parse(localStorage.getItem(DRAG_KEY) || 'null');
+      if (raw && isFinite(raw.x) && isFinite(raw.y)) {
+        return { x: Math.max(0, Math.min(1, Number(raw.x))), y: Math.max(0, Math.min(1, Number(raw.y))) };
+      }
+    } catch (e) { /* a broken preference just keeps the default corner */ }
+    return null;
+  }
+
+  function applyDragPos() {
+    var card = root && root.querySelector('.tvo-whales');
+    if (!card || !box) return;
+    // A resize / chart:refresh fired mid-drag used to snap the card back to
+    // the last saved spot under the reader's pointer.
+    if (dragging) return;
+    if (!dragPos) {
+      card.classList.remove('tvo-free');
+      card.style.left = '';
+      card.style.top = '';
+      card.style.right = '';
+      return;
+    }
+    card.classList.add('tvo-free');
+    var freeX = Math.max(0, box.clientWidth - card.offsetWidth);
+    var freeY = Math.max(0, box.clientHeight - card.offsetHeight);
+    card.style.left = Math.round(dragPos.x * freeX) + 'px';
+    card.style.top = Math.round(dragPos.y * freeY) + 'px';
+    card.style.right = 'auto';
+  }
+
+  // The whole card is the grip (it used to be only the ~10px header line,
+  // which was very hard to hit). Buttons inside the card stay buttons, and a
+  // double-click puts the card back in its default corner.
+  var DRAG_THRESHOLD = 3;   // px of travel before a press becomes a drag
+
+  function makeDraggable() {
+    var card = root.querySelector('.tvo-whales');
+    if (!card) return;
+    var drag = null;
+
+    function place(x, y) {
+      card.style.left = Math.round(x) + 'px';
+      card.style.top = Math.round(y) + 'px';
+      card.style.right = 'auto';
+    }
+
+    card.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0) return;
+      // the whale-arrow hint (and any future control) stays clickable
+      if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select')) return;
+      var rect = card.getBoundingClientRect();
+      var boxRect = box.getBoundingClientRect();
+      drag = {
+        id: ev.pointerId,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        dx: ev.clientX - rect.left,
+        dy: ev.clientY - rect.top,
+        w: rect.width,
+        h: rect.height,
+        boxRect: boxRect,
+        moved: false
+      };
+      try { if (card.setPointerCapture) card.setPointerCapture(ev.pointerId); } catch (e) {}
+      ev.preventDefault();
+    });
+
+    card.addEventListener('pointermove', function (ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      if (!drag.moved) {
+        if (Math.abs(ev.clientX - drag.startX) < DRAG_THRESHOLD &&
+            Math.abs(ev.clientY - drag.startY) < DRAG_THRESHOLD) return;
+        drag.moved = true;
+        dragging = true;
+        card.classList.add('dragging', 'tvo-free');
+        // the TradingView iframe must not swallow the pointer mid-drag
+        box.classList.add('tvo-dragging');
+      }
+      var maxX = Math.max(0, drag.boxRect.width - drag.w);
+      var maxY = Math.max(0, drag.boxRect.height - drag.h);
+      place(
+        Math.max(0, Math.min(maxX, ev.clientX - drag.boxRect.left - drag.dx)),
+        Math.max(0, Math.min(maxY, ev.clientY - drag.boxRect.top - drag.dy))
+      );
+      ev.preventDefault();
+    });
+
+    function endDrag() {
+      if (!drag) return;
+      var d = drag;
+      drag = null;
+      dragging = false;
+      card.classList.remove('dragging');
+      box.classList.remove('tvo-dragging');
+      // a plain click must not save a position (it used to save 0,0 and the
+      // card jumped to the top-left corner on the next resize)
+      if (!d.moved) return;
+      var maxX = Math.max(0, d.boxRect.width - d.w);
+      var maxY = Math.max(0, d.boxRect.height - d.h);
+      var x = parseFloat(card.style.left) || 0;
+      var y = parseFloat(card.style.top) || 0;
+      dragPos = { x: maxX > 0 ? x / maxX : 0, y: maxY > 0 ? y / maxY : 0 };
+      try { localStorage.setItem(DRAG_KEY, JSON.stringify(dragPos)); } catch (e) {}
+    }
+
+    card.addEventListener('pointerup', endDrag);
+    card.addEventListener('pointercancel', endDrag);
+    card.addEventListener('lostpointercapture', endDrag);
+
+    card.addEventListener('dblclick', function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest('button, a, input, select')) return;
+      dragPos = null;
+      try { localStorage.removeItem(DRAG_KEY); } catch (e) {}
+      applyDragPos();
+    });
+  }
+
+  function onMarket(sym, meta) {
+    var next = String(sym || '');
+    if (!next) return;
+    var changed = next !== symbol;
+    symbol = next;
+    if (meta && meta.digits !== undefined) digits = Number(meta.digits) || digits;
+    if (changed) {
+      prints = [];
+      renderWhales();
+      renderNews();
+      fetchTape();
+    }
+  }
+
+  function init() {
+    build();
+    if (!root) return;
+
+    dragPos = loadDragPos();
+    makeDraggable();
+    applyDragPos();
+    // The chart box resizes between the TradingView frame and the indicator
+    // panes (and on window resize): keep the parked card inside it.
+    window.addEventListener('resize', applyDragPos);
+    window.addEventListener('chart:refresh', applyDragPos);
+    if (typeof ResizeObserver === 'function') {
+      try { new ResizeObserver(function () { applyDragPos(); }).observe(box); } catch (e) {}
+    }
+
+    // One click back to the candle chart, where the whale markers sit on the
+    // exact candle the print happened in.
+    var hint = $('tvo-candle-hint');
+    if (hint) {
+      hint.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var toggle = $('tv-chart-toggle');
+        if (toggle) toggle.click();
+      });
+    }
+
+    var term = window.SoftradeXTerminal;
+    var cur = term && typeof term.getCurrentSymbol === 'function' ? term.getCurrentSymbol() : '';
+    if (cur) onMarket(cur, null);
+
+    window.addEventListener('chart:market', function (ev) {
+      var d = (ev && ev.detail) || {};
+      onMarket(d.symbol || (d.meta && d.meta.symbol), d.meta);
+    });
+
+    window.addEventListener('chart:snapshot', function (ev) {
+      var d = (ev && ev.detail) || {};
+      if (d.symbol && d.symbol !== symbol) onMarket(d.symbol, d.meta);
+      if (!tapeAt || Date.now() - tapeAt > TAPE_MS) fetchTape();
+    });
+
+    // TradingView mounted/toggled: rebuild the tape + calendar for the market
+    // that is on screen right now.
+    window.addEventListener('chart:refresh', function () {
+      fetchTape();
+      refreshNewsSource();
+    });
+
+    var stalePressure = $('tvo-pressure');
+    if (stalePressure && stalePressure.parentNode) stalePressure.parentNode.removeChild(stalePressure);
+
+    setInterval(function () { if (!document.hidden) fetchTape(); }, TAPE_MS);
+    setInterval(function () { if (!document.hidden) refreshNewsSource(); }, NEWS_MS);
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) { fetchTape(); refreshNewsSource(); }
+    });
+
+    refreshNewsSource();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    setTimeout(init, 300);
+  }
+
+  window.ChartOverlay = {
+    current: function () { return { symbol: symbol, prints: prints.length }; },
+    refresh: function () { fetchTape(); refreshNewsSource(); }
+  };
+  window.addEventListener('softradex:state-access', function () {
+    if (window.SoftradeXStateAccess && window.SoftradeXStateAccess.ready) {
+      refreshNewsSource();
+    } else {
+      newsRows = [];
+      newsSig = '';
+      renderNews();
+    }
+  });
+})();
+
+
+// ==================== tv-setups.js ====================
+/* Next extreme execution setups, priced live from the chart.
+   --------------------------------------------------------------------------
+   Ten levels, all measured on the daily candles the chart itself draws:
+
+     Today Low · Today High
+     Previous Day Low · Previous Day High
+     This Week Low · This Week High
+     Previous Week Low · Previous Week High
+     This Month Low · This Month High
+
+   Two feeds keep the panel honest:
+
+   1. /api/chart/candles (tf=1d) - the daily bars behind those ten levels.
+   2. /api/chart/ticker          - the live price, polled every 5 s, so the
+      price and every distance next to it move with the chart.
+   -------------------------------------------------------------------------- */
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+
+  var LEVELS_MS = 60000;   // re-read the daily extremes
+  var PRICE_MS = 5000;     // follow the chart price
+  var LEVEL_COUNT = 10;    // today/prev-day/week/prev-week/month, low + high
+  var WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+  var symbol = '';
+  var levels = [];         // [{ action, label, scope, price }]
+  var livePrice = 0;
+  var updatedAt = 0;
+  var feedNote = '';
+  var levelsBusy = false;
+  var priceBusy = false;
+  var levelsTimer = null;
+  var priceTimer = null;
+  var marketGeneration = 0;
+  var levelsAbort = null, priceAbort = null;
+  var quoteMaxAge = 15000;
+
+  function instrument() {
+    return window.TvChartHost && typeof window.TvChartHost.symbolFor === 'function'
+      ? window.TvChartHost.symbolFor(symbol) : '';
+  }
+
+  function acceptQuote(data) {
+    if (!data || cleanSymbol(data.symbol).toUpperCase() !== cleanSymbol(symbol).toUpperCase()) return false;
+    var target = instrument();
+    if (target && data.tv_symbol !== target) return false;
+    var stamp = Number(data.at || data.updated_at || data.updated || 0);
+    if (stamp < 1e12) stamp *= 1000;
+    if (!(Number(data.price) > 0) || data.stale || !stamp
+        || Date.now() - stamp > quoteMaxAge || stamp > Date.now() + 5000 || stamp < updatedAt) return false;
+    livePrice = Number(data.price);
+    updatedAt = stamp;
+    paint();
+    return true;
+  }
+
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function fmtPrice(v) {
+    var n = Number(v);
+    if (!isFinite(n) || n <= 0) return '—';
+    var d = n >= 1000 ? 2 : n >= 10 ? 3 : 5;
+    return n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  }
+  function fmtPct(v) {
+    var n = Number(v);
+    return isFinite(n) && n >= 0 ? n.toFixed(2) + '%' : '—';
+  }
+  function cleanSymbol(v) { return String(v || '').replace(/m$/, ''); }
+
+  // UTC Monday 00:00 of the week that holds ts - the same week boundary the
+  // chart's daily bars fall on, so "this week" means the current calendar week.
+  function weekStartUTC(ts) {
+    var d = new Date(Number(ts));
+    var back = (d.getUTCDay() + 6) % 7;   // Sunday(0) -> 6, Monday(1) -> 0
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - back);
+  }
+
+  function statusFor(level, price) {
+    if (!(level > 0) || !(price > 0)) {
+      return { status: 'PENDING', cls: 'pending', pct: null, dist: Infinity };
+    }
+    var dist = Math.abs(price - level);
+    var pct = (dist / price) * 100;
+    if (dist <= price * 0.0006) return { status: 'AT LEVEL', cls: 'trigger', pct: pct, dist: dist };
+    if (pct <= 0.35) return { status: 'IMMINENT', cls: 'imminent', pct: pct, dist: dist };
+    if (pct <= 1.2) return { status: 'APPROACHING', cls: 'approaching', pct: pct, dist: dist };
+    return { status: 'PENDING', cls: 'pending', pct: pct, dist: dist };
+  }
+
+  function paint() {
+    var list = $('tvs-list');
+    if (!list) return;
+    var symEl = $('tvs-symbol');
+    if (symEl) symEl.textContent = cleanSymbol(symbol) || 'XAUUSD';
+    var currentPrice = Date.now() - updatedAt <= quoteMaxAge ? livePrice : 0;
+    var priceEl = $('tvs-price');
+    if (priceEl) priceEl.textContent = fmtPrice(currentPrice);
+    var updEl = $('tvs-updated');
+    if (updEl) {
+      updEl.textContent = updatedAt
+        ? new Date(updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        : '—';
+    }
+    var countEl = $('tvs-count');
+    if (countEl) countEl.textContent = levels.length + ' / ' + LEVEL_COUNT;
+
+    if (!levels.length) {
+      list.innerHTML = '<div class="tvs-empty">' + esc(feedNote || 'Loading the daily levels…') + '</div>';
+      return;
+    }
+
+    var price = currentPrice;
+    var rows = levels.map(function (row) {
+      return { row: row, st: statusFor(Number(row.price), price) };
+    }).sort(function (a, b) { return a.st.dist - b.st.dist; });
+
+    list.innerHTML = rows.map(function (item, i) {
+      var row = item.row;
+      var st = item.st;
+      var buy = String(row.action || '').toUpperCase() === 'BUY';
+      var cls = buy ? 'buy' : 'sell';
+      return '<div class="tvs-row ' + cls + '">' +
+        '<span class="tvs-rank">#' + (i + 1) + '</span>' +
+        '<span class="tvs-action ' + cls + '">' + (buy ? '▲ BUY' : '▼ SELL') + '</span>' +
+        '<span class="tvs-main"><b>' + esc(row.label || 'Extreme level') + '</b>' +
+          '<small><span class="tvs-status status-' + esc(st.cls) + '">' + esc(st.status) + '</span> · ' + esc(row.scope || '') + '</small></span>' +
+        '<span class="tvs-level">' + fmtPrice(row.price) + '</span>' +
+        '<span class="tvs-dist ' + cls + '">' + fmtPct(st.pct) + '</span>' +
+      '</div>';
+    }).join('');
+  }
+
+  /* ------------------------------------------------ levels from the chart */
+  function loadLevels() {
+    if (levelsBusy || !symbol) return;
+    levelsBusy = true;
+    var requested = symbol, generation = marketGeneration, target = instrument();
+    var controller = new AbortController(); levelsAbort = controller;
+    var timeout = setTimeout(function () { controller.abort(); }, 25000);
+    fetch('/api/chart/' + (target ? 'tvcandles' : 'candles') + '?symbol=' + encodeURIComponent(requested) +
+      '&tf=1d&count=400' + (target ? '&tv_symbol=' + encodeURIComponent(target) : ''),
+      { cache: 'no-store', signal: controller.signal })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (generation !== marketGeneration || requested !== symbol
+            || (data && data.symbol && cleanSymbol(data.symbol).toUpperCase() !== cleanSymbol(requested).toUpperCase())) return;
+        var bars = (data && Array.isArray(data.bars) ? data.bars : []).filter(function (b) {
+          return Array.isArray(b) && isFinite(Number(b[2])) && isFinite(Number(b[3]));
+        });
+        if (bars.length < 2) {
+          levels = [];
+          feedNote = 'No daily candles for ' + (cleanSymbol(symbol) || 'this market') + ' yet.';
+          paint();
+          return;
+        }
+        var last = bars[bars.length - 1];
+        var prev = bars[bars.length - 2];
+
+        var lastDate = new Date(Number(last[0]));
+        var thisWeekStart = weekStartUTC(lastDate.getTime());
+        var prevWeekStart = thisWeekStart - WEEK_MS;
+        var monthHigh = -Infinity, monthLow = Infinity;
+        var weekHigh = -Infinity, weekLow = Infinity;
+        var prevWeekHigh = -Infinity, prevWeekLow = Infinity;
+        bars.forEach(function (b) {
+          var ts = Number(b[0]);
+          var d = new Date(ts);
+          var h = Number(b[2]), l = Number(b[3]);
+          if (d.getUTCFullYear() === lastDate.getUTCFullYear() &&
+              d.getUTCMonth() === lastDate.getUTCMonth()) {
+            if (h > monthHigh) monthHigh = h;
+            if (l < monthLow) monthLow = l;
+          }
+          if (ts >= thisWeekStart) {
+            if (h > weekHigh) weekHigh = h;
+            if (l < weekLow) weekLow = l;
+          } else if (ts >= prevWeekStart) {
+            if (h > prevWeekHigh) prevWeekHigh = h;
+            if (l < prevWeekLow) prevWeekLow = l;
+          }
+        });
+
+        levels = [
+          { action: 'BUY', label: 'Today Low', scope: 'DAY', price: Number(last[3]) },
+          { action: 'SELL', label: 'Today High', scope: 'DAY', price: Number(last[2]) },
+          { action: 'BUY', label: 'Previous Day Low', scope: 'PREV DAY', price: Number(prev[3]) },
+          { action: 'SELL', label: 'Previous Day High', scope: 'PREV DAY', price: Number(prev[2]) },
+          { action: 'BUY', label: 'This Week Low', scope: 'WEEK', price: weekLow },
+          { action: 'SELL', label: 'This Week High', scope: 'WEEK', price: weekHigh },
+          { action: 'BUY', label: 'Previous Week Low', scope: 'PREV WEEK', price: prevWeekLow },
+          { action: 'SELL', label: 'Previous Week High', scope: 'PREV WEEK', price: prevWeekHigh },
+          { action: 'SELL', label: 'This Month High', scope: 'MONTH', price: monthHigh },
+          { action: 'BUY', label: 'This Month Low', scope: 'MONTH', price: monthLow }
+        ].filter(function (row) {
+          return isFinite(Number(row.price)) && Number(row.price) > 0;
+        });
+
+        feedNote = levels.length ? '' : 'No extreme level inside the chart window.';
+        paint();
+      })
+      .catch(function () {
+        if (generation !== marketGeneration) return;
+        levels = [];
+        feedNote = 'The chart feed is not answering right now.';
+        paint();
+      })
+      .finally(function () { clearTimeout(timeout); if (generation === marketGeneration) { levelsBusy = false; levelsAbort = null; } });
+  }
+
+  /* ---------------------------------------------------- price from chart */
+  function loadPrice() {
+    if (priceBusy || !symbol) return;
+    if (acceptQuote(window.SOFT_TV_QUOTE) && Date.now() - updatedAt < 4500) return;
+    priceBusy = true;
+    var requested = symbol, generation = marketGeneration, target = instrument();
+    var controller = new AbortController(); priceAbort = controller;
+    var timeout = setTimeout(function () { controller.abort(); }, 12000);
+    fetch('/api/chart/' + (target ? 'tvquote' : 'ticker') + '?symbol=' + encodeURIComponent(requested) +
+      (target ? '&tv_symbol=' + encodeURIComponent(target) : ''), { cache: 'no-store', signal: controller.signal })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (t) {
+        if (generation === marketGeneration && requested === symbol) acceptQuote(t);
+      })
+      .catch(function () { /* keep the last price */ })
+      .finally(function () { clearTimeout(timeout); if (generation === marketGeneration) { priceBusy = false; priceAbort = null; } });
+  }
+
+  function setSymbol(next) {
+    var s = String(next || '');
+    if (!s || s === symbol) return;
+    symbol = s;
+    marketGeneration++;
+    if (levelsAbort) levelsAbort.abort();
+    if (priceAbort) priceAbort.abort();
+    levelsBusy = priceBusy = false;
+    levels = [];
+    livePrice = 0;
+    updatedAt = 0;
+    feedNote = 'Loading the daily levels…';
+    paint();
+    loadPrice();
+    loadLevels();
+  }
+
+  function init() {
+    var term = window.SoftradeXTerminal;
+    symbol = (term && typeof term.getCurrentSymbol === 'function')
+      ? String(term.getCurrentSymbol() || '') : '';
+    if (!symbol) symbol = 'XAUUSDm';
+    paint();
+    loadPrice();
+    loadLevels();
+
+    window.addEventListener('chart:market', function (ev) {
+      var d = (ev && ev.detail) || {};
+      setSymbol(d.symbol || (d.meta && d.meta.symbol) || '');
+    });
+    window.addEventListener('chart:refresh', function () { loadPrice(); loadLevels(); });
+    window.addEventListener('chart:tv-quote', function (ev) { acceptQuote(ev && ev.detail); });
+    window.addEventListener('tv:quote', function (ev) { acceptQuote(ev && ev.detail); });
+
+    if (levelsTimer) clearInterval(levelsTimer);
+    levelsTimer = setInterval(function () { if (!document.hidden) loadLevels(); }, LEVELS_MS);
+    if (priceTimer) clearInterval(priceTimer);
+    priceTimer = setInterval(function () { if (!document.hidden) loadPrice(); }, PRICE_MS);
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) { loadPrice(); loadLevels(); }
+    });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+
+  window.TvSetups = {
+    refresh: function () { loadPrice(); loadLevels(); },
+    state: function () { return { symbol: symbol, price: Date.now() - updatedAt <= quoteMaxAge ? livePrice : 0,
+      updatedAt: updatedAt, tv_symbol: instrument(), levels: levels }; }
+  };
+})();
+
+
+// ==================== setups-strip.js ====================
+/* All available extreme levels in one compact grid, nearest first. */
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+
+  var POLL_MS = 2000;
+
+  var track = null;
+  var heading = null;
+  var sig = '';
+
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function px(v) {
+    var n = Number(v);
+    if (!isFinite(n) || n <= 0) return '—';
+    var decimals = n >= 1000 ? 2 : n >= 10 ? 3 : 5;
+    return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  }
+  function pct(v) {
+    if (v == null) return '—';
+    var n = Number(v);
+    return isFinite(n) && n >= 0 ? n.toFixed(2) + '%' : '—';
+  }
+
+  function chips(levels, price) {
+    return levels.map(function (lv) {
+      var buy = String(lv.action || '').toUpperCase() === 'BUY';
+      var cls = buy ? 'buy' : 'sell';
+      var dist = price > 0 ? Math.abs(price - Number(lv.price)) / price * 100 : null;
+      return '<div class="bset-chip ' + cls + '" title="' + esc(lv.label + ' · ' + (lv.scope || '') + ' · ' + (buy ? 'BUY' : 'SELL')) + '">' +
+        '<span class="bset-side">' + (buy ? '▲' : '▼') + '</span>' +
+        '<span class="bset-body"><b>' + esc(lv.label || 'Level') + '</b>' +
+        '<small>' + esc(lv.scope || '') + '</small></span>' +
+        '<span class="bset-dist">' + pct(dist) + '</span>' +
+        '<span class="bset-price">' + px(lv.price) + '</span>' +
+      '</div>';
+    }).join('');
+  }
+
+  function render(levels, price) {
+    if (!track) return;
+    var sorted = levels.slice().sort(function (a, b) {
+      return Math.abs(price - Number(a.price)) - Math.abs(price - Number(b.price));
+    });
+    track.innerHTML = chips(sorted, price) || '<div class="bset-empty">Waiting for daily levels…</div>';
+    if (heading) heading.textContent = sorted.length ? 'NEXT ' + sorted.length + ' EXTREME SETUPS' : 'EXTREME SETUPS';
+  }
+
+  function poll() {
+    if (document.hidden) return;
+    var st = window.TvSetups && typeof window.TvSetups.state === 'function'
+      ? window.TvSetups.state() : null;
+    if (!st || !Array.isArray(st.levels)) return;
+    var levels = st.levels;
+    var price = Number(st.price) || 0;
+    var next = (st.symbol || '') + '|' + price + '|' + levels.length;
+    for (var i = 0; i < levels.length; i++) {
+      var lv = levels[i];
+      next += '|' + lv.action + ':' + lv.price + ':' + lv.label;
+    }
+    if (next === sig) return;
+    sig = next;
+    render(levels, price);
+  }
+
+  function init() {
+    track = $('bset-track');
+    var strip = $('b-strip-setups');
+    if (!track || !strip) return;
+    heading = $('bset-heading');
+
+    poll();
+    setInterval(poll, 3000);
+    window.addEventListener('chart:refresh', poll);
+    window.addEventListener('chart:market', poll);
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
+
+
+// ==================== extreme-levels.js ====================
+/* Draw Bot 3's five planned extreme prices over both chart views. */
+(function () {
+  'use strict';
+
+  var setups = [];
+  var setupSymbol = '';
+  var range = null;
+  var calculationTimer = null;
+  var calculationToken = 0;
+  var dynamicSymbol = '';
+
+  function normalize(value) {
+    return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  }
+
+  function matches(a, b) {
+    var left = normalize(a);
+    var right = normalize(b);
+    return left && right && (left === right || left.replace(/M$/, '') === right.replace(/M$/, ''));
+  }
+
+  function priceText(value) {
+    var number = Number(value);
+    if (!isFinite(number)) return '--';
+    return number >= 1000 ? number.toFixed(2) : number < 10 ? number.toFixed(5) : number.toFixed(3);
+  }
+
+  function weekKey(timestamp) {
+    var date = new Date(Number(timestamp) * 1000);
+    var day = date.getUTCDay() || 7;
+    date.setUTCDate(date.getUTCDate() - day + 1);
+    return date.getUTCFullYear() + '-' + String(date.getUTCMonth() + 1).padStart(2, '0') + '-' + String(date.getUTCDate()).padStart(2, '0');
+  }
+
+  function dayHighLow(bars) {
+    var high = -Infinity;
+    var low = Infinity;
+    bars.forEach(function (bar) {
+      high = Math.max(high, Number(bar[2]));
+      low = Math.min(low, Number(bar[3]));
+    });
+    return { high: high, low: low };
+  }
+
+  function calculateSetups(bars, symbol) {
+    if (!Array.isArray(bars) || bars.length < 2) return;
+    var valid = bars.filter(function (bar) {
+      return Array.isArray(bar) && isFinite(Number(bar[2])) && isFinite(Number(bar[3]));
+    });
+    if (valid.length < 2) return;
+    var current = valid[valid.length - 1];
+    var currentWeek = weekKey(current[0]);
+    var weekKeys = [];
+    valid.forEach(function (bar) {
+      var key = weekKey(bar[0]);
+      if (weekKeys.indexOf(key) < 0) weekKeys.push(key);
+    });
+    var previousWeek = weekKeys.length > 1 ? weekKeys[weekKeys.length - 2] : '';
+    var today = dayHighLow([current]);
+    var thisWeek = dayHighLow(valid.filter(function (bar) { return weekKey(bar[0]) === currentWeek; }));
+    var prevBars = valid.filter(function (bar) { return weekKey(bar[0]) === previousWeek; });
+    var previous = prevBars.length ? dayHighLow(prevBars) : thisWeek;
+    var price = Number(current[4]);
+    var previousBuy = Math.abs(price - previous.low) < Math.abs(price - previous.high);
+    setups = [
+      { action: 'BUY', label: 'Today Lower Low (LL)', price: today.low },
+      { action: 'SELL', label: 'Today Higher High (HH)', price: today.high },
+      { action: 'BUY', label: 'This Week Lower Low (LL)', price: thisWeek.low },
+      { action: 'SELL', label: 'This Week Higher High (HH)', price: thisWeek.high },
+      { action: previousBuy ? 'BUY' : 'SELL', label: previousBuy ? 'Prev Week Low (Floor)' : 'Prev Week High (Ceiling)', price: previousBuy ? previous.low : previous.high }
+    ];
+    setupSymbol = symbol;
+    dynamicSymbol = symbol;
+    window.dispatchEvent(new CustomEvent('bot3:planned-trades', {
+      detail: { symbol: symbol, planned: setups, source: 'chart-extreme-calculation' }
+    }));
+    render();
+  }
+
+  function refreshCalculation(symbol) {
+    if (!symbol) return;
+    var terminal = window.SoftradeXTerminal;
+    var token = ++calculationToken;
+    fetch('/api/chart/candles?symbol=' + encodeURIComponent(symbol) + '&tf=1d&count=60', { cache: 'no-store' })
+      .then(function (response) { return response.ok ? response.json() : null; })
+      .then(function (data) {
+        if (token !== calculationToken || !data || !Array.isArray(data.bars)) return;
+        calculateSetups(data.bars, symbol);
+      })
+      .catch(function () { /* keep the last calculated levels */ });
+    if (calculationTimer) clearInterval(calculationTimer);
+    calculationTimer = setInterval(function () {
+      if (!document.hidden) refreshCalculation(symbol);
+    }, 60000);
+  }
+
+  function ensureLayer(box) {
+    if (!box) return null;
+    var layer = box.querySelector('.extreme-levels-layer');
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.className = 'extreme-levels-layer';
+      box.appendChild(layer);
+    }
+    return layer;
+  }
+
+  function render() {
+    if (document.hidden || window.SOFT_TV_ACTIVE) return;
+    var box = document.getElementById('binance-canvas-box');
+    if (!box || box.style.display === 'none') return;
+    var terminal = window.SoftradeXTerminal;
+    var chartSymbol = terminal && typeof terminal.getCurrentSymbol === 'function'
+      ? terminal.getCurrentSymbol() : '';
+    var validRange = range && isFinite(range.min) && isFinite(range.max) && range.max > range.min;
+    var visible = validRange && matches(setupSymbol, chartSymbol);
+    var boxes = [box];
+
+    boxes.forEach(function (b) {
+      var layer = ensureLayer(b);
+      if (!layer) return;
+      if (!visible) {
+        if (layer.childElementCount) layer.innerHTML = '';
+        return;
+      }
+      var height = Number(range.height) || b.clientHeight || 1;
+      var html = setups.slice(0, 5).map(function (setup) {
+        var price = Number(setup.price);
+        if (!isFinite(price) || price <= 0) return '';
+        var y = (range.max - price) / (range.max - range.min) * height;
+        if (y < -8 || y > height + 8) return '';
+        var isBuy = String(setup.action || '').toUpperCase() === 'BUY';
+        var side = isBuy ? 'BUY' : 'SELL';
+        return '<div class="extreme-price-line ' + (isBuy ? 'buy' : 'sell') + '" style="top:' + y.toFixed(2) + 'px">' +
+          '<span class="extreme-price-label">' + side + ' · ' + priceText(price) + '</span>' +
+          '</div>';
+      }).join('');
+      layer.innerHTML = html;
+    });
+  }
+
+  window.addEventListener('bot3:planned-trades', function (event) {
+    var detail = event.detail || {};
+    if (detail.source !== 'chart-extreme-calculation' && dynamicSymbol && matches(dynamicSymbol, detail.symbol)) return;
+    setups = Array.isArray(detail.planned) ? detail.planned : [];
+    setupSymbol = detail.symbol || '';
+    render();
+  });
+
+  window.addEventListener('chart:market', function (event) {
+    var detail = event.detail || {};
+    var symbol = detail.symbol || (detail.meta && detail.meta.symbol) || '';
+    if (symbol && !matches(dynamicSymbol, symbol)) {
+      setups = [];
+      setupSymbol = symbol;
+      render();
+    }
+    refreshCalculation(symbol);
+  });
+
+  window.addEventListener('chart:price-range', function (event) {
+    range = event.detail || null;
+    render();
+  });
+
+  window.addEventListener('resize', render);
+  function bootExtremeLevels() {
+    render();
+    setTimeout(function () {
+      var terminal = window.SoftradeXTerminal;
+      if (terminal && typeof terminal.getCurrentSymbol === 'function') {
+        refreshCalculation(terminal.getCurrentSymbol());
+      }
+    }, 500);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootExtremeLevels);
+  else bootExtremeLevels();
+})();
+
+
+// ==================== chart-indicators.js ====================
+/* ==========================================================================
+   Chart indicators (chart-indicators.js)
+   --------------------------------------------------------------------------
+   The three Pine Script indicators shipped in /Indicator, ported to this
+   dashboard's own engine and drawn as THREE SEPARATE PANES inside the chart
+   panel - one study per pane, never mixed on a single surface:
+
+     1. MSB · OB      Indicator/Chart Indicator 1.txt  (EmreKb, Pine v5)
+                      candles + zigzag structure, MSB lines/labels and the
+                      Bu-OB / Be-OB / Bu-BB / Be-BB boxes.
+     2. WaveTrend     Indicator/chart indicator 2.txt  (LazyBear, Pine v4)
+                      oscillator pane: WT1 / WT2 with the +-53 / +-60 bands and
+                      the WT1-WT2 area.
+     3. ICT Killzones Indicator/chart indicator 3.txt  (TFO, Pine v6)
+                      candles + Asia/London/NY AM/NY PM session boxes, session
+                      high/low pivots (extended until mitigated) and previous
+                      day/week high, low and midline levels. The script's stats
+                      table and its text_area driven level/opening-price lists
+                      are not drawn; everything else follows its defaults.
+
+   Why a port: the hosted TradingView embed refuses custom Pine ("It is not
+   possible to add pine scripts to widgets at this time"), and a cross-origin
+   iframe cannot be painted into. The panes therefore read the same
+   TradingView instrument's /api/chart/tvcandles series and share its bar geometry
+   (chart:geometry), so every study lines up with the candles.
+
+   Nothing here invents prices: with no bars the panes stay empty.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var STORE_KEY = 'softradex.chart.ind2';   // v2: the study bar now opens with MSB · OB on
+  var ZOOM_KEY = 'softradex.chart.ind.zoom';
+  var TF_SECONDS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
+  var CANDLE_COUNT = 500;
+  var REFRESH_MS = 12000;
+  var lastRenderKey = '';
+  var paneSizes = new WeakMap();
+  var paneObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(function (entries) {
+    var changed = false;
+    entries.forEach(function (entry) {
+      var width = Math.round(entry.contentRect.width), height = Math.round(entry.contentRect.height);
+      var previous = paneSizes.get(entry.target);
+      if (!previous || previous.width !== width || previous.height !== height) {
+        paneSizes.set(entry.target, {width: width, height: height});
+        changed = true;
+      }
+    });
+    if (changed) schedule();
+  }) : null;
+
+  var INDICATORS = [
+    {
+      id: 'msb',
+      label: 'MSB · OB',
+      sub: 'Chart Indicator 1 · Market Structure Break & Order Block',
+      title: 'Market Structure Break & Order Block (Indicator/Chart Indicator 1.txt) — zigzag MSB, Bu-OB / Be-OB and break blocks'
+    },
+    {
+      id: 'wavetrend',
+      label: 'WaveTrend',
+      sub: 'chart indicator 2 · WaveTrend [LazyBear]',
+      title: 'WaveTrend [LazyBear] (Indicator/chart indicator 2.txt) — WT1 / WT2 with ±53 and ±60 bands'
+    },
+    {
+      id: 'killzones',
+      label: 'ICT Killzones',
+      sub: 'chart indicator 3 · ICT Killzones & Pivots [TFO]',
+      title: 'ICT Killzones & Pivots [TFO] (Indicator/chart indicator 3.txt) — Asia/London/NY session boxes, session pivots, previous day and week levels'
+    }
+  ];
+
+  var LIGHT_COLORS = {
+    background: '#ffffff',
+    up: '#089981',
+    upFill: 'rgba(8, 153, 129, 0.16)',
+    upLine: 'rgba(8, 153, 129, 0.75)',
+    down: '#f23645',
+    downFill: 'rgba(242, 54, 69, 0.16)',
+    downLine: 'rgba(242, 54, 69, 0.75)',
+    structure: '#64748b',
+    text: '#1f2937',
+    muted: '#64748b',
+    grid: '#e6edf9',
+    tagBg: 'rgba(255, 255, 255, 0.88)',
+    zoneBuyFill: '#e6f5ef',
+    zoneSellFill: '#fdebef'
+  };
+  var DARK_COLORS = {
+    background: '#0b1220',
+    up: '#34d399',
+    upFill: 'rgba(52, 211, 153, 0.18)',
+    upLine: 'rgba(52, 211, 153, 0.78)',
+    down: '#f87171',
+    downFill: 'rgba(248, 113, 113, 0.18)',
+    downLine: 'rgba(248, 113, 113, 0.78)',
+    structure: '#94a3b8',
+    text: '#e2e8f0',
+    muted: '#94a3b8',
+    grid: 'rgba(148, 163, 184, 0.14)',
+    tagBg: 'rgba(15, 23, 42, 0.88)',
+    zoneBuyFill: 'rgba(16, 185, 129, 0.16)',
+    zoneSellFill: 'rgba(239, 68, 68, 0.16)'
+  };
+  var COLORS = Object.assign({}, LIGHT_COLORS);
+  function syncIndicatorTheme() {
+    var dark = document.documentElement.classList.contains('sx-dark');
+    Object.assign(COLORS, dark ? DARK_COLORS : LIGHT_COLORS);
+  }
+  syncIndicatorTheme();
+
+  /* ------------------------------------------------------------ state ---- */
+  var enabled = {};
+  (function restore() {
+    var saved = null;
+    try { saved = localStorage.getItem(STORE_KEY); } catch (e) { /* private mode */ }
+    // First visit: the chart opens with the market-structure study already on,
+    // so the site lands on candles + MSB / OB instead of a bare chart. A saved
+    // choice (including "everything off") is always respected - with no study
+    // on, the TradingView chart is what shows.
+    if (saved === null) {
+      enabled.msb = true;
+      savePrefs();
+      return;
+    }
+    try {
+      var raw = JSON.parse(saved || '[]');
+      if (Array.isArray(raw)) raw.forEach(function (id) { enabled[String(id)] = true; });
+    } catch (e) {
+      enabled.msb = true;
+    }
+  })();
+
+  var bars = [];              // [{ t, o, h, l, c, v }] oldest -> newest
+  var dataSymbol = '';
+  var dataTf = '';
+  var dataInstrument = '';
+  var dataError = '';
+  var barsRequest = null;
+  var barsRequestKey = '';
+  var livePrice = 0;
+  var livePriceAt = 0;
+  var dataToken = 0;
+  var loading = false;
+  var refreshTimer = null;
+
+  var geometry = null;        // chart:geometry (bar slot, price band, pan)
+  var stack = null;           // #chart-indicator-stack
+  // shared viewport for every pane: how many bars are in view and how far
+  // back the reader panned (TradingView style wheel zoom + drag pan)
+  // 78 bars fills the pane like a TradingView chart; 140 made every candle a
+  // hairline. offset 0 = the newest bar sits on the right edge.
+  var view = { bars: 78, offset: 0 };
+  var MIN_BARS = 24;
+  var MAX_BARS = 500;
+  (function restoreZoom() {
+    try {
+      var savedBars = Number(localStorage.getItem(ZOOM_KEY));
+      if (isFinite(savedBars) && savedBars >= MIN_BARS && savedBars <= MAX_BARS) {
+        view.bars = Math.round(savedBars);
+      }
+    } catch (e) {}
+  })();
+  function saveZoom() {
+    try { localStorage.setItem(ZOOM_KEY, String(Math.round(view.bars))); } catch (e) {}
+  }
+  var rafPending = false;
+  var toastTimer = null;
+
+  function $(id) { return document.getElementById(id); }
+
+  function anyEnabled() {
+    return INDICATORS.some(function (ind) { return enabled[ind.id] === true; });
+  }
+
+  function savePrefs() {
+    var list = INDICATORS.filter(function (ind) { return enabled[ind.id]; })
+      .map(function (ind) { return ind.id; });
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+
+  function currentSymbol() {
+    var terminal = window.SoftradeXTerminal;
+    if (terminal && typeof terminal.getCurrentSymbol === 'function') {
+      return String(terminal.getCurrentSymbol() || '');
+    }
+    return dataSymbol;
+  }
+
+  function currentTf() {
+    // softradex-terminal.js exports getInterval(); other builds expose
+    // getCurrentInterval(). Reading only one of them left the studies stuck on
+    // the timeframe they were first loaded with, so both are accepted here.
+    var terminal = window.SoftradeXTerminal || window.BinanceTerminal;
+    if (terminal) {
+      var tf = '';
+      if (typeof terminal.getCurrentInterval === 'function') tf = String(terminal.getCurrentInterval() || '');
+      else if (typeof terminal.getInterval === 'function') tf = String(terminal.getInterval() || '');
+      if (TF_SECONDS[tf]) return tf;
+    }
+    return dataTf || '5m';
+  }
+
+  function tfSeconds() {
+    return TF_SECONDS[dataTf] || TF_SECONDS[currentTf()] || 300;
+  }
+
+  /* ------------------------------------------------------------- data ---- */
+  function mappedInstrument(symbol) {
+    var host = window.TvChartHost;
+    var terminal = window.SoftradeXTerminal || window.BinanceTerminal;
+    var meta = terminal && terminal.MARKETS && terminal.MARKETS[symbol];
+    return host && typeof host.symbolFor === 'function' ? host.symbolFor(symbol, meta || {}) : '';
+  }
+
+  function acceptQuote(q) {
+    if (!dataInstrument || !q || q.symbol !== dataSymbol || q.tv_symbol !== dataInstrument ||
+        currentSymbol() !== dataSymbol || currentTf() !== dataTf) return false;
+    var price = Number(q.price), at = Number(q.at), now = Date.now();
+    if (!(price > 0) || !isFinite(price) || !at || at < livePriceAt ||
+        now - at > 30000 || at > now + 5000) return false;
+    livePrice = price;
+    livePriceAt = at;
+    // Keep the live forming candle synchronized with TradingView ticks in-place
+    // so historical references remain intact and studies only recalculate tail updates.
+    var last = bars[bars.length - 1];
+    if (last) {
+      var tfMs = tfSeconds() * 1000;
+      var tickTs = Number(q.exchange_ts) > 0 ? Number(q.exchange_ts) * 1000 : at;
+      var bucket = Math.floor(tickTs / tfMs) * tfMs;
+      if (bucket === last.t) {
+        var nextH = Math.max(last.h, price);
+        var nextL = Math.min(last.l, price);
+        if (last.c === price && last.h === nextH && last.l === nextL) return true;
+        last.h = nextH;
+        last.l = nextL;
+        last.c = price;
+      } else if (bucket > last.t && bucket - last.t <= tfMs * 2 && q.market_open !== false) {
+        bars.push({ t: bucket, o: last.c, h: Math.max(last.c, price),
+          l: Math.min(last.c, price), c: price, v: 0 });
+      }
+    }
+    schedule();
+    return true;
+  }
+
+  function normalise(rows) {
+    if (!Array.isArray(rows)) return [];
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!Array.isArray(row) || row.length < 5) continue;
+      var o = Number(row[1]), h = Number(row[2]), l = Number(row[3]), c = Number(row[4]);
+      if (!isFinite(o) || !isFinite(h) || !isFinite(l) || !isFinite(c)) continue;
+      // the feed answers in seconds; the chart's own klines carry milliseconds
+      var t = Math.round(Number(row[0]));
+      if (t > 0 && t < 1e11) t *= 1000;
+      out.push({ t: t, o: o, h: h, l: l, c: c, v: Number(row[5]) || 0 });
+    }
+    return out;
+  }
+
+  function loadBars() {
+    var symbol = currentSymbol();
+    var tf = currentTf();
+    if (!symbol) return;
+    var instrument = mappedInstrument(symbol);
+    var key = symbol + '|' + tf + '|' + instrument;
+    if (barsRequest && barsRequestKey === key) return;
+    if (barsRequest) barsRequest.abort();
+    var token = ++dataToken;
+    var controller = new AbortController();
+    barsRequest = controller;
+    barsRequestKey = key;
+    if (dataSymbol !== symbol || dataTf !== tf || dataInstrument !== instrument) {
+      bars = [];
+      livePrice = livePriceAt = 0;
+    }
+    dataSymbol = symbol;
+    dataTf = tf;
+    dataInstrument = instrument;
+    dataError = '';
+    loading = true;
+    syncButtons();
+    schedule();
+    var timeout = setTimeout(function () { controller.abort(); }, 25000);
+    var url = (instrument ? '/api/chart/tvcandles' : '/api/chart/candles') +
+      '?symbol=' + encodeURIComponent(symbol) + '&tf=' + encodeURIComponent(tf) + '&count=' + CANDLE_COUNT;
+    if (instrument) url += '&tv_symbol=' + encodeURIComponent(instrument);
+    fetch(url, { cache: 'no-store', signal: controller.signal })
+      .then(function (response) { return response.ok ? response.json() : null; })
+      .then(function (data) {
+        if (token !== dataToken || symbol !== currentSymbol() || tf !== currentTf()) return;
+        if (instrument && (!data || !data.ok || data.symbol !== symbol ||
+            data.tf !== tf || data.tv_symbol !== instrument)) throw new Error('TradingView candles unavailable');
+        var next = normalise(data && data.bars);
+        if (!next.length) throw new Error('Candles unavailable');
+        // Never allow a smaller background response to shrink existing history and trigger auto zoom-in.
+        if (bars.length >= 250 && next.length < bars.length * 0.8 &&
+            dataSymbol === symbol && dataTf === tf && dataInstrument === instrument) {
+          var firstNextT = next[0].t;
+          var prefix = [];
+          for (var pi = 0; pi < bars.length; pi++) {
+            if (bars[pi].t < firstNextT) prefix.push(bars[pi]);
+            else break;
+          }
+          bars = prefix.concat(next).slice(-CANDLE_COUNT);
+        } else {
+          bars = next;
+        }
+        view.offset = clampOffset(view.offset);
+        if (!acceptQuote(window.SOFT_TV_QUOTE) && !(livePrice > 0)) {
+          livePrice = bars[bars.length - 1].c;
+          livePriceAt = 0;
+        }
+        schedule();
+      })
+      .catch(function () {
+        if (token !== dataToken) return;
+        dataError = instrument ? 'TradingView candles unavailable' : 'Market candles unavailable';
+        // Keep only this instrument's cached bars. No proxy-feed fallback.
+      })
+      .finally(function () {
+        clearTimeout(timeout);
+        if (token !== dataToken) return;
+        barsRequest = null;
+        loading = false;
+        syncButtons();
+        schedule();
+      });
+  }
+
+  function armRefresh() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(function () {
+      if (anyEnabled()) loadBars();
+    }, REFRESH_MS);
+  }
+
+  var msbCache = { key: '', res: null };
+  var wtCache = { key: '', res: null };
+  var nyStampCache = new Map();
+
+  function seriesKey(series) {
+    var n = series ? series.length : 0;
+    if (!n) return '';
+    var last = series[n - 1];
+    return dataSymbol + '|' + dataTf + '|' + n + '|' + series[0].t + '|' + last.t + '|' + last.o + '|' + last.h + '|' + last.l + '|' + last.c;
+  }
+
+  /* ================================================== 1. MSB-OB ========== */
+  // Direct port of the Pine v5 script. Memoized by series snapshot so 60fps
+  // zoom/pan frames and unchanged ticks reuse structure in O(1).
+  function computeMSB(series) {
+    var sk = seriesKey(series);
+    if (sk && msbCache.key === sk && msbCache.res) return msbCache.res;
+    var LEN = 9;            // zigzag_len
+    var FIB = 0.33;         // fib_factor
+    var n = series.length;
+    var result = { zigzag: [], msb: [], boxes: [] };
+    if (n < LEN * 3) { msbCache = { key: sk, res: result }; return result; }
+
+    var toUp = new Array(n);
+    var toDown = new Array(n);
+    var i, k;
+    for (i = 0; i < n; i++) {
+      var hi = -Infinity, lo = Infinity;
+      for (k = Math.max(0, i - LEN + 1); k <= i; k++) {
+        if (series[k].h > hi) hi = series[k].h;
+        if (series[k].l < lo) lo = series[k].l;
+      }
+      toUp[i] = series[i].h >= hi;
+      toDown[i] = series[i].l <= lo;
+    }
+
+    function lastTrue(flags, end) {
+      for (var j = end; j >= 0; j--) if (flags[j]) return j;
+      return -1;
+    }
+
+    var lowVal = new Array(n), lowIdx = new Array(n);
+    var highVal = new Array(n), highIdx = new Array(n);
+    var lowFlag = new Array(n), highFlag = new Array(n);
+
+    for (i = 0; i < n; i++) {
+      var upSince = lastTrue(toUp, i - 1);
+      var upWin = (upSince >= 0 && (i - 1 - upSince) > 0) ? (i - 1 - upSince) : 1;
+      var lo2 = Infinity;
+      for (k = Math.max(0, i - upWin + 1); k <= i; k++) if (series[k].l < lo2) lo2 = series[k].l;
+      lowVal[i] = lo2;
+      lowFlag[i] = lowVal[i] === series[i].l;
+
+      var downSince = lastTrue(toDown, i - 1);
+      var downWin = (downSince >= 0 && (i - 1 - downSince) > 0) ? (i - 1 - downSince) : 1;
+      var hi2 = -Infinity;
+      for (k = Math.max(0, i - downWin + 1); k <= i; k++) if (series[k].h > hi2) hi2 = series[k].h;
+      highVal[i] = hi2;
+      highFlag[i] = highVal[i] === series[i].h;
+    }
+    for (i = 0; i < n; i++) {
+      lowIdx[i] = lastTrue(lowFlag, i);
+      highIdx[i] = lastTrue(highFlag, i);
+    }
+
+    var trend = 1;
+    var market = 1;
+    var highPts = [];
+    var lowPts = [];
+    var lastL0 = NaN;
+    var lastH0 = NaN;
+    var buOb = [], beOb = [], buBb = [], beBb = [];
+
+    for (i = 0; i < n; i++) {
+      var prevTrend = trend;
+      if (trend === 1 && toDown[i]) trend = -1;
+      else if (trend === -1 && toUp[i]) trend = 1;
+      var trendChanged = trend !== prevTrend;
+
+      if (trendChanged) {
+        if (trend === 1 && lowIdx[i] >= 0) lowPts.push({ i: lowIdx[i], p: lowVal[i] });
+        if (trend === -1 && highIdx[i] >= 0) highPts.push({ i: highIdx[i], p: highVal[i] });
+      }
+
+      if (highPts.length < 2 || lowPts.length < 2) continue;
+
+      var h0 = highPts[highPts.length - 1];
+      var h1 = highPts[highPts.length - 2];
+      var l0 = lowPts[lowPts.length - 1];
+      var l1 = lowPts[lowPts.length - 2];
+
+      if (trendChanged) {
+        if (trend === 1) result.zigzag.push({ x1: h0.i, y1: h0.p, x2: l0.i, y2: l0.p });
+        else result.zigzag.push({ x1: l0.i, y1: l0.p, x2: h0.i, y2: h0.p });
+      }
+
+      var before = market;
+      if (!(lastL0 === l0.p || lastH0 === h0.p)) {
+        if (market === 1 && l0.p < l1.p && l0.p < l1.p - Math.abs(h0.p - l1.p) * FIB) market = -1;
+        else if (market === -1 && h0.p > h1.p && h0.p > h1.p + Math.abs(h1.p - l0.p) * FIB) market = 1;
+      }
+      var marketChanged = market !== before;
+      if (marketChanged) {
+        lastL0 = l0.p;
+        lastH0 = h0.p;
+      }
+
+      if (marketChanged) {
+        var buObIdx = i, buBbIdx = i, beObIdx = i, beBbIdx = i;
+        if (market === 1) {
+          result.msb.push({ dir: 1, i0: h1.i, i1: h0.i, p: h1.p, labelI: Math.round((h1.i + l0.i) / 2), labelP: h1.p });
+          var scanEnd = (i - LEN >= 0 && lowIdx[i - LEN] >= 0) ? lowIdx[i - LEN] : i;
+          for (k = Math.max(0, h1.i); k <= Math.min(scanEnd, i - 1); k++) {
+            if (series[k].o > series[k].c) buObIdx = k;
+          }
+          for (k = Math.max(0, l1.i - LEN); k <= Math.min(h1.i, i - 1); k++) {
+            if (series[k].o < series[k].c) buBbIdx = k;
+          }
+          buOb.push(makeBox(series, buObIdx, i, 'Bu-OB', 1));
+          buBb.push(makeBox(series, buBbIdx, i, l0.p < l1.p ? 'Bu-BB' : 'Bu-MB', 1));
+        } else {
+          result.msb.push({ dir: -1, i0: l1.i, i1: l0.i, p: l1.p, labelI: Math.round((l1.i + h0.i) / 2), labelP: l1.p });
+          var scanEnd2 = (i - LEN >= 0 && highIdx[i - LEN] >= 0) ? highIdx[i - LEN] : i;
+          for (k = Math.max(0, l1.i); k <= Math.min(scanEnd2, i - 1); k++) {
+            if (series[k].o < series[k].c) beObIdx = k;
+          }
+          for (k = Math.max(0, h1.i - LEN); k <= Math.min(l1.i, i - 1); k++) {
+            if (series[k].o > series[k].c) beBbIdx = k;
+          }
+          beOb.push(makeBox(series, beObIdx, i, 'Be-OB', -1));
+          beBb.push(makeBox(series, beBbIdx, i, h0.p > h1.p ? 'Be-BB' : 'Be-MB', -1));
+        }
+      }
+
+      maintain(buOb, series[i], i, 1);
+      maintain(beOb, series[i], i, -1);
+      maintain(buBb, series[i], i, 1);
+      maintain(beBb, series[i], i, -1);
+    }
+
+    result.boxes = buOb.concat(buBb, beOb, beBb).filter(function (b) { return !b.gone; });
+    msbCache = { key: sk, res: result };
+    return result;
+  }
+
+  function makeBox(series, from, created, text, dir) {
+    var bar = series[Math.max(0, Math.min(from, series.length - 1))];
+    return {
+      from: from,
+      right: Math.min(series.length - 1, created + 10),
+      top: bar.h,
+      bottom: bar.l,
+      text: text,
+      dir: dir,
+      gone: false
+    };
+  }
+
+  function maintain(list, bar, i, dir) {
+    for (var k = 0; k < list.length; k++) {
+      var b = list[k];
+      if (b.gone) continue;
+      if (dir === 1) {
+        if (bar.c < b.bottom) b.gone = true;
+        else if (bar.c < b.top) { /* price inside the demand block */ }
+        else b.right = i;
+      } else {
+        if (bar.c > b.top) b.gone = true;
+        else if (bar.c > b.bottom) { /* price inside the supply block */ }
+        else b.right = i;
+      }
+    }
+  }
+
+  /* ============================================ 2. WaveTrend ============== */
+  function ema(values, length) {
+    var out = new Array(values.length);
+    var k = 2 / (length + 1);
+    var prev = null;
+    for (var i = 0; i < values.length; i++) {
+      var v = values[i];
+      if (!isFinite(v)) { out[i] = null; continue; }
+      prev = prev === null ? v : v * k + prev * (1 - k);
+      out[i] = prev;
+    }
+    return out;
+  }
+
+  function sma(values, length) {
+    var out = new Array(values.length);
+    for (var i = 0; i < values.length; i++) {
+      if (i < length - 1) { out[i] = null; continue; }
+      var sum = 0, ok = true;
+      for (var k = i - length + 1; k <= i; k++) {
+        if (!isFinite(values[k])) { ok = false; break; }
+        sum += values[k];
+      }
+      out[i] = ok ? sum / length : null;
+    }
+    return out;
+  }
+
+  function computeWaveTrend(series) {
+    var sk = seriesKey(series);
+    if (sk && wtCache.key === sk && wtCache.res) return wtCache.res;
+    var N1 = 10, N2 = 21;
+    var ap = series.map(function (b) { return (b.h + b.l + b.c) / 3; });
+    var esa = ema(ap, N1);
+    var dev = ap.map(function (v, i) { return Math.abs(v - esa[i]); });
+    var d = ema(dev, N1);
+    var ci = ap.map(function (v, i) {
+      var denom = 0.015 * d[i];
+      return denom ? (v - esa[i]) / denom : 0;
+    });
+    var wt1 = ema(ci, N2);
+    var wt2 = sma(wt1, 4);
+    var out = { wt1: wt1, wt2: wt2 };
+    wtCache = { key: sk, res: out };
+    return out;
+  }
+
+  /* ======================================== 3. ICT Killzones ============== */
+  var NY_FMT = null;
+  function nyStamp(ts) {
+    var cachedStamp = nyStampCache.get(ts);
+    if (cachedStamp) return cachedStamp;
+    if (!NY_FMT) {
+      try {
+        NY_FMT = new Intl.DateTimeFormat('en-US', {
+          timeZone: 'America/New_York',
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', hour12: false
+        });
+      } catch (e) { NY_FMT = null; }
+    }
+    if (!NY_FMT) return null;
+    // normalise() keeps the feed's milliseconds; older feeds answered in
+    // seconds. Multiplying milliseconds by 1000 again shifted every session
+    // to a year ~58,000, so no killzone ever matched a bar.
+    var ms = ts > 0 && ts < 1e11 ? ts * 1000 : ts;
+    var date = new Date(ms);
+    if (!isFinite(date.getTime())) return null;
+    var parts = NY_FMT.formatToParts(date);
+    var out = { y: 0, m: 0, d: 0, h: 0, min: 0 };
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p.type === 'year') out.y = Number(p.value);
+      else if (p.type === 'month') out.m = Number(p.value);
+      else if (p.type === 'day') out.d = Number(p.value);
+      else if (p.type === 'hour') out.h = Number(p.value) % 24;
+      else if (p.type === 'minute') out.min = Number(p.value);
+    }
+    out.minutes = out.h * 60 + out.min;
+    out.dayKey = out.y + '-' + out.m + '-' + out.d;
+    var dow = new Date(Date.UTC(out.y, out.m - 1, out.d)).getUTCDay();
+    var back = dow === 0 ? 6 : dow - 1;                     // Monday based week
+    out.weekKey = new Date(Date.UTC(out.y, out.m - 1, out.d - back)).toISOString().slice(0, 10);
+    if (nyStampCache.size > 1500) nyStampCache.clear();
+    nyStampCache.set(ts, out);
+    return out;
+  }
+
+  // Defaults from the script's inputs: KZ1 Asia 20:00-00:00, KZ2 London
+  // 02:00-05:00, KZ3 NY AM 09:30-11:00, KZ5 NY PM 13:30-16:00 (KZ4 and KZ6 are
+  // off by default). All times follow America/New_York, like the script.
+  var KILLZONES = [
+    { id: 'ASIA', from: 20 * 60, to: 24 * 60, color: '#2196f3' },
+    { id: 'LNDN', from: 2 * 60, to: 5 * 60, color: '#f23645' },
+    { id: 'NYAM', from: 9 * 60 + 30, to: 11 * 60, color: '#089981' },
+    { id: 'NYPM', from: 13 * 60 + 30, to: 16 * 60, color: '#e040fb' }
+  ];
+  var SESSION_LIMIT = 3;   // max_days input
+  // A session replay formats every bar with Intl. Cache by snapshot key so
+  // pan, zoom, and unchanged quote ticks reuse results in O(1).
+  var kzCache = { key: '', res: null };
+
+  function inSession(minutes, kz) {
+    if (kz.to <= 24 * 60) return minutes >= kz.from && minutes < kz.to;
+    return minutes >= kz.from || minutes < (kz.to - 24 * 60);
+  }
+
+  function computeKillzones(series) {
+    var sk = seriesKey(series);
+    if (sk && kzCache.key === sk && kzCache.res) return kzCache.res;
+    var blocks = [];
+    var stamps = series.map(function (b) { return nyStamp(b.t); });
+
+    KILLZONES.forEach(function (kz) {
+      var run = null;
+      for (var i = 0; i < series.length; i++) {
+        var st = stamps[i];
+        var on = st && inSession(st.minutes, kz);
+        if (on) {
+          if (!run) {
+            run = { kz: kz, i0: i, i1: i, high: series[i].h, low: series[i].l };
+            blocks.push(run);
+          }
+          run.i1 = i;
+          if (series[i].h > run.high) run.high = series[i].h;
+          if (series[i].l < run.low) run.low = series[i].l;
+        } else if (run) {
+          run = null;
+        }
+      }
+    });
+
+    var byKz = {};
+    blocks.forEach(function (b) {
+      (byKz[b.kz.id] = byKz[b.kz.id] || []).push(b);
+    });
+    var kept = [];
+    Object.keys(byKz).forEach(function (id) {
+      kept = kept.concat(byKz[id].slice(-SESSION_LIMIT));
+    });
+
+    // pivots extend to the right until price trades through them
+    kept.forEach(function (b) {
+      var hiEnd = b.i1;
+      var loEnd = b.i1;
+      for (var j = b.i1 + 1; j < series.length; j++) {
+        if (hiEnd === b.i1 && series[j].h > b.high) hiEnd = j;
+        if (loEnd === b.i1 && series[j].l < b.low) loEnd = j;
+        if (hiEnd !== b.i1 && loEnd !== b.i1) break;
+      }
+      b.hiEnd = hiEnd;
+      b.loEnd = loEnd;
+    });
+
+    // previous day / week highs, lows and midlines (dhl, dmid, whl, wmid)
+    var days = [];
+    var weeks = [];
+    for (var i = 0; i < series.length; i++) {
+      var st = stamps[i];
+      if (!st) continue;
+      var day = days[days.length - 1];
+      if (!day || day.key !== st.dayKey) {
+        day = { key: st.dayKey, i0: i, high: series[i].h, low: series[i].l };
+        days.push(day);
+      }
+      day.i1 = i;
+      if (series[i].h > day.high) day.high = series[i].h;
+      if (series[i].l < day.low) day.low = series[i].l;
+
+      var week = weeks[weeks.length - 1];
+      if (!week || week.key !== st.weekKey) {
+        week = { key: st.weekKey, i0: i, high: series[i].h, low: series[i].l };
+        weeks.push(week);
+      }
+      week.i1 = i;
+      if (series[i].h > week.high) week.high = series[i].h;
+      if (series[i].l < week.low) week.low = series[i].l;
+    }
+
+    var levels = [];
+    var prevDay = days.length > 1 ? days[days.length - 2] : null;
+    var prevWeek = weeks.length > 1 ? weeks[weeks.length - 2] : null;
+    if (prevDay) {
+      levels.push({ i0: prevDay.i1, p: prevDay.high, label: 'PDH', color: '#0ea5e9' });
+      levels.push({ i0: prevDay.i1, p: prevDay.low, label: 'PDL', color: '#0ea5e9' });
+      levels.push({ i0: prevDay.i1, p: (prevDay.high + prevDay.low) / 2, label: 'PDM', color: '#94a3b8' });
+    }
+    if (prevWeek) {
+      levels.push({ i0: prevWeek.i1, p: prevWeek.high, label: 'PWH', color: '#8b5cf6' });
+      levels.push({ i0: prevWeek.i1, p: prevWeek.low, label: 'PWL', color: '#8b5cf6' });
+      levels.push({ i0: prevWeek.i1, p: (prevWeek.high + prevWeek.low) / 2, label: 'PWM', color: '#c4b5fd' });
+    }
+
+    var latest = {};
+    kept.forEach(function (b) {
+      if (!latest[b.kz.id] || b.i1 > latest[b.kz.id]) latest[b.kz.id] = b.i1;
+    });
+
+    kzCache = { key: sk, res: { blocks: kept, levels: levels, latest: latest } };
+    return kzCache.res;
+  }
+
+  /* ================================================= pane geometry ======= */
+  // Each pane maps bars the way the main chart does: one slot per bar, the
+  // right edge three slots away from the price axis, the reader's pan in
+  // pixels (scaled to the pane width). The price band is per pane, from the
+  // candles it actually has on screen.
+  function candleView(w, h) {
+    var axisW = 56;
+    var padT = 6;
+    var padB = 12;
+    var chartW = Math.max(48, w - axisW);
+    // the panes show more history than the main chart: the studies need
+    // enough swings (zigzag 9) for their structure to read at this size
+    var total = bars.length;
+    var wantBars = isFinite(view.bars) ? view.bars : 140;
+    var wantBack = isFinite(view.offset) ? Math.max(0, view.offset) : 0;
+    var visible = Math.max(8, Math.min(wantBars, total));
+    var slot = chartW / Math.max(8, visible);
+    var rightEdgeX = chartW - slot;
+    var end = Math.max(visible, Math.min(total, total - wantBack));
+    var start = Math.max(0, Math.min(end, total) - visible);
+
+    // index mapping only: no clock arithmetic, so the candles always land
+    // inside the pane even when the feed's stamps and the chart's differ
+    function xAt(index) { return rightEdgeX - (end - 1 - index) * slot; }
+
+    var min = Infinity, max = -Infinity;
+    for (var i = start; i < end && i < total; i++) {
+      if (!bars[i]) break;
+      if (bars[i].l < min) min = bars[i].l;
+      if (bars[i].h > max) max = bars[i].h;
+    }
+    if (end === total && livePrice > 0) {
+      min = Math.min(min, livePrice);
+      max = Math.max(max, livePrice);
+    }
+    if (!isFinite(min) || !isFinite(max) || max <= min) {
+      min = isFinite(min) ? min * 0.999 : 0;
+      max = isFinite(max) ? max * 1.001 : 1;
+      if (max <= min) max = min + 1;
+    }
+    var pad = (max - min) * 0.04;   // tighter price band = bigger candles
+    var plotMin = min - pad;
+    var plotMax = max + pad;
+    var plotH = Math.max(20, h - padT - padB);
+
+    return {
+      w: w, h: h, chartW: chartW, axisW: axisW, padT: padT, plotH: plotH,
+      slot: slot, rightEdgeX: rightEdgeX, start: start, end: end,
+      plotMin: plotMin, plotMax: plotMax,
+      xAt: xAt,
+      yOf: function (p) {
+        return padT + plotH - ((p - plotMin) / (plotMax - plotMin)) * plotH;
+      }
+    };
+  }
+
+  /* ================================================= painters ============ */
+  function line(c, x1, y1, x2, y2, color, width, dash) {
+    if (!isFinite(x1) || !isFinite(y1) || !isFinite(x2) || !isFinite(y2)) return;
+    c.save();
+    c.strokeStyle = color;
+    c.lineWidth = width || 1;
+    if (dash) c.setLineDash(dash);
+    c.beginPath();
+    c.moveTo(x1, y1);
+    c.lineTo(x2, y2);
+    c.stroke();
+    c.restore();
+  }
+
+  function tag(c, text, x, y, color, align, limitX) {
+    if (!isFinite(x) || !isFinite(y)) return;
+    c.save();
+    c.font = '600 9px "JetBrains Mono", monospace';
+    c.textAlign = align || 'left';
+    c.textBaseline = 'middle';
+    var w = c.measureText(text).width + 6;
+    var bx = align === 'right' ? x - w : align === 'center' ? x - w / 2 : x;
+    var maxX = (limitX || Infinity) - w - 2;
+    if (bx > maxX) bx = Math.max(2, maxX);
+    c.fillStyle = COLORS.tagBg;
+    c.fillRect(bx, y - 6, w, 12);
+    c.fillStyle = color;
+    c.fillText(text, bx + 3, y);
+    c.restore();
+  }
+
+  function hexAlpha(hex, alpha) {
+    var h = String(hex || '').replace('#', '');
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    if (h.length !== 6) return 'rgba(100, 116, 139, ' + alpha + ')';
+    var r = parseInt(h.slice(0, 2), 16);
+    var g = parseInt(h.slice(2, 4), 16);
+    var b = parseInt(h.slice(4, 6), 16);
+    return 'rgba(' + r + ', ' + g + ', ' + b + ', ' + alpha + ')';
+  }
+
+  function drawCandles(c, v) {
+    var barW = Math.max(1, Math.min(9, v.slot * 0.66));
+    for (var i = v.start; i < v.end; i++) {
+      var b = bars[i];
+      var x = v.xAt(i);
+      if (x < -v.slot || x > v.chartW + v.slot) continue;
+      var up = b.c >= b.o;
+      var yH = v.yOf(b.h);
+      var yL = v.yOf(b.l);
+      var yO = v.yOf(b.o);
+      var yC = v.yOf(b.c);
+      c.strokeStyle = up ? 'rgba(8, 153, 129, 0.85)' : 'rgba(242, 54, 69, 0.85)';
+      c.lineWidth = 1;
+      c.beginPath();
+      c.moveTo(x, yH);
+      c.lineTo(x, yL);
+      c.stroke();
+      var top = Math.min(yO, yC);
+      var height = Math.max(1, Math.abs(yC - yO));
+      c.fillStyle = up ? 'rgba(8, 153, 129, 0.9)' : 'rgba(242, 54, 69, 0.9)';
+      c.fillRect(x - barW / 2, top, barW, height);
+    }
+  }
+
+  function drawLivePrice(c, v, digits) {
+    if (!livePrice || v.end !== bars.length) return;
+    var y = v.yOf(livePrice);
+    var last = bars[bars.length - 1];
+    var color = last && livePrice < last.o ? COLORS.down : COLORS.up;
+    line(c, 0, y, v.chartW, y, color, 1, [3, 3]);
+    c.save();
+    c.fillStyle = color;
+    c.fillRect(v.chartW, y - 8, v.axisW, 16);
+    c.font = '600 9px "JetBrains Mono", monospace';
+    c.textAlign = 'left';
+    c.textBaseline = 'middle';
+    c.fillStyle = '#ffffff';
+    c.fillText(livePrice.toFixed(digits), v.chartW + 3, y);
+    c.restore();
+  }
+
+  function liquidityLevels() {
+    var engine = window.StopLiquidity;
+    if (!engine || typeof engine.state !== 'function') return [];
+    var state = engine.state();
+    if (!state || state.symbol !== dataSymbol || state.tvSymbol !== dataInstrument || !dataInstrument ||
+        currentSymbol() !== dataSymbol || currentTf() !== dataTf) return [];
+    // Exactly the top four BUY and SELL levels shown by the side panel.
+    return (state.visibleZones || []).filter(function (z) {
+      return (z.side === 'buy' || z.side === 'sell') && isFinite(Number(z.price)) && Number(z.price) > 0;
+    }).map(function (z) {
+      return {id:z.id, side:z.side, price:Number(z.price), touches:z.touches, fresh:state.fresh};
+    });
+  }
+
+  function drawLiquidityZones(c, v, digits) {
+    var levels = liquidityLevels();
+    if (!levels.length) return;
+    var top = v.padT + 9, bottom = v.padT + v.plotH - 9;
+    var rows = levels.map(function (z) {
+      var y = v.yOf(z.price);
+      return {zone:z, y:y, target:Math.max(top, Math.min(bottom, y)), labelY:0};
+    }).sort(function (a,b) {return a.target-b.target || b.zone.price-a.zone.price;});
+    var gap = Math.min(18, (bottom-top) / Math.max(1, rows.length-1));
+    rows.forEach(function (r,i) { r.labelY = Math.max(r.target, i ? rows[i-1].labelY+gap : top); });
+    rows[rows.length-1].labelY = Math.min(bottom, rows[rows.length-1].labelY);
+    for (var i=rows.length-2; i>=0; i--) rows[i].labelY = Math.min(rows[i].labelY, rows[i+1].labelY-gap);
+    rows.forEach(function (r) {
+      var z = r.zone, color = z.side === 'buy' ? COLORS.up : COLORS.down;
+      var inRange = r.y >= v.padT && r.y <= v.padT+v.plotH;
+      var price = z.price.toLocaleString('en-US', {minimumFractionDigits:digits, maximumFractionDigits:digits});
+      var text = (inRange ? '' : (r.y < top ? '↑ ' : '↓ ')) +
+        z.side.toUpperCase() + ' SL · ' + price;
+      c.save();
+      if (!z.fresh) c.globalAlpha = 0.5;
+      c.font = '600 9px "JetBrains Mono", monospace';
+      var labelW = c.measureText(text).width + 10;
+      var labelX = Math.max(2, v.chartW - labelW - 6);
+      if (inRange) {
+        // Keep only a compact right-edge price pointer instead of a full-width line across candles.
+        line(c, labelX + labelW, r.labelY, v.chartW, r.y, color, 1.2);
+      }
+      c.fillStyle = z.side === 'buy' ? COLORS.zoneBuyFill : COLORS.zoneSellFill;
+      c.fillRect(labelX, r.labelY-7, labelW, 14);
+      c.strokeStyle = color;
+      c.lineWidth = 1;
+      c.strokeRect(labelX, r.labelY-7, labelW, 14);
+      c.fillStyle = color;
+      c.textAlign = 'left';
+      c.textBaseline = 'middle';
+      c.fillText(text, labelX+5, r.labelY);
+      c.restore();
+    });
+  }
+
+  function drawGrid(c, v, digits) {
+    c.save();
+    c.strokeStyle = COLORS.grid;
+    c.lineWidth = 1;
+    c.fillStyle = COLORS.muted;
+    c.font = '600 8px "JetBrains Mono", monospace';
+    c.textAlign = 'left';
+    c.textBaseline = 'middle';
+    for (var g = 0; g <= 3; g++) {
+      var y = v.padT + v.plotH * (g / 3);
+      c.beginPath();
+      c.moveTo(0, y);
+      c.lineTo(v.chartW, y);
+      c.stroke();
+      if (digits > 0) {
+        var price = v.plotMax - (g / 3) * (v.plotMax - v.plotMin);
+        c.fillText(price.toFixed(digits), v.chartW + 5, y);
+      }
+    }
+    c.restore();
+  }
+
+  function drawMSB(c, v) {
+    var res = computeMSB(bars);
+    var i, x1, x2, y;
+
+    for (i = 0; i < res.zigzag.length; i++) {
+      var z = res.zigzag[i];
+      line(c, v.xAt(z.x1), v.yOf(z.y1), v.xAt(z.x2), v.yOf(z.y2), COLORS.structure, 1);
+    }
+
+    for (i = 0; i < res.boxes.length; i++) {
+      var b = res.boxes[i];
+      x1 = v.xAt(b.from);
+      x2 = v.xAt(b.right);
+      var yTop = v.yOf(b.top);
+      var yBottom = v.yOf(b.bottom);
+      if (!isFinite(x1) || !isFinite(x2) || !isFinite(yTop) || !isFinite(yBottom)) continue;
+      if (x2 < -20 || x1 > v.chartW) continue;
+      var up = b.dir === 1;
+      var boxW = Math.max(2, x2 - x1);
+      var boxH = Math.max(1, yBottom - yTop);
+      c.fillStyle = up ? COLORS.upFill : COLORS.downFill;
+      c.fillRect(x1, yTop, boxW, boxH);
+      c.strokeStyle = up ? COLORS.upLine : COLORS.downLine;
+      c.lineWidth = 1;
+      c.strokeRect(x1 + 0.5, yTop + 0.5, boxW, boxH);
+      tag(c, b.text, Math.min(x2, v.chartW - 2), yBottom - 7, up ? COLORS.up : COLORS.down, 'right', v.chartW);
+    }
+
+    for (i = 0; i < res.msb.length; i++) {
+      var m = res.msb[i];
+      var color = m.dir === 1 ? COLORS.up : COLORS.down;
+      line(c, v.xAt(m.i0), v.yOf(m.p), v.xAt(m.i1), v.yOf(m.p), color, 2);
+      tag(c, 'MSB', v.xAt(m.labelI), v.yOf(m.labelP) + (m.dir === 1 ? -9 : 9), color, 'center', v.chartW);
+    }
+  }
+
+  function drawKillzones(c, v) {
+    var res = computeKillzones(bars);
+    var i, j;
+
+    for (i = 0; i < res.blocks.length; i++) {
+      var b = res.blocks[i];
+      var x0 = v.xAt(b.i0);
+      var x1 = v.xAt(b.i1);
+      var yTop = v.yOf(b.high);
+      var yBottom = v.yOf(b.low);
+      if (!isFinite(x0) || !isFinite(x1) || !isFinite(yTop) || !isFinite(yBottom)) continue;
+      if (x1 < -20 || x0 > v.chartW) continue;
+      c.save();
+      c.fillStyle = hexAlpha(b.kz.color, 0.10);
+      c.fillRect(x0, yTop, Math.max(1, x1 - x0), Math.max(1, yBottom - yTop));
+      c.strokeStyle = hexAlpha(b.kz.color, 0.45);
+      c.lineWidth = 1;
+      c.strokeRect(x0 + 0.5, yTop + 0.5, Math.max(1, x1 - x0), Math.max(1, yBottom - yTop));
+      c.restore();
+
+      line(c, x0, yTop, v.xAt(b.hiEnd), yTop, hexAlpha(b.kz.color, 0.85), 1, [4, 3]);
+      line(c, x0, yBottom, v.xAt(b.loEnd), yBottom, hexAlpha(b.kz.color, 0.85), 1, [4, 3]);
+      if (b.i1 === res.latest[b.kz.id]) {
+        tag(c, b.kz.id + ' H', v.xAt(b.hiEnd), yTop - 7, b.kz.color, 'right', v.chartW);
+        tag(c, b.kz.id + ' L', v.xAt(b.loEnd), yBottom + 8, b.kz.color, 'right', v.chartW);
+      }
+    }
+
+    for (j = 0; j < res.levels.length; j++) {
+      var lv = res.levels[j];
+      var lx = v.xAt(lv.i0);
+      var ly = v.yOf(lv.p);
+      if (!isFinite(lx) || !isFinite(ly)) continue;
+      line(c, lx, ly, v.chartW, ly, hexAlpha(lv.color, 0.7), 1, [2, 3]);
+      tag(c, lv.label, v.chartW - 2, ly, lv.color, 'right', v.chartW);
+    }
+  }
+
+  function drawWaveTrend(c, v) {
+    var res = computeWaveTrend(bars);
+    var values = [];
+    res.wt1.forEach(function (val) { if (isFinite(val)) values.push(val); });
+    res.wt2.forEach(function (val) { if (isFinite(val)) values.push(val); });
+    if (!values.length) return;
+
+    var min = Math.min(-62, Math.min.apply(null, values));
+    var max = Math.max(62, Math.max.apply(null, values));
+    var span = (max - min) || 1;
+    var top = v.padT;
+    var height = v.plotH;
+
+    function yOf(val) { return top + height - ((val - min) / span) * height; }
+
+    var gapOuter = Math.abs(yOf(60) - yOf(53));
+    [[60, COLORS.down, true], [53, COLORS.down, gapOuter >= 11], [0, '#94a3b8', true], [-53, COLORS.up, gapOuter >= 11], [-60, COLORS.up, true]]
+      .forEach(function (lvl) {
+        line(c, 0, yOf(lvl[0]), v.chartW, yOf(lvl[0]), lvl[1], 1, lvl[0] === 0 ? null : [3, 3]);
+        if (!lvl[2]) return;
+        c.save();
+        c.font = '600 8px "JetBrains Mono", monospace';
+        c.fillStyle = lvl[1];
+        c.textAlign = 'left';
+        c.textBaseline = 'middle';
+        c.fillText(String(lvl[0]), v.chartW + 5, yOf(lvl[0]));
+        c.restore();
+      });
+
+    var fromIdx = Math.max(0, v.start - 2);
+    var toIdx = Math.min(bars.length - 1, v.end + 1);
+    c.save();
+    c.beginPath();
+    var started = false, i, x;
+    for (i = fromIdx; i <= toIdx; i++) {
+      if (!isFinite(res.wt1[i])) continue;
+      x = v.xAt(i);
+      if (!isFinite(x)) continue;
+      if (!started) { c.moveTo(x, yOf(res.wt1[i])); started = true; }
+      else c.lineTo(x, yOf(res.wt1[i]));
+    }
+    for (i = toIdx; i >= fromIdx; i--) {
+      if (!isFinite(res.wt2[i])) continue;
+      x = v.xAt(i);
+      if (!isFinite(x)) continue;
+      c.lineTo(x, yOf(res.wt2[i]));
+    }
+    c.closePath();
+    c.fillStyle = 'rgba(59, 130, 246, 0.18)';
+    c.fill();
+    c.restore();
+
+    function plot(arr, color, dash) {
+      c.save();
+      c.strokeStyle = color;
+      c.lineWidth = 1.5;
+      if (dash) c.setLineDash(dash);
+      c.beginPath();
+      var on = false;
+      for (var k = fromIdx; k <= toIdx; k++) {
+        if (!isFinite(arr[k])) { on = false; continue; }
+        var xx = v.xAt(k);
+        if (!isFinite(xx)) { on = false; continue; }
+        if (!on) { c.moveTo(xx, yOf(arr[k])); on = true; }
+        else c.lineTo(xx, yOf(arr[k]));
+      }
+      c.stroke();
+      c.restore();
+    }
+
+    plot(res.wt1, COLORS.up, null);
+    plot(res.wt2, COLORS.down, [4, 3]);
+
+    var last = -1;
+    for (i = bars.length - 1; i >= 0; i--) { if (isFinite(res.wt1[i])) { last = i; break; } }
+    if (last >= 0) tag(c, 'WT ' + res.wt1[last].toFixed(1), 4, top + 8, COLORS.text, 'left', v.chartW);
+  }
+
+  /* ================================================= stack + panes ======= */
+  function ensureStack() {
+    var wrap = document.querySelector('.binance-chart-wrapper');
+    if (!wrap) return null;
+    var el = document.getElementById('chart-indicator-stack');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'chart-indicator-stack';
+      el.className = 'chart-indicator-stack';
+      INDICATORS.forEach(function (ind) {
+        var pane = document.createElement('div');
+        pane.className = 'chart-ind-pane';
+        pane.setAttribute('data-pane', ind.id);
+        pane.innerHTML = '<div class="chart-ind-pane-head"><b>' + ind.label + '</b><span>' + ind.sub + '</span>' +
+          '<em class="chart-ind-pane-zoom">scroll = zoom · drag = pan</em></div>' +
+          '<div class="chart-ind-pane-canvas"><canvas></canvas></div>';
+        el.appendChild(pane);
+      });
+      el.querySelectorAll('.chart-ind-pane-canvas').forEach(function (holder) {
+        bindPaneInput(holder);
+        if (paneObserver) {
+          paneSizes.set(holder, {width: 0, height: 0});
+          paneObserver.observe(holder);
+        }
+      });
+      var anchor = wrap.querySelector('.binance-canvas-box');
+      if (anchor && anchor.nextSibling) wrap.insertBefore(el, anchor.nextSibling);
+      else wrap.appendChild(el);
+    }
+    stack = el;
+    return el;
+  }
+
+  // TradingView-style navigation: the wheel zooms (shift/wheel-x pans) and a
+  // drag moves the window back through history. Every pane shares the view.
+  function clampOffset(value) {
+    if (!isFinite(value)) return 0;
+    var maxOffset = Math.max(0, bars.length - Math.max(MIN_BARS, Math.min(view.bars, bars.length)));
+    return Math.max(0, Math.min(maxOffset, Math.round(value)));
+  }
+
+  function paneSlot(holder) {
+    if (!holder) return 8;
+    var chartW = Math.max(48, holder.clientWidth - 56);
+    var visible = Math.max(8, Math.min(view.bars, bars.length || view.bars));
+    return chartW / visible;
+  }
+
+  function applyZoomBars(nextBars) {
+    var clamped = Math.max(MIN_BARS, Math.min(MAX_BARS, Math.round(nextBars)));
+    if (!isFinite(clamped)) return;
+    if (clamped !== view.bars) {
+      view.bars = clamped;
+      view.offset = clampOffset(view.offset);
+      saveZoom();
+      schedule();
+    }
+  }
+
+  function bindPaneInput(holder) {
+    if (!holder || holder.dataset.bound === '1') return;
+    holder.dataset.bound = '1';
+
+    holder.addEventListener('wheel', function (ev) {
+      var modeScale = ev.deltaMode === 1 ? 16 : (ev.deltaMode === 2 ? 120 : 1);
+      var dx = (Number(ev.deltaX) || 0) * modeScale;
+      var dy = (Number(ev.deltaY) || 0) * modeScale;
+      var absX = Math.abs(dx);
+      var absY = Math.abs(dy);
+      var horizontal = ev.shiftKey || (absX > absY * 1.15 && absX >= 2);
+      if (horizontal) {
+        ev.preventDefault();
+        var panDelta = ev.shiftKey ? (dy || dx) : dx;
+        if (Math.abs(panDelta) < 0.5) return;
+        view.offset = clampOffset(view.offset + (panDelta / paneSlot(holder)));
+        schedule();
+        return;
+      }
+      ev.preventDefault();
+      // Ignore zero/sub-pixel inertia events so trackpad bounce after zooming out never zooms back in.
+      if (absY < 0.75) return;
+      var factor = Math.exp(Math.max(-0.45, Math.min(0.45, dy * 0.0014)));
+      var target = Math.round(view.bars * factor);
+      if (target === view.bars) target = dy > 0 ? view.bars + 1 : view.bars - 1;
+      applyZoomBars(target);
+    }, { passive: false });
+
+    var drag = null;
+    var activePointers = new Map();
+    var pinchStart = null;
+
+    function pointerDistance() {
+      var pts = Array.from(activePointers.values());
+      if (pts.length < 2) return 0;
+      return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    }
+
+    holder.addEventListener('pointerdown', function (ev) {
+      if (ev.pointerType === 'touch') {
+        activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+        if (activePointers.size === 2) {
+          drag = null;
+          holder.classList.remove('dragging');
+          pinchStart = { dist: pointerDistance(), bars: view.bars };
+          return;
+        }
+      }
+      if (ev.button !== 0 && ev.pointerType !== 'touch') return;
+      drag = { x: ev.clientX, offset: view.offset };
+      holder.classList.add('dragging');
+      if (holder.setPointerCapture) {
+        try { holder.setPointerCapture(ev.pointerId); } catch (e) {}
+      }
+    });
+    holder.addEventListener('pointermove', function (ev) {
+      if (activePointers.has(ev.pointerId)) {
+        activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      }
+      if (pinchStart && activePointers.size >= 2) {
+        var dist = pointerDistance();
+        if (dist > 8 && pinchStart.dist > 8) {
+          // Spreading fingers apart = zoom in (fewer bars); pinching together = zoom out (more bars).
+          applyZoomBars(pinchStart.bars * (pinchStart.dist / dist));
+        }
+        return;
+      }
+      if (!drag) return;
+      view.offset = clampOffset(drag.offset + ((ev.clientX - drag.x) / paneSlot(holder)));
+      schedule();
+    });
+    function stopDrag(ev) {
+      if (ev && activePointers.has(ev.pointerId)) activePointers.delete(ev.pointerId);
+      if (activePointers.size < 2) pinchStart = null;
+      drag = null;
+      holder.classList.remove('dragging');
+    }
+    holder.addEventListener('pointerup', stopDrag);
+    holder.addEventListener('pointercancel', stopDrag);
+    holder.addEventListener('pointerleave', function () { if (drag && activePointers.size === 0) stopDrag(); });
+  }
+
+  /* The TradingView overlay layer (large-flow tape, market news, pressure)
+     stays on screen above the panes, so it has to start where the pane stack
+     starts — measured, because the legend and the indicator bar above it can
+     wrap to different heights. */
+  function syncStackTop() {
+    var wrap = document.querySelector('.binance-chart-wrapper');
+    var el = document.getElementById('chart-indicator-stack');
+    if (!wrap) return;
+    if (wrap.classList.contains('ind-stack-on') && el) {
+      wrap.style.setProperty('--ind-stack-top', el.offsetTop + 'px');
+    } else {
+      wrap.style.removeProperty('--ind-stack-top');
+    }
+  }
+
+  function applyStack() {
+    var wrap = document.querySelector('.binance-chart-wrapper');
+    var el = ensureStack();
+    if (!wrap || !el) return;
+    var on = anyEnabled();
+    wrap.classList.toggle('ind-stack-on', on);
+    INDICATORS.forEach(function (ind) {
+      var pane = el.querySelector('[data-pane="' + ind.id + '"]');
+      if (pane) pane.classList.toggle('on', enabled[ind.id] === true);
+    });
+    if (on) schedule();
+    requestAnimationFrame(syncStackTop);
+  }
+
+  window.addEventListener('resize', syncStackTop);
+
+  function schedule() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(function () {
+      rafPending = false;
+      render();
+    });
+  }
+
+  function digitsFor(price) {
+    var q = window.SOFT_TV_QUOTE;
+    var terminal = window.SoftradeXTerminal || window.BinanceTerminal;
+    var meta = terminal && terminal.MARKETS && terminal.MARKETS[dataSymbol];
+    var d = (meta && Number.isInteger(meta.decimals) && meta.decimals >= 0 && meta.decimals <= 8)
+      ? meta.decimals
+      : (price >= 1000 ? 2 : price >= 10 ? 3 : 5);
+    if (q && q.symbol === dataSymbol && Number.isInteger(q.tv_digits) && q.tv_digits >= 0 && q.tv_digits <= 8) {
+      var cap = price >= 10000 ? 2 : price >= 1000 ? 3 : 8;
+      d = Math.min(cap, Math.max(d, q.tv_digits));
+    }
+    return d;
+  }
+
+  function paintPane(canvas, id) {
+    var holder = canvas.parentNode;
+    // ResizeObserver measures after layout. Reading dimensions on every quote
+    // forced pending live-tape changes to lay out the entire dashboard here.
+    var size = paneSizes.get(holder);
+    var w = size ? size.width : holder.clientWidth;
+    var h = size ? size.height : holder.clientHeight;
+    if (!w || !h) return;
+    var dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+    }
+    var c = canvas.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, w, h);
+    c.fillStyle = COLORS.background;
+    c.fillRect(0, 0, w, h);
+
+    if (!bars.length) {
+      c.fillStyle = COLORS.muted;
+      c.font = '12px sans-serif';
+      c.textAlign = 'center';
+      c.fillText(dataError || (loading ? 'Loading candles…' : 'Waiting for market data…'), w / 2, h / 2);
+      return;
+    }
+
+    if (id === 'wavetrend') {
+      var vOsc = candleView(w, h);
+      drawGrid(c, vOsc, 0);
+      drawWaveTrend(c, vOsc);
+      return;
+    }
+
+    var v = candleView(w, h);
+    var digits = digitsFor((v.plotMax + v.plotMin) / 2);
+    drawGrid(c, v, digits);
+    drawCandles(c, v);
+    if (id === 'msb') drawMSB(c, v);
+    else if (id === 'killzones') drawKillzones(c, v);
+    drawLiquidityZones(c, v, digits);
+    drawLivePrice(c, v, digits);
+  }
+
+  function render() {
+    if (document.hidden) return;
+    var el = stack || ensureStack();
+    var wrap = document.querySelector('.binance-chart-wrapper');
+    if (!el || !wrap || !wrap.classList.contains('ind-stack-on')) return;
+    if (currentSymbol() && dataSymbol &&
+        (currentSymbol() !== dataSymbol || currentTf() !== dataTf)) {
+      if (!loading) loadBars();
+      return;
+    }
+    var activeMask = INDICATORS.map(function (ind) { return enabled[ind.id] ? '1' : '0'; }).join('');
+    var firstPane = el.querySelector('.chart-ind-pane.on .chart-ind-pane-canvas');
+    var firstSize = firstPane ? paneSizes.get(firstPane) : null;
+    var rKey = seriesKey(bars) + '|' + livePrice + '|' + view.bars + '|' + view.offset + '|' +
+      activeMask + '|' + (firstSize ? firstSize.width + 'x' + firstSize.height : '') + '|' +
+      (loading ? 'L' : '') + '|' + (dataError || '');
+    if (rKey === lastRenderKey) return;
+    lastRenderKey = rKey;
+    INDICATORS.forEach(function (ind) {
+      if (!enabled[ind.id]) return;
+      var pane = el.querySelector('[data-pane="' + ind.id + '"]');
+      var canvas = pane && pane.querySelector('canvas');
+      if (canvas) paintPane(canvas, ind.id);
+      var zoom = pane && pane.querySelector('.chart-ind-pane-zoom');
+      if (zoom) zoom.textContent = view.bars + (view.offset ? ' bars · ' + Math.round(view.offset) + ' back' : ' bars');
+    });
+  }
+
+  /* ======================================================== UI =========== */
+  function flashNote(text) {
+    var el = document.getElementById('chart-ind-toast');
+    if (!el) {
+      var host = ensureStack();
+      if (!host) return;
+      el = document.createElement('div');
+      el.id = 'chart-ind-toast';
+      el.className = 'chart-ind-toast';
+      host.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add('show');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.remove('show'); }, 5200);
+  }
+
+  function syncButtons() {
+    var bar = $('chart-indicator-bar');
+    if (!bar) return;
+    INDICATORS.forEach(function (ind) {
+      var btn = bar.querySelector('[data-indicator="' + ind.id + '"]');
+      if (!btn) return;
+      var on = enabled[ind.id] === true;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    var hint = bar.querySelector('.chart-indicator-hint');
+    if (hint) {
+      hint.textContent = anyEnabled() && dataInstrument
+        ? 'TradingView · ' + dataInstrument + (dataError ? ' · unavailable' : '')
+        : (anyEnabled() ? 'separate pane · own study' : 'Pine port · separate panes');
+    }
+  }
+
+  function toggle(id) {
+    if (enabled[id]) delete enabled[id];
+    else enabled[id] = true;
+    // Opening a study starts on the latest candle offset while preserving the user's zoom level.
+    view.offset = 0;
+    if (!isFinite(view.bars) || view.bars < MIN_BARS || view.bars > MAX_BARS) view.bars = 78;
+    lastRenderKey = '';
+    savePrefs();
+    syncButtons();
+    applyStack();
+    if (anyEnabled()) {
+      flashNote('TradingView\u2019s widget cannot run Pine scripts \u2014 the study opens in its own pane inside the chart.');
+      if (!bars.length || currentSymbol() !== dataSymbol || currentTf() !== dataTf) loadBars();
+    }
+    schedule();
+  }
+
+  function bindButtons() {
+    var bar = $('chart-indicator-bar');
+    if (!bar) return;
+    INDICATORS.forEach(function (ind) {
+      var btn = bar.querySelector('[data-indicator="' + ind.id + '"]');
+      if (!btn) return;
+      btn.addEventListener('click', function () { toggle(ind.id); });
+    });
+    syncButtons();
+    applyStack();
+  }
+
+  /* ==================================================== wiring =========== */
+  window.addEventListener('chart:geometry', function (ev) {
+    geometry = ev.detail || null;
+  });
+
+  window.addEventListener('chart:tv-quote', function (ev) { acceptQuote(ev.detail); });
+  window.addEventListener('chart:liquidity-zones', function () {
+    lastRenderKey = '';
+    if (anyEnabled()) schedule();
+  });
+
+  window.addEventListener('chart:price-range', function (ev) {
+    if (!geometry) return;
+    var d = ev.detail || {};
+    if (isFinite(d.min) && isFinite(d.max) && d.max > d.min) {
+      geometry.plotMin = d.min;
+      geometry.plotMax = d.max;
+    }
+  });
+
+  window.addEventListener('chart:market', function (ev) {
+    var symbol = (ev.detail && ev.detail.symbol) || '';
+    if (symbol && symbol !== dataSymbol) {
+      ++dataToken;
+      if (barsRequest) barsRequest.abort();
+      barsRequest = null;
+      loading = false;
+      bars = [];
+      livePrice = livePriceAt = 0;
+      lastRenderKey = '';
+      view.offset = 0;
+      if (anyEnabled()) loadBars();
+    }
+    schedule();
+  });
+
+  window.addEventListener('chart:interval', function (ev) {
+    var tf = (ev.detail && ev.detail.tf) || '';
+    if (tf && tf !== dataTf) {
+      ++dataToken;
+      if (barsRequest) barsRequest.abort();
+      barsRequest = null;
+      loading = false;
+      bars = [];
+      livePrice = livePriceAt = 0;
+      lastRenderKey = '';
+      view.offset = 0;
+      if (anyEnabled()) loadBars();
+    }
+    schedule();
+  });
+
+  window.addEventListener('resize', function () { schedule(); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) schedule(); });
+  window.addEventListener('softradex:theme', function () {
+    syncIndicatorTheme();
+    schedule();
+  });
+
+  function bootChartIndicators() {
+    bindButtons();
+    if (anyEnabled()) loadBars();
+    armRefresh();
+    schedule();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootChartIndicators);
+  else bootChartIndicators();
+
+  window.ChartIndicators = {
+    list: function () { return INDICATORS.slice(); },
+    active: function () {
+      return INDICATORS.filter(function (ind) { return enabled[ind.id]; })
+        .map(function (ind) { return ind.id; });
+    },
+    setEnabled: function (id, on) {
+      if (on) enabled[id] = true;
+      else delete enabled[id];
+      view.offset = 0;
+      if (!isFinite(view.bars) || view.bars < MIN_BARS || view.bars > MAX_BARS) view.bars = 78;
+      lastRenderKey = '';
+      savePrefs();
+      syncButtons();
+      applyStack();
+      if (anyEnabled()) loadBars();
+      schedule();
+    },
+    toggle: toggle,
+    zoomBy: function (factor) {
+      var next = Math.round(view.bars * (Number(factor) || 1));
+      if (next === view.bars && factor > 1) next = view.bars + 6;
+      else if (next === view.bars && factor < 1) next = view.bars - 6;
+      applyZoomBars(next);
+    },
+    resetZoom: function () {
+      view.offset = 0;
+      applyZoomBars(78);
+    },
+    liquidity: liquidityLevels,
+    debug: function () {
+      var pane = document.querySelector('[data-pane="msb"] canvas');
+      if (!pane) return null;
+      var v = candleView(pane.clientWidth, pane.clientHeight);
+      return {
+        bars: bars.length,
+        first: bars[0] || null,
+        last: bars[bars.length - 1] || null,
+        tf: dataTf,
+        view: { bars: view.bars, offset: view.offset, slot: v.slot, start: v.start, end: v.end },
+        plotMin: v.plotMin,
+        plotMax: v.plotMax,
+        slot: v.slot,
+        rightEdgeX: v.rightEdgeX,
+        paneSize: [pane.clientWidth, pane.clientHeight]
+      };
+    },
+    // diagnostic view of the ICT session replay (used to verify the pane and
+    // to compare the boxes against the feed's bar timestamps)
+    killzones: function () {
+      if (!bars.length) return null;
+      var res = computeKillzones(bars);
+      return {
+        blocks: res.blocks.map(function (b) {
+          return {
+            id: b.kz.id, i0: b.i0, i1: b.i1, high: b.high, low: b.low,
+            hiEnd: b.hiEnd, loEnd: b.loEnd,
+            t0: bars[b.i0].t, t1: bars[b.i1].t
+          };
+        }),
+        latest: res.latest,
+        levels: res.levels
+      };
+    },
+    state: function () {
+      return {
+        active: window.ChartIndicators.active(),
+        bars: bars.length,
+        symbol: dataSymbol,
+        tf: dataTf,
+        tvSymbol: dataInstrument,
+        price: livePrice,
+        priceAt: livePriceAt,
+        loading: loading,
+        error: dataError,
+        geometry: geometry,
+        stack: !!stack && stack.classList.contains('on'),
+        panes: INDICATORS.filter(function (ind) {
+          var pane = document.querySelector('[data-pane="' + ind.id + '"]');
+          return pane && pane.classList.contains('on');
+        }).map(function (ind) { return ind.id; })
+      };
+    }
+  };
+})();
+
+
+}

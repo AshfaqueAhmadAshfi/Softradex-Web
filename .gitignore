@@ -1,0 +1,26 @@
+# Node / Vite / TypeScript
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Local environment & runtime data
+.env
+config/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.json
+data/*.tmp
+data/*.pid
+data/*.log
+data/*.png
+
+# IDE & OS
+.vscode/
+.idea/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.log
