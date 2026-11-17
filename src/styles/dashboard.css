@@ -1930,6 +1930,7 @@ input:focus, select:focus, .inp:focus {
 
 /* ----------------------------------------------------------------- footer */
 .footer { display: flex; align-items: center; gap: 8px; padding: 10px 20px 14px; color: var(--txt-faint); font-size: 11.5px; font-family: var(--mono); }
+#foot-source, #foot-source + .sep { display: none !important; }
 .sep { opacity: .4; }
 
 /* ----------------------------------------------------------------- modals */
@@ -13478,8 +13479,19 @@ html.chart-workspace-open{overflow:hidden}
 .vfb-advisory{padding:7px 8px;background:linear-gradient(135deg,#f8fbff,#eef4ff);border-block:1px solid #dbeafe}
 .vfb-advisory-main{display:flex;align-items:center;gap:7px;font:700 8px "JetBrains Mono",monospace;color:#64748b}.vfb-advisory-main b{font-size:12px;color:#b45309}.vfb-advisory-main b.buy{color:#047857}.vfb-advisory-main b.sell{color:#b91c1c}.vfb-advisory-main em{margin-left:auto;font-style:normal;font-size:7px}
 .vfb-advisory-bar{height:4px;margin:5px 0;border-radius:99px;background:#fecaca;overflow:hidden}.vfb-advisory-bar i{display:block;height:100%;width:50%;background:#10b981}.vfb-advisory small{display:block;font:600 7px "JetBrains Mono",monospace;color:#64748b}
-.market-news-terminal{border-bottom:1px solid #dbe3ee;background:#fff;min-height:118px;max-height:235px;display:flex;flex-direction:column}
+.market-news-terminal{border-bottom:1px solid #dbe3ee;background:#fff;min-height:140px;max-height:272px;display:flex;flex-direction:column}
 .mnt-head{display:flex;align-items:center;justify-content:space-between;gap:5px;padding:6px 8px;font:800 8px "JetBrains Mono",monospace;color:#334155}
+.mnt-fixed-bar{margin:0 8px 5px;padding:5px 8px;border-radius:7px;border:1px solid rgba(148,163,184,.3);background:#f8fafc;font:800 7.6px "JetBrains Mono",monospace;flex:none}
+.mnt-fixed-bar.buy{border-color:rgba(16,185,129,.42);background:#ecfdf5}
+.mnt-fixed-bar.sell{border-color:rgba(239,68,68,.42);background:#fef2f2}
+.mnt-fixed-top{display:flex;align-items:center;gap:6px;line-height:1.2}
+.mnt-fixed-lbl{font-size:6.8px;font-weight:900;color:#64748b;letter-spacing:.04em;white-space:nowrap}
+.mnt-fixed-side{font-size:8.6px;font-weight:900;letter-spacing:.03em;padding:1px 6px;border-radius:4px;white-space:nowrap}
+.mnt-fixed-bar.buy .mnt-fixed-side{color:#047857;background:#d1fae5}
+.mnt-fixed-bar.sell .mnt-fixed-side{color:#b91c1c;background:#fee2e2}
+.mnt-fixed-pcts{margin-left:auto;font-size:7px;font-weight:800;color:#475569;white-space:nowrap}
+.mnt-fixed-track{height:4px;margin-top:4px;border-radius:99px;background:#fca5a5;overflow:hidden}
+.mnt-fixed-track i{display:block;height:100%;background:#10b981;transition:width .25s ease}
 .mnt-head-meta{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0;flex:1 1 auto;overflow:hidden}
 .mnt-head-title{display:flex;align-items:center;gap:5px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis;font-size:8.6px}
 #mnt-count{color:#2563eb;font-size:7.6px;font-weight:800;letter-spacing:.02em;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
@@ -13525,6 +13537,20 @@ html.chart-workspace-open{overflow:hidden}
 #mnt-ai-robot-pop .arp-net-tag.wait{color:#b45309;background:#fef3c7}
 #mnt-ai-robot-pop .arp-badge-kind{font-size:6.2px;font-weight:900;padding:1px 4px;border-radius:3px;background:#e0f2fe;color:#0369a1;letter-spacing:.04em}
 #mnt-ai-robot-pop .arp-badge-kind.web{background:#ede9fe;color:#6d28d9}
+#mnt-ai-robot-pop .arp-badge-kind.live{background:#dcfce7;color:#047857}
+#mnt-ai-robot-pop .arp-pillars{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin-top:5px}
+#mnt-ai-robot-pop .arp-pillar{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;padding:3px 4px;border-radius:6px;border:1px solid rgba(148,163,184,.24);background:rgba(248,250,252,.92);font-size:6px;font-weight:800;color:#475569;text-align:center}
+#mnt-ai-robot-pop .arp-pillar b{font-size:7px;font-weight:900;color:#64748b}
+#mnt-ai-robot-pop .arp-pillar.buy{background:rgba(236,253,245,.9);border-color:rgba(16,185,129,.35)}
+#mnt-ai-robot-pop .arp-pillar.buy b{color:#047857}
+#mnt-ai-robot-pop .arp-pillar.sell{background:rgba(254,242,242,.9);border-color:rgba(239,68,68,.35)}
+#mnt-ai-robot-pop .arp-pillar.sell b{color:#b91c1c}
+#mnt-ai-robot-pop .arp-release-alert{display:flex;align-items:center;gap:6px;margin-top:5px;padding:4px 7px;border-radius:6px;border:1px solid rgba(245,158,11,.38);background:rgba(254,243,199,.78);font-size:6.8px;color:#92400e;font-weight:700;line-height:1.25}
+#mnt-ai-robot-pop .arp-release-alert b{font-size:6.4px;font-weight:900;white-space:nowrap;padding:1px 4px;border-radius:4px;background:rgba(245,158,11,.22)}
+#mnt-ai-robot-pop .arp-release-alert.buy{border-color:rgba(16,185,129,.42);background:rgba(209,250,229,.78);color:#065f46}
+#mnt-ai-robot-pop .arp-release-alert.buy b{background:rgba(16,185,129,.22)}
+#mnt-ai-robot-pop .arp-release-alert.sell{border-color:rgba(239,68,68,.42);background:rgba(254,226,226,.78);color:#991b1b}
+#mnt-ai-robot-pop .arp-release-alert.sell b{background:rgba(239,68,68,.22)}
 #mnt-ai-robot-pop .arp-list{display:grid;gap:5px;margin:7px 0;max-height:175px;overflow-y:auto}
 #mnt-ai-robot-pop .arp-item{padding:6px 8px;border-radius:7px;border:1px solid rgba(148,163,184,.22);background:rgba(248,250,252,.92)!important;border-left:3px solid #94a3b8;color:#1e293b!important}
 #mnt-ai-robot-pop .arp-item.buy{border-left-color:#10b981!important;background:rgba(236,253,245,.82)!important;color:#1e293b!important}
@@ -13747,6 +13773,25 @@ button.sai-chip.scale-btn.is-active {
 button.sai-chip.scale-btn.is-active i {
   color: #4f46e5;
 }
+button.sai-chip.save-btn, button.sai-chip.clear-btn {
+  appearance: none;
+  cursor: pointer;
+  line-height: 1.25;
+  transition: border-color .15s ease, background .15s ease;
+}
+button.sai-chip.save-btn:hover { border-color: rgba(14, 165, 233, .5); color: #0369a1; }
+button.sai-chip.save-btn.is-saved {
+  background: rgba(16, 185, 129, .14);
+  color: #047857;
+  border-color: rgba(16, 185, 129, .42);
+}
+button.sai-chip.save-btn.is-saved i { color: #059669; }
+button.sai-chip.clear-btn {
+  background: rgba(244, 63, 94, .08);
+  color: #be123c;
+  border-color: rgba(244, 63, 94, .3);
+}
+button.sai-chip.clear-btn i { color: #e11d48; }
 @media (min-width: 420px) {
   .sai-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
@@ -16007,6 +16052,14 @@ html.sx-dark #dash .mnt-robot-svg .ai-bot-shell {
 }
 html.sx-dark #dash .mnt-robot-svg .ai-bot-visor { fill: #020617 !important; }
 html.sx-dark #dash .mnt-ai-robot-tag em { color: #94a3b8 !important; }
+html.sx-dark #dash .mnt-fixed-bar { background: rgba(22, 33, 56, 0.9) !important; border-color: rgba(148, 163, 184, 0.25) !important; }
+html.sx-dark #dash .mnt-fixed-bar.buy { background: rgba(6, 78, 59, 0.34) !important; border-color: rgba(52, 211, 153, 0.38) !important; }
+html.sx-dark #dash .mnt-fixed-bar.sell { background: rgba(127, 29, 29, 0.34) !important; border-color: rgba(248, 113, 113, 0.38) !important; }
+html.sx-dark #dash .mnt-fixed-lbl, html.sx-dark #dash .mnt-fixed-pcts { color: #cbd5e1 !important; }
+html.sx-dark #dash .mnt-fixed-bar.buy .mnt-fixed-side { color: #34d399 !important; background: rgba(16, 185, 129, 0.22) !important; }
+html.sx-dark #dash .mnt-fixed-bar.sell .mnt-fixed-side { color: #f87171 !important; background: rgba(239, 68, 68, 0.22) !important; }
+html.sx-dark #dash .mnt-fixed-track { background: rgba(239, 68, 68, 0.45) !important; }
+html.sx-dark #dash .mnt-fixed-track i { background: #34d399 !important; }
 html.sx-dark #dash .mnt-ai-robot-tag b.buy { color: #34d399 !important; background: rgba(16, 185, 129, 0.2) !important; }
 html.sx-dark #dash .mnt-ai-robot-tag b.sell { color: #f87171 !important; background: rgba(239, 68, 68, 0.2) !important; }
 html.sx-dark #dash .mnt-ai-robot-tag b.wait { color: #fbbf24 !important; background: rgba(245, 158, 11, 0.2) !important; }
@@ -16030,6 +16083,16 @@ html.sx-dark #mnt-ai-robot-pop .arp-net-tag.sell { color: #f87171 !important; ba
 html.sx-dark #mnt-ai-robot-pop .arp-net-tag.wait { color: #fbbf24 !important; background: rgba(245, 158, 11, 0.2) !important; }
 html.sx-dark #mnt-ai-robot-pop .arp-badge-kind { background: rgba(56, 189, 248, 0.2) !important; color: #7dd3fc !important; }
 html.sx-dark #mnt-ai-robot-pop .arp-badge-kind.web { background: rgba(167, 139, 250, 0.22) !important; color: #c4b5fd !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-badge-kind.live { background: rgba(16, 185, 129, 0.24) !important; color: #34d399 !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-pillar { background: rgba(30, 41, 59, 0.88) !important; border-color: rgba(148, 163, 184, 0.22) !important; color: #cbd5e1 !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-pillar b { color: #94a3b8 !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-pillar.buy { background: rgba(6, 78, 59, 0.36) !important; border-color: rgba(52, 211, 153, 0.36) !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-pillar.buy b { color: #34d399 !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-pillar.sell { background: rgba(127, 29, 29, 0.36) !important; border-color: rgba(248, 113, 113, 0.36) !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-pillar.sell b { color: #f87171 !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-release-alert { background: rgba(120, 53, 15, 0.36) !important; border-color: rgba(251, 191, 36, 0.38) !important; color: #fde68a !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-release-alert.buy { background: rgba(6, 78, 59, 0.4) !important; border-color: rgba(52, 211, 153, 0.4) !important; color: #a7f3d0 !important; }
+html.sx-dark #mnt-ai-robot-pop .arp-release-alert.sell { background: rgba(127, 29, 29, 0.4) !important; border-color: rgba(248, 113, 113, 0.4) !important; color: #fecaca !important; }
 html.sx-dark #mnt-ai-robot-pop .arp-item {
   background: rgba(22, 33, 56, 0.88) !important;
   border-color: rgba(148, 163, 184, 0.2) !important;
@@ -16087,6 +16150,20 @@ html.sx-dark #dash button.sai-chip.scale-btn.is-active {
   background: rgba(99, 102, 241, 0.28) !important;
   border-color: rgba(129, 140, 248, 0.65) !important;
   color: #e0e7ff !important;
+}
+html.sx-dark #dash button.sai-chip.save-btn:hover {
+  border-color: rgba(56, 189, 248, 0.6) !important;
+  color: #7dd3fc !important;
+}
+html.sx-dark #dash button.sai-chip.save-btn.is-saved {
+  background: rgba(6, 78, 59, 0.36) !important;
+  border-color: rgba(52, 211, 153, 0.5) !important;
+  color: #34d399 !important;
+}
+html.sx-dark #dash button.sai-chip.clear-btn {
+  background: rgba(127, 29, 29, 0.3) !important;
+  border-color: rgba(248, 113, 113, 0.42) !important;
+  color: #fda4af !important;
 }
 html.sx-dark #dash .sai-conf { color: #cbd5e1 !important; }
 html.sx-dark #dash .sai-cell .sai-exit-tm { color: #94a3b8 !important; }

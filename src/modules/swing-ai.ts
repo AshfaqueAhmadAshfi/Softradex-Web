@@ -39,11 +39,15 @@ export function loadModule(): void {
   var CANDLES_MS = 25000;
   var PRICE_MS = 3500;
   var FAIL_REBUILD_MS = 4000;
+  var TIMEOUT_REBUILD_MS = 1200;
   var MAX_RESTORE_AGE_MS = 24 * 60 * 60 * 1000;
+  var EXPIRED_SIGNAL_COOLDOWN_MS = 20 * 60 * 1000;
   var MAX_ETA_MIN = 720, MIN_ETA_MIN = 5;
   var LOG_KEY = 'softradex.swing.log';
   var PLAN_KEY = 'softradex.swing.plan.v4.';
   var MODE_KEY = 'softradex.swing.mode.v1.';
+  var SAVED_ZONES_KEY = 'softradex.swing.savedZones.v1.';
+  var MAX_SAVED_ZONES = 16;
 
   var SCALE_SPECS = {
     SHORT: {
@@ -109,6 +113,8 @@ export function loadModule(): void {
   var structureStamp = '';
   var directionModels = { BUY: null, SELL: null };
   var lastCompletedSignals = {};
+  var recentExpiredSignals = {};
+  var savedChartZones = [];
   var savedPlanSignatures = { BUY: '', SELL: '' };
   var runningSeqCounter = 0;
   var manualScalePickAt = { BUY: 0, SELL: 0 };
@@ -752,18 +758,37 @@ export function loadModule(): void {
     function bracketIntact(br) {
       return !!br && (!(price > 0) || (buy ? price > br.stop : price < br.stop));
     }
+    function wasRecentlyExpired(br) {
+      if (!br) return false;
+      var sid = [symbol, tvInstrument || instrument(), side, spec.scale, br.entry, br.target, br.stop].join('|');
+      var expAt = Number(recentExpiredSignals[sid]) || 0;
+      return expAt > 0 && now - expAt < EXPIRED_SIGNAL_COOLDOWN_MS;
+    }
 
     var chosen = null, chosenBounds = null;
     for (var i = 0; i < clusters.length; i++) {
       var cl = clusters[i];
       var br = structuralBracket(side, cl.mean, frames, spec, false);
-      if (cl.items.length >= 2 && bracketIntact(br)) { chosen = cl; chosenBounds = br; break; }
+      if (cl.items.length >= 2 && bracketIntact(br) && !wasRecentlyExpired(br)) { chosen = cl; chosenBounds = br; break; }
+    }
+    if (!chosen) {
+      for (var i2 = 0; i2 < clusters.length; i2++) {
+        var brAlt = structuralBracket(side, clusters[i2].mean, frames, spec, false);
+        if (clusters[i2].items.length >= 2 && bracketIntact(brAlt)) { chosen = clusters[i2]; chosenBounds = brAlt; break; }
+      }
     }
     if (!chosen) {
       for (var j = 0; j < clusters.length; j++) {
         var br2 = structuralBracket(side, clusters[j].mean, frames, spec, false) ||
           structuralBracket(side, clusters[j].mean, frames, spec, true);
-        if (bracketIntact(br2)) { chosen = clusters[j]; chosenBounds = br2; break; }
+        if (bracketIntact(br2) && !wasRecentlyExpired(br2)) { chosen = clusters[j]; chosenBounds = br2; break; }
+      }
+    }
+    if (!chosen) {
+      for (var j2 = 0; j2 < clusters.length; j2++) {
+        var br2Alt = structuralBracket(side, clusters[j2].mean, frames, spec, false) ||
+          structuralBracket(side, clusters[j2].mean, frames, spec, true);
+        if (bracketIntact(br2Alt)) { chosen = clusters[j2]; chosenBounds = br2Alt; break; }
       }
     }
     if (!chosen) {
@@ -888,15 +913,115 @@ export function loadModule(): void {
     return true;
   }
 
+  function savedZoneKey(z) {
+    return [z.side || '', z.scale || '', Number(z.entry || 0).toFixed(4), Number(z.tp || 0).toFixed(4), Number(z.sl || 0).toFixed(4)].join('|');
+  }
+
+  function loadSavedZones() {
+    try {
+      var raw = JSON.parse(localStorage.getItem(SAVED_ZONES_KEY + symbol) || '[]');
+      savedChartZones = Array.isArray(raw) ? raw.filter(function (z) {
+        return z && z.symbol === symbol && (z.side === 'BUY' || z.side === 'SELL') &&
+          Number(z.entry) > 0 && Number(z.tp) > 0 && Number(z.sl) > 0;
+      }).slice(-MAX_SAVED_ZONES) : [];
+    } catch (e) { savedChartZones = []; }
+  }
+
+  function persistSavedZones() {
+    try { localStorage.setItem(SAVED_ZONES_KEY + symbol, JSON.stringify(savedChartZones.slice(-MAX_SAVED_ZONES))); } catch (e) {}
+  }
+
+  function isPlanSavedOnChart(p) {
+    if (!p) return false;
+    var key = savedZoneKey({
+      side: p.side,
+      scale: p.scale || 'SHORT',
+      entry: Number(p.observedEntry || p.entry),
+      tp: Number(p.target),
+      sl: Number(p.stop)
+    });
+    return savedChartZones.some(function (z) { return savedZoneKey(z) === key; });
+  }
+
+  function savePlanToChart(p, reason, now) {
+    if (!p) return false;
+    now = now || Date.now();
+    var entry = Number(p.observedEntry || p.entry);
+    var tp = Number(p.target);
+    var sl = Number(p.stop);
+    if (!(entry > 0) || !(tp > 0) || !(sl > 0)) return false;
+    var item = {
+      id: (p.signalId || (p.side + '|' + entry)) + '|' + Math.round(p.startAt || now),
+      symbol: symbol,
+      tvSymbol: p.tvSymbol || instrument(),
+      side: p.side,
+      scale: p.scale || 'SHORT',
+      tfLabel: p.tfLabel || '',
+      entry: entry,
+      tp: tp,
+      sl: sl,
+      rr: Number(p.observedRR || p.rr) || Math.abs(tp - entry) / Math.max(1e-9, Math.abs(entry - sl)),
+      startAt: Number(p.startAt || p.created || now),
+      savedAt: now,
+      reason: reason || 'manual',
+      status: 'OPEN',
+      hitAt: 0,
+      hitPrice: 0
+    };
+    var key = savedZoneKey(item);
+    var existing = savedChartZones.find(function (z) { return savedZoneKey(z) === key; });
+    if (existing) {
+      if (reason === 'manual') { existing.reason = 'manual'; persistSavedZones(); }
+      return false;
+    }
+    savedChartZones.push(item);
+    if (savedChartZones.length > MAX_SAVED_ZONES) savedChartZones = savedChartZones.slice(-MAX_SAVED_ZONES);
+    persistSavedZones();
+    return true;
+  }
+
+  function clearSavedZones(sideOrAll) {
+    if (!sideOrAll || sideOrAll === 'ALL') {
+      savedChartZones = [];
+    } else {
+      savedChartZones = savedChartZones.filter(function (z) { return z.side !== sideOrAll; });
+    }
+    persistSavedZones();
+    lastFactorHtmlByBoard = Object.create(null);
+    paint(Date.now());
+  }
+
+  function updateSavedZonesStatus(now) {
+    if (!savedChartZones.length || !quoteFresh(now) || !(price > 0)) return;
+    var changed = false;
+    savedChartZones.forEach(function (z) {
+      if (!z || z.status !== 'OPEN') return;
+      var buy = z.side === 'BUY';
+      if (buy ? price >= z.tp : price <= z.tp) {
+        z.status = 'TP_HIT';
+        z.hitAt = now;
+        z.hitPrice = price;
+        changed = true;
+      } else if (buy ? price <= z.sl : price >= z.sl) {
+        z.status = 'SL_HIT';
+        z.hitAt = now;
+        z.hitPrice = price;
+        changed = true;
+      }
+    });
+    if (changed) persistSavedZones();
+  }
+
   function hydrateRestoredPlan(p, now) {
     p.rr = Math.abs(p.target - p.entry) / Math.max(1e-9, Math.abs(p.stop - p.entry));
     if (p.running && Number.isFinite(p.observedEntry)) {
       p.observedRR = Math.abs(p.target - p.observedEntry) / Math.max(1e-9, Math.abs(p.stop - p.observedEntry));
     }
-    // Preserve exact prices and original start candle across reload even if the watch window elapsed offline.
+    // Enforce fixed duration across reloads: archive timed-out running swing to chart so its TP/SL stays drawn, then find a fresh swing
     if (p.endAt <= now) {
-      if (!p.running) p.startAt = nextBarOpen(now);
-      p.endAt = now + Math.max(MIN_ETA_MIN, Number(p.etaMin) || 30) * 60000;
+      if (p.running) savePlanToChart(p, 'timeout', now);
+      if (p.signalId) recentExpiredSignals[p.signalId] = now;
+      return null;
     }
     p.restored = true;
     return p;
@@ -936,8 +1061,11 @@ export function loadModule(): void {
             var sp = saved.scales[sc];
             if (isValidPlanShape(sp, side)) {
               tvInstrument = saved.tvSymbol;
-              lockedScales[side][sc] = hydrateRestoredPlan(sp, now);
-              runningSeqCounter = Math.max(runningSeqCounter, Number(sp.runningSeq) || 0);
+              var hydScale = hydrateRestoredPlan(sp, now);
+              if (hydScale) {
+                lockedScales[side][sc] = hydScale;
+                runningSeqCounter = Math.max(runningSeqCounter, Number(hydScale.runningSeq) || 0);
+              }
             }
           });
         }
@@ -946,18 +1074,20 @@ export function loadModule(): void {
         if (isValidPlanShape(p, side)) {
           tvInstrument = saved.tvSymbol;
           var restored = hydrateRestoredPlan(p, now);
-          runningSeqCounter = Math.max(runningSeqCounter, Number(restored.runningSeq) || 0);
-          if (restored.scale && (restored.scale === 'SHORT' || restored.scale === 'MAJOR')) {
-            var existingScale = lockedScales[side][restored.scale];
-            var restoredTs = Math.max(restored.lastQuoteAt || 0, restored.evaluatedQuoteAt || 0, restored.created || 0);
-            var existingTs = existingScale ? Math.max(existingScale.lastQuoteAt || 0, existingScale.evaluatedQuoteAt || 0, existingScale.created || 0) : 0;
-            if (!existingScale || (restored.running && !existingScale.running) ||
-                (restored.signalId === existingScale.signalId && restoredTs >= existingTs)) {
-              lockedScales[side][restored.scale] = restored;
+          if (restored) {
+            runningSeqCounter = Math.max(runningSeqCounter, Number(restored.runningSeq) || 0);
+            if (restored.scale && (restored.scale === 'SHORT' || restored.scale === 'MAJOR')) {
+              var existingScale = lockedScales[side][restored.scale];
+              var restoredTs = Math.max(restored.lastQuoteAt || 0, restored.evaluatedQuoteAt || 0, restored.created || 0);
+              var existingTs = existingScale ? Math.max(existingScale.lastQuoteAt || 0, existingScale.evaluatedQuoteAt || 0, existingScale.created || 0) : 0;
+              if (!existingScale || (restored.running && !existingScale.running) ||
+                  (restored.signalId === existingScale.signalId && restoredTs >= existingTs)) {
+                lockedScales[side][restored.scale] = restored;
+              }
+              plans[side] = attachScaleSummaries(lockedScales[side][restored.scale], lockedScales[side].SHORT, lockedScales[side].MAJOR);
+            } else {
+              plans[side] = attachScaleSummaries(restored, lockedScales[side].SHORT, lockedScales[side].MAJOR);
             }
-            plans[side] = attachScaleSummaries(lockedScales[side][restored.scale], lockedScales[side].SHORT, lockedScales[side].MAJOR);
-          } else {
-            plans[side] = attachScaleSummaries(restored, lockedScales[side].SHORT, lockedScales[side].MAJOR);
           }
         }
         var latestRun = pickLatestRunning(lockedScales[side].SHORT, lockedScales[side].MAJOR);
@@ -1087,10 +1217,14 @@ export function loadModule(): void {
     return true;
   }
 
+  function rebuildDelayFor(p) {
+    return (p && (p.outcome === 'timeout' || p.outcome === 'expired')) ? TIMEOUT_REBUILD_MS : FAIL_REBUILD_MS;
+  }
+
   function ensureScaleLock(side, scaleKey, candidateSetup, now) {
     var existing = lockedScales[side][scaleKey];
     if (existing && (existing.hit || existing.doneAt)) {
-      if (plans[side] === existing && now - (existing.hitAt || existing.doneAt) <= FAIL_REBUILD_MS) {
+      if (plans[side] === existing && now - (existing.hitAt || existing.doneAt) <= rebuildDelayFor(existing)) {
         return existing;
       }
       lockedScales[side][scaleKey] = null;
@@ -1238,7 +1372,7 @@ export function loadModule(): void {
 
   function planNeedsRebuild(p, side, now) {
     if (!p) return true;
-    if (p.hit || p.doneAt) return now - (p.hitAt || p.doneAt) > FAIL_REBUILD_MS;
+    if (p.hit || p.doneAt) return now - (p.hitAt || p.doneAt) > rebuildDelayFor(p);
     if (p.running) return false;
     // Wait until initial multi-TF candles are loaded before judging an active restored plan!
     if (!bootCandlesReady) return false;
@@ -1268,21 +1402,22 @@ export function loadModule(): void {
     }
 
     if (now >= p.endAt) {
-      if (!p.running) {
-        // Keep armed structural swing locked until filled or stop-invalidated; renew watch window.
-        p.startAt = nextBarOpen(now);
-        p.endAt = now + Math.max(MIN_ETA_MIN, p.etaMin) * 60000;
-        return true;
-      }
-      if (now - p.startAt > MAX_RESTORE_AGE_MS) {
+      if (p.signalId) recentExpiredSignals[p.signalId] = now;
+      if (p.running) {
+        // Save drawn Entry/TP/SL permanently on chart before closing and scanning for a new swing
+        savePlanToChart(p, 'timeout', now);
         p.doneAt = now;
         p.outcome = 'timeout';
-        p.exitPrice = price > 0 ? price : p.target;
+        p.exitPrice = price > 0 ? price : p.entry;
         p.exitAt = now;
         pushLog(p, 'timeout');
         return true;
       }
-      p.endAt = now + Math.max(15, Math.round(p.etaMin * 0.5)) * 60000;
+      p.doneAt = now;
+      p.outcome = 'expired';
+      p.exitPrice = price > 0 ? price : p.entry;
+      p.exitAt = now;
+      pushLog(p, 'expired');
       return true;
     }
 
@@ -1404,7 +1539,7 @@ export function loadModule(): void {
       var sp = lockedScales[side][sc];
       if (!sp || (!sp.hit && !sp.doneAt)) return;
       var finishedAt = sp.hitAt || sp.doneAt || 0;
-      if (plans[side] !== sp || now - finishedAt > FAIL_REBUILD_MS) {
+      if (plans[side] !== sp || now - finishedAt > rebuildDelayFor(sp)) {
         if (plans[side] === sp) displayedFinished = true;
         lockedScales[side][sc] = null;
       }
@@ -1424,6 +1559,7 @@ export function loadModule(): void {
     ['BUY', 'SELL'].forEach(function (side) {
       stepPlanLifecycle(side, now);
     });
+    updateSavedZonesStatus(now);
     if (!bootCandlesReady) return;
 
     ['BUY', 'SELL'].forEach(function (side) {
@@ -1483,6 +1619,23 @@ export function loadModule(): void {
       '<i>AI</i>' + (mode === 'AUTO' ? 'AUTO S+M' : 'RESET AUTO') + '</button>'
     );
 
+    var pinnedOnChart = !!(plan && isPlanSavedOnChart(plan));
+    if (plan && !plan.hit && !plan.doneAt) {
+      scaleChips.push(
+        '<button type="button" class="sai-chip save-btn' + (pinnedOnChart ? ' is-saved' : '') +
+        '" data-board-side="' + side + '" data-save-action="pin" title="Save this TP / SL permanently on chart">' +
+        '<i>CHART</i>' + (pinnedOnChart ? '✓ SAVED' : '📌 SAVE TP/SL') + '</button>'
+      );
+    }
+    var sideSavedCount = savedChartZones.filter(function (z) { return z && z.side === side; }).length;
+    if (sideSavedCount > 0) {
+      scaleChips.push(
+        '<button type="button" class="sai-chip clear-btn" data-board-side="' + side +
+        '" data-save-action="clear" title="Clear saved ' + side + ' TP / SL overlays from chart">' +
+        '<i>SAVED ' + sideSavedCount + '</i>CLEAR ×</button>'
+      );
+    }
+
     var m5 = fallbackBaseFrame();
     var chips = [];
     if (m5 && m5.ready) {
@@ -1536,6 +1689,9 @@ export function loadModule(): void {
     return p ? [!!p.running, !!p.hit, !!p.doneAt, p.observedEntry || p.entry, p.target, p.stop, p.startAt].join(':') : '';
   }
   function notifySwingState() {
+    var savedPart = savedChartZones.map(function (z) {
+      return z.side + ':' + (z.scale || '') + ':' + z.entry + ':' + z.tp + ':' + z.sl + ':' + (z.status || '');
+    }).join(',');
     var sig = [
       symbol,
       scaleSigPart(plans.BUY),
@@ -1543,7 +1699,8 @@ export function loadModule(): void {
       scaleSigPart(lockedScales.BUY.SHORT),
       scaleSigPart(lockedScales.BUY.MAJOR),
       scaleSigPart(lockedScales.SELL.SHORT),
-      scaleSigPart(lockedScales.SELL.MAJOR)
+      scaleSigPart(lockedScales.SELL.MAJOR),
+      savedPart
     ].join('|');
     if (sig === lastSwingEventSig) return;
     lastSwingEventSig = sig;
@@ -1680,9 +1837,10 @@ export function loadModule(): void {
       setClock(clock(p.hitAt - p.startAt));
       setBar(1);
     } else if (p.doneAt) {
-      setPhase(p.outcome === 'timeout' ? 'TIME EXIT · COMPLETE'
-        : p.outcome === 'invalidated' ? 'STRUCTURE SHIFT · RE-SCANNING'
-          : 'STOPPED OUT · RE-CALCULATING', 'fail', p.outcome ? 'EXPIRED' : 'FAILED');
+      setPhase(p.outcome === 'timeout' ? 'TIME UP · SAVED TO CHART · NEXT SWING'
+        : p.outcome === 'expired' ? 'WATCH EXPIRED · RE-SCANNING'
+          : p.outcome === 'invalidated' ? 'STRUCTURE SHIFT · RE-SCANNING'
+            : 'STOPPED OUT · RE-CALCULATING', 'fail', p.outcome === 'timeout' ? 'SCAN NEXT' : (p.outcome ? 'EXPIRED' : 'FAILED'));
       setClock(clock(p.doneAt - p.startAt));
       setBar(1);
     } else if (p.running) {
@@ -1930,7 +2088,10 @@ export function loadModule(): void {
     reads = {};
     vote = null;
     log = [];
+    savedChartZones = [];
+    recentExpiredSignals = {};
     loadLog();
+    loadSavedZones();
     restorePlans();
     paint();
     loadPrice();
@@ -1948,6 +2109,22 @@ export function loadModule(): void {
       var el = $(board.id);
       if (!el) return;
       el.addEventListener('click', function (ev) {
+        var saveBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-save-action]') : null;
+        if (saveBtn) {
+          var sSide = saveBtn.getAttribute('data-board-side') || board.side;
+          var act = saveBtn.getAttribute('data-save-action');
+          if (act === 'pin') {
+            var p = plans[sSide] || lockedScales[sSide].SHORT || lockedScales[sSide].MAJOR;
+            if (p) {
+              savePlanToChart(p, 'manual', Date.now());
+              lastFactorHtmlByBoard = Object.create(null);
+              paint(Date.now());
+            }
+          } else if (act === 'clear') {
+            clearSavedZones(sSide);
+          }
+          return;
+        }
         var btn = ev.target && ev.target.closest ? ev.target.closest('button.scale-btn[data-scale]') : null;
         if (!btn) return;
         var bSide = btn.getAttribute('data-board-side') || board.side;
@@ -1979,6 +2156,7 @@ export function loadModule(): void {
     window.addEventListener('chart:tv-quote', function (ev) { acceptQuote(ev.detail); });
 
     loadLog();
+    loadSavedZones();
     restorePlans();
     paint();
     loadPrice();
@@ -2006,6 +2184,17 @@ export function loadModule(): void {
   window.SwingAI = {
     refresh: function () { loadPrice(); loadCandles(); },
     setScale: function (side, mode) { applyScaleChoice(side, mode); },
+    savedZones: function () { return savedChartZones.map(function (z) { return Object.assign({}, z); }); },
+    saveCurrent: function (side) {
+      var s = side === 'BUY' || side === 'SELL' ? side : primarySide();
+      var p = plans[s] || lockedScales[s].SHORT || lockedScales[s].MAJOR;
+      if (!p) return false;
+      var ok = savePlanToChart(p, 'manual', Date.now());
+      lastFactorHtmlByBoard = Object.create(null);
+      paint(Date.now());
+      return ok;
+    },
+    clearSaved: function (sideOrAll) { clearSavedZones(sideOrAll); },
     structure: function () {
       var inst = instrument();
       var key = symbol + '|' + structureAt + '|' + inst + '|' +
@@ -2041,6 +2230,7 @@ export function loadModule(): void {
         plan: activePlan,
         plans: plans,
         scales: lockedScales,
+        savedZones: savedChartZones.map(function (z) { return Object.assign({}, z); }),
         modes: scaleMode,
         reads: reads,
         flowBias: currentFlow(Date.now()),

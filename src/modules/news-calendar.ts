@@ -134,6 +134,9 @@ export function loadModule(): void {
   var newsServerSig = '', lastSavedSig = '', newsMergeGen = 0;
   var cachedRenderHeadlines = [], cachedHeadlinesKey = '';
   var workerEstimates = Object.create(null), workerBatchGen = 0, lastWorkerKey = '';
+  var dxyBarsM5 = [], lastReleaseScanAt = 0;
+  var fixed24hState = { market: '', side: 'BUY', buyPct: 51, sellPct: 49, winPct: 51, buyCount: 0, sellCount: 0, waitCount: 0 };
+  var lastFixedRenderSig = '';
   function getRelevantHeadlines(now) {
     var key = symbol + '|' + newsMergeGen;
     if (cachedHeadlinesKey !== key) {
@@ -322,45 +325,57 @@ export function loadModule(): void {
   }
   var dirEstCache = Object.create(null);
   var dirEstBucket = 0;
-  function directionalEstimate(ev, now) {
+  function directionalEstimate(ev, now, resolveRunning) {
     if (!window.NewsDirection) return null;
     if (!locksRestored) {
       locksRestored = true;
       try { lockedDirections = JSON.parse(localStorage.getItem(NEWS_LOCK_KEY) || '{}'); } catch(e) {}
       if (!lockedDirections || typeof lockedDirections !== 'object') lockedDirections = Object.create(null);
     }
+    var runMode = !!resolveRunning;
     var key = marketBase(symbol) + '|' + eventKey(ev), phase = phaseFor(ev, now);
+    var lockKey = key + (runMode ? '|run' : '');
+    var evActualStr = ev.actual != null ? String(ev.actual).trim() : '';
     var m5Bars = getLiveM5Bars(), qLive = liveQuote();
-    var locked = lockedDirections[key];
+    var locked = lockedDirections[lockKey];
     if (phase === 'running' && locked && locked.expires > now) {
-      var evHasActual = ev.actual != null && String(ev.actual).trim() !== '';
-      var lockedStaleActual = evHasActual && !locked.hasActual;
+      var evHasActual = evActualStr !== '';
+      var lockedStaleActual = evHasActual && (!locked.hasActual || String(locked.actualVal || '') !== evActualStr);
       var rx = m5Bars.length ? computePostEventReaction(m5Bars, Number(ev.ts) || now, now, qLive ? Number(qLive.price) : undefined) : null;
-      var lockedReversed = !!(rx && rx.ready && (
+      var lockedReversed = !!(rx && rx.ready && !locked.hasActual && (
         (locked.side === 'SELL' && rx.evMoveAtr >= 0.72) ||
         (locked.side === 'BUY' && rx.evMoveAtr <= -0.72)
       ));
-      if (!lockedStaleActual && !lockedReversed) return locked;
-      delete lockedDirections[key];
+      var lockedInvalid = locked.side === 'WAIT' || !!locked.conflict;
+      if (!lockedStaleActual && !lockedReversed && !lockedInvalid) return locked;
+      delete lockedDirections[lockKey];
     }
-    var wEst = workerEstimates[key];
-    if (wEst && now - (wEst.at / 1000) <= 12) return wEst;
+    var wEst = !runMode ? workerEstimates[key] : null;
+    if (wEst && now - (wEst.at / 1000) <= 12 && wEst._phase === phase && wEst._actual === evActualStr) return wEst;
     var bucketNow = Math.floor(now / 15);
     if (dirEstBucket !== bucketNow) { dirEstCache = Object.create(null); dirEstBucket = bucketNow; }
     var swState = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
     var qB = qLive ? Math.round(Number(qLive.price) / (Number(qLive.price) * 0.0005 || 1)) : 0;
     var swSig = swState && swState.fresh ? (swState.verdict || '') + ':' + Math.round((Number(swState.score) || 0) * 10) : '';
-    var dCacheKey = key + '|' + newsMergeGen + '|' + qB + '|' + swSig + '|' + String(ev.actual || '') + '|' + m5Bars.length;
+    var dCacheKey = lockKey + '|' + phase + '|' + newsMergeGen + '|' + qB + '|' + swSig + '|' + evActualStr + '|' + m5Bars.length + '|' + dxyBarsM5.length;
     if (Object.prototype.hasOwnProperty.call(dirEstCache, dCacheKey)) return dirEstCache[dCacheKey];
     var imp = impactFor(ev);
-    var estimate = window.NewsDirection.estimate({symbol:symbol,event:ev,impact:imp,prediction:predictionFor(ev,imp),
-      quote:qLive,market:swState,now:now,headlines:getRelevantHeadlines(now),headlinesPreSorted:true,barsM5:m5Bars});
-    // Never lock qualitative speeches/unreleased events at t=0 before post-speech headlines & live reaction unfold
-    var canLock = phase === 'running' && estimate && estimate.side !== 'WAIT' &&
-      (estimate.hasActual || now >= Number(ev.ts) + 900);
+    var estimate = window.NewsDirection.estimate({
+      symbol: symbol, event: ev, impact: imp, prediction: predictionFor(ev, imp),
+      quote: qLive, market: swState, now: now, headlines: getRelevantHeadlines(now),
+      headlinesPreSorted: true, barsM5: m5Bars,
+      dxyBarsM5: dxyBarsM5.length >= 4 ? dxyBarsM5 : undefined,
+      resolveRunning: runMode
+    });
+    // Lock only verified actual surprises (strength >= 58) or confirmed 5m+ post-event breakouts (no conflict)
+    var canLock = phase === 'running' && estimate && estimate.side !== 'WAIT' && !estimate.conflict &&
+      Number(estimate.strength || 0) >= 58 &&
+      (estimate.hasActual || (now >= Number(ev.ts) + 300 && Math.abs(Number(estimate.reactionAtr) || 0) >= 0.55));
     if (canLock) {
-      estimate.locked = true; estimate.expires = Number(ev.ts) + impactWindow(ev);
-      lockedDirections[key] = estimate;
+      estimate.locked = true;
+      estimate.actualVal = evActualStr;
+      estimate.expires = Number(ev.ts) + impactWindow(ev);
+      lockedDirections[lockKey] = estimate;
       Object.keys(lockedDirections).forEach(function(k) { if (lockedDirections[k].expires <= now) delete lockedDirections[k]; });
       try { localStorage.setItem(NEWS_LOCK_KEY, JSON.stringify(lockedDirections)); } catch(e) {}
     }
@@ -525,11 +540,12 @@ export function loadModule(): void {
   function renderNewsList(id, rows, now) {
     var list = $(id);
     if (!list) return;
+    var isRunningPanel = id === 'running-news-list';
     var qL = liveQuote();
     var qSig = qL ? Math.round(Number(qL.price) / (Number(qL.price) * 0.0005 || 1)) : 0;
     var swL = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
     var swLSig = swL && swL.fresh ? (swL.verdict || '') + ':' + Math.round((Number(swL.score) || 0) * 10) : '';
-    var sigParts = [symbol, newsMergeGen, workerBatchGen, qSig, swLSig, Math.floor(now / 15), rows.length];
+    var sigParts = [symbol, newsMergeGen, workerBatchGen, qSig, swLSig, getLiveM5Bars().length, dxyBarsM5.length, Math.floor(now / 15), rows.length];
     for (var si = 0; si < rows.length; si++) {
       var r0 = rows[si];
       sigParts.push(r0.ts, phaseFor(r0, now), r0.actual || '', r0.impact || '', r0.kind || '');
@@ -541,7 +557,7 @@ export function loadModule(): void {
     if (list.querySelectorAll) Array.prototype.forEach.call(list.querySelectorAll('details[open]'), function(el) { opened[el.dataset.key] = true; });
     var contextStarted = false;
     var html = rows.length ? rows.map(function(ev) {
-      var prediction = directionalEstimate(ev, now);
+      var prediction = directionalEstimate(ev, now, isRunningPanel);
       var impact = String(ev.impact || 'low').toLowerCase();
       if (['low','medium','high'].indexOf(impact) < 0) impact = 'low';
       var side = prediction ? prediction.side : 'DATA';
@@ -609,19 +625,26 @@ export function loadModule(): void {
     var keys = news.map(eventKey);
     Object.keys(eventReferences).forEach(function(key) { if (keys.indexOf(key) < 0) delete eventReferences[key]; });
     var rows = visibleEvents(now);
+    var active = rows.filter(function(ev) { return phaseFor(ev, now) === 'running'; });
     var workerApi = window.SoftCalcWorker;
     if (workerApi && typeof workerApi.estimateNews === 'function' && workerApi.available && workerApi.available() && rows.length > 12) {
       var qLive = liveQuote(), sLive = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
       var qBucket = qLive ? Math.round(qLive.price / (qLive.price * 0.0005 || 1)) : 0;
       var sSig = sLive && sLive.fresh ? (sLive.verdict || '') + ':' + Math.round((Number(sLive.score) || 0) * 10) : '';
-      var wKey = symbol + '|' + newsMergeGen + '|' + qBucket + '|' + sSig;
+      var phaseSig = active.map(function(e) { return eventKey(e) + ':' + String(e.actual || ''); }).join(';');
+      var wKey = symbol + '|' + newsMergeGen + '|' + qBucket + '|' + sSig + '|' + dxyBarsM5.length + '|' + phaseSig;
       if (wKey !== lastWorkerKey) {
         lastWorkerKey = wKey;
         var reqGen = ++workerBatchGen;
         var reqSym = symbol;
+        var reqPhaseByKey = Object.create(null);
+        var reqActualByKey = Object.create(null);
         var reqItems = rows.map(function(ev) {
           var imp = impactFor(ev);
-          return { key: marketBase(reqSym) + '|' + eventKey(ev), event: ev, impact: imp, prediction: predictionFor(ev, imp) };
+          var k = marketBase(reqSym) + '|' + eventKey(ev);
+          reqPhaseByKey[k] = phaseFor(ev, now);
+          reqActualByKey[k] = ev.actual != null ? String(ev.actual).trim() : '';
+          return { key: k, event: ev, impact: imp, prediction: predictionFor(ev, imp) };
         });
         workerApi.estimateNews({
           symbol: reqSym,
@@ -630,14 +653,21 @@ export function loadModule(): void {
           market: sLive,
           headlines: getRelevantHeadlines(now),
           barsM5: getLiveM5Bars(),
+          dxyBarsM5: dxyBarsM5.length >= 4 ? dxyBarsM5 : undefined,
           items: reqItems
         }).then(function(res) {
           if (reqGen !== workerBatchGen || reqSym !== symbol || !res || !res.estimates) return;
-          workerEstimates = res.estimates;
+          var nextEst = res.estimates;
+          Object.keys(nextEst).forEach(function(k) {
+            if (nextEst[k]) {
+              nextEst[k]._phase = reqPhaseByKey[k];
+              nextEst[k]._actual = reqActualByKey[k];
+            }
+          });
+          workerEstimates = nextEst;
         }).catch(function() {});
       }
     }
-    var active = rows.filter(function(ev) { return phaseFor(ev, now) === 'running'; });
     var recent = rows.filter(function(ev) { return recentHeadline(ev, now); });
     var headlines = rows.filter(function(ev) { return phaseFor(ev, now) === 'context'; }).sort(function(a,b) { return Number(b.ts)-Number(a.ts); }); var monitoredHeadlines = recent.length ? recent : (!active.length ? headlines.slice(0, 6) : []);
     var running = active.concat(monitoredHeadlines).sort(function(a,b) { return Number(b.ts)-Number(a.ts); });
@@ -649,6 +679,7 @@ export function loadModule(): void {
     renderNewsList('mnt-list', upcoming.concat(headlines.slice(0, 40)), now);
     renderNewsList('running-news-list', running, now);
     updateAiWorldRobot(upcoming, headlines, now, running, false);
+    updateFixed24hDirection(rows, now);
     if (window.RunningNewsAlerts) window.RunningNewsAlerts.observe({
       market: marketBase(symbol), label: symbol, now: now, ready: newsSnapshotReady,
       events: active.concat(recent).map(function(ev) {
@@ -659,11 +690,109 @@ export function loadModule(): void {
     });
     renderSources(rows);
   }
+  function updateFixed24hDirection(rows, now) {
+    var list = Array.isArray(rows) ? rows : [];
+    var buyW = 0, sellW = 0, weakBuyW = 0, weakSellW = 0;
+    var buyCount = 0, sellCount = 0, waitCount = 0;
+    for (var i = 0; i < list.length; i++) {
+      var ev = list[i];
+      if (!ev) continue;
+      var pred = directionalEstimate(ev, now);
+      var imp = String(ev.impact || 'low').toLowerCase();
+      var impW = imp === 'high' ? 3.0 : imp === 'medium' ? 1.8 : 0.85;
+      var ph = phaseFor(ev, now);
+      var dt = Number(ev.ts || now) - now;
+      var phW = ph === 'running' && pred && pred.hasActual ? 3.2
+        : ph === 'running' ? 2.2
+        : ev.kind === 'headline' ? (Math.abs(dt) <= 7200 ? 1.7 : 0.85)
+        : (dt <= 7200 ? 1.65 : dt <= 21600 ? 1.2 : 0.85);
+      var strW = pred && Number(pred.strength) > 0 ? Number(pred.strength) / 100 : 0.45;
+      var w = impW * phW * strW;
+      if (pred && pred.side === 'BUY') {
+        buyW += w; buyCount++;
+      } else if (pred && pred.side === 'SELL') {
+        sellW += w; sellCount++;
+      } else {
+        waitCount++;
+        var sc = pred ? Number(pred.score) || 0 : 0;
+        if (sc > 0.12) weakBuyW += sc * 0.3 * impW;
+        else if (sc < -0.12) weakSellW += Math.abs(sc) * 0.3 * impW;
+      }
+    }
+
+    var totalW = buyW + sellW;
+    var buyPct = 50, sellPct = 50;
+    if (totalW > 0) {
+      buyPct = Math.round((buyW / totalW) * 100);
+      sellPct = 100 - buyPct;
+    } else if (weakBuyW + weakSellW > 0) {
+      buyPct = Math.round((weakBuyW / (weakBuyW + weakSellW)) * 100);
+      sellPct = 100 - buyPct;
+    } else if (aiWorldState && (aiWorldState.dir === 'BUY' || aiWorldState.dir === 'SELL')) {
+      buyPct = aiWorldState.dir === 'BUY' ? Math.max(55, Number(aiWorldState.pct) || 60) : (100 - Math.max(55, Number(aiWorldState.pct) || 60));
+      sellPct = 100 - buyPct;
+    } else {
+      var sw = window.SwingAI && typeof window.SwingAI.state === 'function' ? window.SwingAI.state() : null;
+      var sVal = sw && sw.fresh ? Number(sw.score) || 0 : 0;
+      buyPct = sVal >= 0 ? 52 : 48;
+      sellPct = 100 - buyPct;
+    }
+
+    // Never allow a 50/50 tie: break tie cleanly so BUY or SELL strictly wins by %
+    if (buyPct === 50) {
+      var tieDelta = (buyW - sellW) || (weakBuyW - weakSellW) || (aiWorldState.dir === 'BUY' ? 1 : aiWorldState.dir === 'SELL' ? -1 : 0);
+      if (!tieDelta) {
+        var sw2 = window.SwingAI && typeof window.SwingAI.state === 'function' ? window.SwingAI.state() : null;
+        tieDelta = sw2 && sw2.fresh && Number(sw2.score) < 0 ? -1 : 1;
+      }
+      buyPct = tieDelta >= 0 ? 51 : 49;
+      sellPct = 100 - buyPct;
+    }
+
+    var side = buyPct > sellPct ? 'BUY' : 'SELL';
+    var winPct = side === 'BUY' ? buyPct : sellPct;
+    fixed24hState = {
+      market: symbol || 'MARKET',
+      side: side,
+      buyPct: buyPct,
+      sellPct: sellPct,
+      winPct: winPct,
+      buyCount: buyCount,
+      sellCount: sellCount,
+      waitCount: waitCount
+    };
+
+    var term = $('market-news-terminal');
+    var bar = $('mnt-fixed-bar');
+    if (term && !bar) {
+      bar = document.createElement('div');
+      bar.id = 'mnt-fixed-bar';
+      bar.className = 'mnt-fixed-bar buy';
+      bar.innerHTML = '<div class="mnt-fixed-top"><span class="mnt-fixed-lbl">24H FIXED DIRECTION</span><strong class="mnt-fixed-side" id="mnt-fixed-side">SCANNING</strong><span class="mnt-fixed-pcts" id="mnt-fixed-pcts">BUY --% · SELL --%</span></div><div class="mnt-fixed-track"><i id="mnt-fixed-fill" style="width:50%"></i></div>';
+      var head = term.querySelector('.mnt-head');
+      if (head && head.nextSibling) term.insertBefore(bar, head.nextSibling);
+      else term.insertBefore(bar, term.firstChild);
+    }
+    var sig = side + '|' + buyPct + '|' + sellPct + '|' + buyCount + '|' + sellCount;
+    if (bar && sig !== lastFixedRenderSig) {
+      lastFixedRenderSig = sig;
+      bar.className = 'mnt-fixed-bar ' + side.toLowerCase();
+      var sideEl = $('mnt-fixed-side');
+      var pctsEl = $('mnt-fixed-pcts');
+      var fillEl = $('mnt-fixed-fill');
+      if (sideEl) sideEl.textContent = (side === 'BUY' ? '▲ BUY · ' : '▼ SELL · ') + winPct + '%';
+      if (pctsEl) pctsEl.textContent = 'BUY ' + buyPct + '% (' + buyCount + ') · SELL ' + sellPct + '% (' + sellCount + ')';
+      if (fillEl) fillEl.style.width = buyPct + '%';
+      if (aiRobotOpen) renderAiRobotPopContent();
+    }
+  }
+
   var aiWorldState = {
     dir: 'WAIT', pct: 0, headlineCount: 0, next24Count: 0, webCount: 0,
     panelBuyCount: 0, panelSellCount: 0, panelDir: 'WAIT',
     webDir: 'WAIT', webState: 'SCANNING', webSources: [],
-    dxyText: '', msg: 'Reading NEXT 24H news & checking global feeds...', items: [], market: 'MARKET'
+    dxyText: '', us10yText: '', pillars: [], releaseBadge: null,
+    msg: 'Reading NEXT 24H news & checking global feeds...', items: [], market: 'MARKET'
   };
   var aiRobotOpen = false, aiRobotPinned = false, aiCloseTimer = null;
   var aiInternetCache = Object.create(null);
@@ -765,71 +894,113 @@ export function loadModule(): void {
     var pool = [];
     var seen = Object.create(null);
     var seenTitle = Object.create(null);
-    var runningTimed = (Array.isArray(running) ? running : []).filter(function (e) { return e && e.kind !== 'headline' && phaseFor(e, now) === 'running'; });
+    var keptTitleTokens = [];
+    function normTokens(str) {
+      return String(str || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(function (w) { return w.length >= 4; });
+    }
+    function isDupTitle(raw) {
+      var tk = String(raw || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      if (!tk || seenTitle[tk]) return true;
+      var toks = normTokens(tk);
+      for (var ti = 0; ti < keptTitleTokens.length; ti++) {
+        var prev = keptTitleTokens[ti];
+        if (!toks.length || !prev.length) continue;
+        var hits = 0;
+        for (var k = 0; k < toks.length; k++) if (prev.indexOf(toks[k]) >= 0) hits++;
+        if (hits / Math.max(1, Math.min(toks.length, prev.length)) >= 0.65) return true;
+      }
+      seenTitle[tk] = true;
+      keptTitleTokens.push(toks);
+      return false;
+    }
+
+    var runningTimed = (Array.isArray(running) ? running : [])
+      .filter(function (e) { return e && e.kind !== 'headline' && phaseFor(e, now) === 'running'; })
+      .sort(function (a, b) { return (Number(b.ts) || 0) - (Number(a.ts) || 0); });
     var next24Raw = (Array.isArray(running) ? running : [])
       .concat(Array.isArray(upcoming) ? upcoming : [])
       .concat(Array.isArray(headlines) ? headlines : []);
 
-    var panelBuyScore = 0, panelSellScore = 0, panelBuyCount = 0, panelSellCount = 0, next24Count = 0;
-    var freshPanelBuy = 0, freshPanelSell = 0;
+    var calBuyScore = 0, calSellScore = 0, panelBuyCount = 0, panelSellCount = 0, next24Count = 0;
+    var freshCalBuy = 0, freshCalSell = 0;
+    var hasActiveActual = false, activeActualSide = 'WAIT', activeActualTitle = '', activeStopHunt = false;
 
     function recencyFactor(ev) {
       var ts = Number(ev.ts) || now;
       var age = now - ts;
-      if (ev.kind !== 'headline' && phaseFor(ev, now) === 'running') return 2.0;
-      if (age < 0) return Math.abs(age) <= 3 * 3600 ? 1.4 : 0.9;
+      if (ev.kind !== 'headline' && phaseFor(ev, now) === 'running') {
+        var hasAct = ev.actual != null && String(ev.actual).trim() !== '';
+        return hasAct ? 3.2 : 2.1;
+      }
+      if (age < 0) {
+        var ahead = Math.abs(age);
+        if (ahead <= 1800) return 1.85;
+        if (ahead <= 7200) return 1.15;
+        if (ahead <= 18000) return 0.65;
+        return 0.28; // distant events tomorrow shouldn't drown out live catalysts
+      }
       if (age <= 2700) return 2.0;
-      if (age <= 7200) return 1.35;
-      if (age <= 21600) return 0.65;
-      return 0.25;
+      if (age <= 7200) return 1.3;
+      if (age <= 21600) return 0.55;
+      return 0.2;
     }
 
     function pushPanelItem(ev, fromNext24) {
       if (!ev) return;
       var k = eventKey(ev);
       var rawTitle = String(ev.title || ev.event || 'Market news');
-      var tk = rawTitle.trim().toLowerCase().replace(/\s+/g, ' ');
-      if (!tk || isMacroNoiseHeadline(rawTitle) || seen[k] || seenTitle[tk]) return;
+      if (isMacroNoiseHeadline(rawTitle) || seen[k] || isDupTitle(rawTitle)) return;
       seen[k] = true;
-      seenTitle[tk] = true;
 
-      // Read exact adjacent direction shown next to the news row in NEWS · NEXT 24H
       var pred = directionalEstimate(ev, now);
       var hasPanelDir = !!(pred && (pred.side === 'BUY' || pred.side === 'SELL'));
+      var isWaitOrGuard = !!(pred && pred.side === 'WAIT');
+      if (pred && pred.basis === 'STOP-HUNT GUARD' && ev.kind !== 'headline' && phaseFor(ev, now) === 'running') {
+        activeStopHunt = true;
+      }
+      var predBasis = String((pred && pred.basis) || '');
+      var isTrueActualSurprise = !!(pred && pred.hasActual && hasPanelDir && /RELEASE|ACTUAL/.test(predBasis));
+      if (isTrueActualSurprise && phaseFor(ev, now) === 'running' && (String(ev.impact || '') === 'high' || String(ev.impact || '') === 'medium')) {
+        hasActiveActual = true;
+        activeActualSide = pred.side;
+        activeActualTitle = rawTitle;
+      }
       var inferred = hasPanelDir
-        ? { side: pred.side, strength: Math.max(25, Number(pred.strength) || 64) }
-        : (pred && pred.side === 'WAIT' ? { side: 'WAIT', strength: 0 } : inferWorldMacroSide(ev, symbol));
+        ? { side: pred.side, strength: Math.max(30, Number(pred.strength) || 64) }
+        : (isWaitOrGuard ? { side: 'WAIT', strength: 0 } : inferWorldMacroSide(ev, symbol));
 
       var imp = String(ev.impact || 'low').toLowerCase();
-      var impW = imp === 'high' ? 1.5 : imp === 'medium' ? 1.2 : 0.9;
-      var kindW = ev.kind === 'headline' ? 1.1 : 1.35;
+      var impW = imp === 'high' ? 1.75 : imp === 'medium' ? 1.25 : 0.65;
+      var kindW = ev.kind === 'headline' ? 1.05 : 1.35;
       var timeW = recencyFactor(ev);
-      var strW = inferred.strength > 0 ? inferred.strength / 100 : 0.35;
-      var weight = impW * kindW * timeW * strW;
+      var strW = inferred.strength > 0 ? inferred.strength / 100 : 0.25;
+      var actBoost = pred && pred.hasActual ? 1.45 : 1.0;
+      var weight = impW * kindW * timeW * strW * actBoost;
       var srcNames = (ev.sources || [ev.source || 'calendar']).map(function (srcKey) { return SOURCE_NAMES[srcKey] || srcKey; }).filter(Boolean).join(' + ');
 
       if (fromNext24) {
         next24Count++;
-        var isVeryRecent = (now - (Number(ev.ts) || now)) <= 10800;
+        var isVeryRecent = Math.abs(now - (Number(ev.ts) || now)) <= 10800;
         if (inferred.side === 'BUY') {
-          panelBuyScore += weight; panelBuyCount++;
-          if (isVeryRecent) freshPanelBuy += weight;
+          calBuyScore += weight; panelBuyCount++;
+          if (isVeryRecent) freshCalBuy += weight;
         } else if (inferred.side === 'SELL') {
-          panelSellScore += weight; panelSellCount++;
-          if (isVeryRecent) freshPanelSell += weight;
+          calSellScore += weight; panelSellCount++;
+          if (isVeryRecent) freshCalSell += weight;
         }
       }
 
       pool.push({
         key: k,
-        tagKind: '24H',
-        title: rawTitle,
+        tagKind: pred && pred.hasActual ? 'LIVE' : '24H',
+        title: rawTitle + (pred && pred.hasActual && ev.actual != null ? ' [ACT ' + ev.actual + ']' : ''),
         src: srcNames || 'NEXT 24H',
         when: ageLabel(ev.ts, now),
         ts: Number(ev.ts) || 0,
         kind: ev.kind || 'event',
         impact: imp,
         hasPanelDir: hasPanelDir,
+        hasActual: !!(pred && pred.hasActual),
         side: inferred.side,
         strength: inferred.strength,
         weight: weight
@@ -838,7 +1009,6 @@ export function loadModule(): void {
 
     for (var i = 0; i < next24Raw.length; i++) pushPanelItem(next24Raw[i], true);
 
-    // Also inspect wider loaded items if NEXT 24H had few items
     var extra = (Array.isArray(news) ? news : []).slice().sort(function (a, b) {
       return (Number(b && b.ts) || 0) - (Number(a && a.ts) || 0);
     });
@@ -846,13 +1016,13 @@ export function loadModule(): void {
       if (relevanceFor(extra[j])) pushPanelItem(extra[j], true);
     }
 
-    // Fuse Full-Internet Research from /api/softradex-ai/research + live M5/OrderFlow checks
+    // Pillar 2: Deduplicated Live Internet Research (Google / Bing / Yahoo / Live Wire)
     var symKey = String(symbol || 'XAUUSDm').trim();
     var netEntry = aiInternetCache[symKey];
     var netData = netEntry && netEntry.data ? netEntry.data : null;
     var webBuyScore = 0, webSellScore = 0, freshWebBuy = 0, freshWebSell = 0, webBuyHits = 0, webSellHits = 0, webCount = 0;
     var webItems = [];
-    var dxyText = '';
+    var dxyText = '', us10yText = '';
     var mac = (netData && netData.macro) || {};
 
     if (netData && Array.isArray(netData.internet_articles)) {
@@ -860,7 +1030,7 @@ export function loadModule(): void {
         var art = netData.internet_articles[w];
         if (!art || !art.title) continue;
         var wTitle = String(art.title).trim();
-        if (isMacroNoiseHeadline(wTitle)) continue;
+        if (isMacroNoiseHeadline(wTitle) || isDupTitle(wTitle)) continue;
         var wtk = wTitle.toLowerCase().replace(/\s+/g, ' ');
         var wSide = (art.side === 'BUY' || art.side === 'SELL') ? art.side : inferWorldMacroSide({ title: wTitle }, symbol).side;
         var wStr = Number(art.strength) || (wSide === 'WAIT' ? 0 : 62);
@@ -875,39 +1045,60 @@ export function loadModule(): void {
           webSellScore += wWt; webSellHits++;
           if (artFresh) freshWebSell += wWt;
         }
-        if (wtk && !seenTitle[wtk]) {
-          seenTitle[wtk] = true;
-          webCount++;
-          webItems.push({
-            key: 'web|' + wtk,
-            tagKind: 'WEB',
-            title: wTitle,
-            src: String(art.source || art.engine || 'INTERNET'),
-            when: ageLabel(artTs, now),
-            ts: artTs,
-            kind: 'web',
-            impact: 'high',
-            side: wSide,
-            strength: wStr,
-            weight: wWt
-          });
-        }
-      }
-      if (mac.dxy_impact_for_symbol === 'BUY' || mac.dxy_impact_for_symbol === 'SELL') {
-        var dxyMove = Number(mac.dxy_60m_pct != null && mac.sym_atr_impulse != null ? mac.dxy_60m_pct : (mac.dxy_change_pct || 0));
-        dxyText = 'DXY ' + (dxyMove >= 0 ? '+' : '') + dxyMove.toFixed(2) + '% -> ' + mac.dxy_impact_for_symbol;
-        var dxyW = Math.min(1.5, Math.max(0.9, 0.8 + Math.abs(dxyMove) * 2.5));
-        if (mac.dxy_impact_for_symbol === 'BUY') webBuyScore += dxyW;
-        else webSellScore += dxyW;
+        webCount++;
+        webItems.push({
+          key: 'web|' + wtk,
+          tagKind: 'WEB',
+          title: wTitle,
+          src: String(art.source || art.engine || 'INTERNET'),
+          when: ageLabel(artTs, now),
+          ts: artTs,
+          kind: 'web',
+          impact: 'high',
+          side: wSide,
+          strength: wStr,
+          weight: wWt
+        });
       }
     }
 
-    // Check real-time client M5 post-news reaction (anchored at running release ts, or last 15m for live headlines)
+    // Check server release alert too
+    var srvRel = netData && netData.release_alert;
+    if (!hasActiveActual && srvRel && srvRel.hasActual && (srvRel.side === 'BUY' || srvRel.side === 'SELL') && !srvRel.conflict) {
+      hasActiveActual = true;
+      activeActualSide = srvRel.side;
+      activeActualTitle = srvRel.title || 'Economic Release';
+    }
+    if (srvRel && srvRel.conflict) activeStopHunt = true;
+
+    // Pillar 3: Macro Intermarket (DXY + US10Y Treasury Yield)
+    var macroBuyScore = 0, macroSellScore = 0;
+    if (mac.dxy_impact_for_symbol === 'BUY' || mac.dxy_impact_for_symbol === 'SELL') {
+      var dxyMove = Number(mac.dxy_60m_pct != null && mac.sym_atr_impulse != null ? mac.dxy_60m_pct : (mac.dxy_change_pct || 0));
+      dxyText = 'DXY ' + (dxyMove >= 0 ? '+' : '') + dxyMove.toFixed(2) + '% -> ' + mac.dxy_impact_for_symbol;
+      var dxyW = Math.min(1.85, Math.max(0.9, 0.85 + Math.abs(dxyMove) * 2.8));
+      if (mac.dxy_impact_for_symbol === 'BUY') macroBuyScore += dxyW;
+      else macroSellScore += dxyW;
+    }
+    if (mac.us10y_price && Math.abs(Number(mac.us10y_change_pct || 0)) >= 0.35) {
+      var yPct = Number(mac.us10y_change_pct);
+      us10yText = 'US10Y ' + (yPct >= 0 ? '+' : '') + yPct.toFixed(2) + '%';
+      var srvMacro = netData && netData.factors && netData.factors.macro;
+      if (srvMacro && (srvMacro.us10y_side === 'BUY' || srvMacro.us10y_side === 'SELL')) {
+        if (srvMacro.us10y_side === 'BUY') macroBuyScore += 0.85;
+        else macroSellScore += 0.85;
+      }
+    }
+
+    // Pillar 4: Real-time M5 Price Reaction + Order Flow + SwingAI Structure (no raw flip during 0-120s sweep!)
+    var flowBuyScore = 0, flowSellScore = 0;
     var m5Bars = getLiveM5Bars();
     var qLive = liveQuote();
     var swState = window.SwingAI && typeof window.SwingAI.state === 'function' ? window.SwingAI.state() : null;
     var m5Atr = swState && swState.reads && swState.reads.M5 ? Number(swState.reads.M5.atr) || 0 : 0;
     var hasRunningRelease = runningTimed.length > 0;
+    var runningElapsed = hasRunningRelease ? Math.max(0, now - Number(runningTimed[0].ts || now)) : 9999;
+    var openingSweepGuard = hasRunningRelease && !hasActiveActual && runningElapsed < 120;
     var baselineTs = hasRunningRelease ? Number(runningTimed[0].ts) : (now - 900);
     var clientRx = m5Bars.length ? computePostEventReaction(m5Bars, baselineTs, now, qLive ? Number(qLive.price) : undefined, m5Atr) : null;
     var liveRxAtr = clientRx && clientRx.ready
@@ -916,90 +1107,149 @@ export function loadModule(): void {
     var hasLiveRx = (clientRx && clientRx.ready) || (mac.sym_atr_impulse != null);
 
     if (hasLiveRx && Math.abs(liveRxAtr) >= 0.45) {
-      var rxW = Math.min(2.8, Math.abs(liveRxAtr) * 1.15);
-      if (liveRxAtr > 0) webBuyScore += rxW;
-      else webSellScore += rxW;
+      // Dampen weight during unconfirmed 0-120s opening spike so stop-hunts don't whipsaw AI verdict
+      var rxMult = openingSweepGuard ? 0.35 : 1.15;
+      var rxW = Math.min(2.6, Math.abs(liveRxAtr) * rxMult);
+      if (liveRxAtr > 0) flowBuyScore += rxW;
+      else flowSellScore += rxW;
       if (!dxyText) {
         dxyText = 'M5 LIVE ' + (liveRxAtr >= 0 ? '+' : '') + liveRxAtr.toFixed(2) + ' ATR -> ' + (liveRxAtr > 0 ? 'BUY' : 'SELL');
       } else {
         dxyText += ' | M5 ' + (liveRxAtr >= 0 ? '+' : '') + liveRxAtr.toFixed(2) + ' ATR';
       }
-    } else if (!hasLiveRx && (webBuyHits + webSellHits > 0)) {
-      if (Number(mac.tv_buyer_pct) >= 56) webBuyScore += 0.65;
-      else if (Number(mac.tv_buyer_pct) > 0 && Number(mac.tv_buyer_pct) <= 44) webSellScore += 0.65;
+    }
+    if (swState && swState.fresh && swState.reads && swState.reads.M5 && swState.reads.M15) {
+      var m5s = Number(swState.reads.M5.score || 0);
+      var m15s = Number(swState.reads.M15.score || 0);
+      var stNet = (m5s + m15s) * 0.28;
+      if (stNet >= 0.35) flowBuyScore += Math.min(0.95, stNet);
+      else if (stNet <= -0.35) flowSellScore += Math.min(0.95, Math.abs(stNet));
     }
 
-    // Real multi-exchange order flow confirmation when meaningful prints are flowing
     var flowApi = window.MultiExchangeOrderFlow;
     var flowTotals = flowApi && typeof flowApi.getOpenTotals === 'function' ? flowApi.getOpenTotals() : null;
     if (flowTotals && (Number(flowTotals.buy || 0) + Number(flowTotals.sell || 0)) > 0) {
       var fTotal = Number(flowTotals.buy) + Number(flowTotals.sell);
       var fBuyPct = (Number(flowTotals.buy) / fTotal) * 100;
-      if (fBuyPct >= 58) webBuyScore += 0.65;
-      else if (fBuyPct <= 42) webSellScore += 0.65;
+      if (fBuyPct >= 58) flowBuyScore += 0.65;
+      else if (fBuyPct <= 42) flowSellScore += 0.65;
     }
 
-    var panelTotal = panelBuyScore + panelSellScore;
-    var panelDir = panelTotal <= 0 ? 'WAIT' : panelBuyScore >= panelSellScore ? 'BUY' : 'SELL';
-    var webTotal = webBuyScore + webSellScore;
-    var webDir = webTotal <= 0 ? 'WAIT' : webBuyScore >= webSellScore ? 'BUY' : 'SELL';
+    var calSide = calBuyScore - calSellScore > 0.45 ? 'BUY' : calSellScore - calBuyScore > 0.45 ? 'SELL' : 'WAIT';
+    var webSide = webBuyScore - webSellScore > 0.35 ? 'BUY' : webSellScore - webBuyScore > 0.35 ? 'SELL' : 'WAIT';
+    var macroSide = macroBuyScore - macroSellScore > 0.35 ? 'BUY' : macroSellScore - macroBuyScore > 0.35 ? 'SELL' : 'WAIT';
+    var flowSide = flowBuyScore - flowSellScore > 0.45 ? 'BUY' : flowSellScore - flowBuyScore > 0.45 ? 'SELL' : 'WAIT';
+    var pillars = [
+      { label: '24H DATA', side: calSide },
+      { label: 'WEB WIRE', side: webSide },
+      { label: 'DXY/YIELD', side: macroSide },
+      { label: 'M5/FLOW', side: flowSide }
+    ];
 
-    var totalBuy = panelBuyScore + webBuyScore;
-    var totalSell = panelSellScore + webSellScore;
+    var totalBuy = calBuyScore + webBuyScore + macroBuyScore + flowBuyScore;
+    var totalSell = calSellScore + webSellScore + macroSellScore + flowSellScore;
+    // Live verified actual release carries strong priority over stale pre-release web articles
+    if (hasActiveActual && (activeActualSide === 'BUY' || activeActualSide === 'SELL')) {
+      if (activeActualSide === 'BUY') totalBuy += 3.0;
+      else totalSell += 3.0;
+    }
     var combinedTotal = totalBuy + totalSell;
 
     var dir = 'WAIT', pct = 0, conflictWarn = false;
-    var rxThresh = hasRunningRelease ? 0.65 : 1.35;
-    var hasStrongLiveUp = hasLiveRx && liveRxAtr >= rxThresh;
-    var hasStrongLiveDown = hasLiveRx && liveRxAtr <= -rxThresh;
+    var rxThresh = hasRunningRelease ? 0.72 : 1.35;
+    var hasStrongLiveUp = !openingSweepGuard && hasLiveRx && liveRxAtr >= rxThresh;
+    var hasStrongLiveDown = !openingSweepGuard && hasLiveRx && liveRxAtr <= -rxThresh;
 
-    if (combinedTotal > 0) {
+    if (activeStopHunt && !hasActiveActual) {
+      conflictWarn = true;
+      dir = 'WAIT';
+      pct = 34;
+    } else if (openingSweepGuard && Math.abs(liveRxAtr) >= 0.45 && calSide !== 'WAIT' && ((calSide === 'BUY' && liveRxAtr < 0) || (calSide === 'SELL' && liveRxAtr > 0))) {
+      // Unreleased 0-2m opening wick fighting pre-event consensus -> NEVER flip, hold WAIT cleanly!
+      conflictWarn = true;
+      dir = 'WAIT';
+      pct = 36;
+    } else if (combinedTotal > 0) {
       var rawDir = totalBuy >= totalSell ? 'BUY' : 'SELL';
       var liveOppose = (rawDir === 'SELL' && hasStrongLiveUp) || (rawDir === 'BUY' && hasStrongLiveDown);
-      if (liveOppose) {
-        var oppLiveSide = liveRxAtr > 0 ? 'BUY' : 'SELL';
-        var freshOppText = oppLiveSide === 'BUY' ? (freshPanelSell + freshWebSell) : (freshPanelBuy + freshWebBuy);
-        if (freshOppText < 2.2 && Math.abs(liveRxAtr) >= 0.85) {
-          dir = oppLiveSide;
-          pct = Math.min(72, Math.max(55, Math.round(52 + Math.abs(liveRxAtr) * 8)));
-        } else {
+      var edgeRatio = Math.abs(totalBuy - totalSell) / combinedTotal;
+
+      if (hasActiveActual && activeActualSide !== 'WAIT') {
+        var actualOppose = (activeActualSide === 'SELL' && hasStrongLiveUp) || (activeActualSide === 'BUY' && hasStrongLiveDown);
+        if (actualOppose && Math.abs(liveRxAtr) >= 1.15) {
           conflictWarn = true;
           dir = 'WAIT';
           pct = 42;
+        } else {
+          dir = activeActualSide;
+          var alignAgree = (calSide === dir ? 1 : 0) + (webSide === dir ? 1 : 0) + (macroSide === dir ? 1 : 0) + (flowSide === dir ? 1 : 0);
+          pct = Math.min(95, 50 + alignAgree * 11);
         }
-      } else if (mac.conflict && ((panelBuyCount + panelSellCount === 0) || webDir === 'WAIT')) {
+      } else if (liveOppose) {
+        var oppLiveSide = liveRxAtr > 0 ? 'BUY' : 'SELL';
+        var freshOppText = oppLiveSide === 'BUY' ? (freshCalSell + freshWebSell) : (freshCalBuy + freshWebBuy);
+        if (freshOppText < 2.2 && runningElapsed >= 150 && Math.abs(liveRxAtr) >= 0.9 && macroSide !== (oppLiveSide === 'BUY' ? 'SELL' : 'BUY')) {
+          dir = oppLiveSide;
+          pct = Math.min(72, Math.max(56, Math.round(54 + Math.abs(liveRxAtr) * 8)));
+        } else {
+          conflictWarn = true;
+          dir = 'WAIT';
+          pct = 40;
+        }
+      } else if (mac.conflict && ((panelBuyCount + panelSellCount === 0) || webSide === 'WAIT')) {
         conflictWarn = true;
         dir = 'WAIT';
-        pct = 40;
-      } else if (Math.abs(totalBuy - totalSell) / combinedTotal >= 0.04) {
+        pct = 38;
+      } else if (edgeRatio >= 0.14) {
         dir = totalBuy > totalSell ? 'BUY' : 'SELL';
-        pct = Math.max(54, Math.min(96, Math.round((Math.max(totalBuy, totalSell) / combinedTotal) * 100)));
-      } else if (mac.dxy_impact_for_symbol === 'BUY' || mac.dxy_impact_for_symbol === 'SELL') {
-        dir = mac.dxy_impact_for_symbol;
-        pct = 54;
+        var agreeCount = (calSide === dir ? 1 : 0) + (webSide === dir ? 1 : 0) + (macroSide === dir ? 1 : 0) + (flowSide === dir ? 1 : 0);
+        pct = Math.max(55, Math.min(95, Math.round(50 + edgeRatio * 28 + agreeCount * 4)));
       } else {
         dir = 'WAIT';
-        pct = 45;
+        pct = 44;
       }
     }
 
-    var webState = '24H LOCAL';
-    if (conflictWarn) webState = 'CONFLICT · WAIT';
+    var webState = '4-FACTOR AI';
+    if (openingSweepGuard && conflictWarn) webState = 'SWEEP GUARD';
+    else if (conflictWarn) webState = 'CONFLICT · WAIT';
+    else if (hasActiveActual) webState = 'ACTUAL + AI -> ' + dir;
     else if (netEntry && netEntry.busy && !netData) webState = 'CHECKING WEB...';
     else if (netData && Array.isArray(netData.sources_checked) && netData.sources_checked.length > 1) {
-      if (webDir === 'WAIT') webState = 'WEB SCANNED';
-      else if (hasStrongLiveUp && dir === 'BUY' && panelDir === 'SELL') webState = 'PRICE + WEB -> BUY';
-      else if (hasStrongLiveDown && dir === 'SELL' && panelDir === 'BUY') webState = 'PRICE + WEB -> SELL';
-      else if (panelDir !== 'WAIT' && panelDir === webDir) webState = 'WEB CONFIRMED ' + dir;
-      else if (panelDir !== 'WAIT' && panelDir !== dir) webState = 'WEB REVISED -> ' + dir;
+      if (webSide === 'WAIT' && dir === 'WAIT') webState = 'WEB SCANNED';
+      else if (calSide !== 'WAIT' && calSide === webSide && macroSide === dir) webState = '3-PILLAR ALIGNED';
+      else if (calSide !== 'WAIT' && calSide === webSide) webState = 'WEB CONFIRMED ' + dir;
+      else if (calSide !== 'WAIT' && calSide !== dir) webState = 'MACRO REVISED -> ' + dir;
       else webState = 'WEB DATA -> ' + dir;
     }
 
-    // Build top visible list combining NEXT 24H rows (sorted by recency/impact) + live Web check headlines
+    var releaseBadge = null;
+    if (openingSweepGuard) {
+      releaseBadge = {
+        cls: 'wait',
+        tag: 'SWEEP GUARD (0-2M)',
+        text: (runningTimed[0].title || 'Release') + ' started ' + Math.round(runningElapsed) + 's ago — waiting for actual/M5 body'
+      };
+    } else if (hasActiveActual) {
+      releaseBadge = {
+        cls: activeActualSide === 'BUY' ? 'buy' : 'sell',
+        tag: 'LIVE ACTUAL PRINT',
+        text: activeActualTitle + ' -> favors ' + activeActualSide
+      };
+    } else if (runningTimed.length) {
+      releaseBadge = {
+        cls: dir === 'BUY' ? 'buy' : dir === 'SELL' ? 'sell' : 'wait',
+        tag: 'ACTIVE RELEASE',
+        text: (runningTimed[0].title || 'Event') + ' running (' + Math.round(runningElapsed / 60) + 'm)'
+      };
+    }
+
     pool.sort(function (a, b) {
+      var ac = a.hasActual ? 1 : 0;
+      var bc = b.hasActual ? 1 : 0;
       var ai = a.impact === 'high' ? 2 : a.impact === 'medium' ? 1 : 0;
       var bi = b.impact === 'high' ? 2 : b.impact === 'medium' ? 1 : 0;
-      return b.weight - a.weight || (bi - ai) || b.ts - a.ts;
+      return (bc - ac) || (b.weight - a.weight) || (bi - ai) || (b.ts - a.ts);
     });
     var displayItems = [];
     var pIdx = 0, wIdx = 0;
@@ -1012,15 +1262,17 @@ export function loadModule(): void {
     var topCue = displayItems[0] ? displayItems[0].title : '';
     var srcList = (netData && Array.isArray(netData.sources_checked) ? netData.sources_checked : ['NEWS · NEXT 24H']).slice(0, 4).join(', ');
     var msg = '';
-    if (conflictWarn) {
-      msg = 'WAIT (Price/News Conflict) - Headlines leaned ' + (totalBuy >= totalSell ? 'BUY' : 'SELL') + ' while live M5 price moved ' +
-        (liveRxAtr > 0 ? 'UP +' : 'DOWN ') + liveRxAtr.toFixed(2) + ' ATR. Do NOT counter-trade until price & news align.';
+    if (openingSweepGuard && dir === 'WAIT') {
+      msg = 'HOLD WAIT (Opening 0-2m Sweep Guard) - News just started without actual print; blocking opening wick whipsaws until M5 confirms.';
+    } else if (conflictWarn) {
+      msg = 'WAIT (Pillar Conflict) - Fundamentals leaned ' + (totalBuy >= totalSell ? 'BUY' : 'SELL') + ' while live M5 price moved ' +
+        (liveRxAtr > 0 ? 'UP +' : 'DOWN ') + liveRxAtr.toFixed(2) + ' ATR. Wait for candle close alignment.';
     } else if (dir === 'WAIT') {
-      msg = 'No clear directional consensus yet for ' + mktLabel + ' - waiting for confirmed news or live M5 breakout.';
+      msg = 'MIXED / LOW CONVICTION for ' + mktLabel + ' - Pillars not aligned strongly enough; wait for clean macro catalyst or M5 breakout.';
     } else {
-      var actionVerb = webState.indexOf('CONFIRMED') >= 0 ? 'Confirmed' : webState.indexOf('PRICE') >= 0 ? 'Live price + web confirmed' : webState.indexOf('REVISED') >= 0 ? 'Revised via internet check' : 'Aligned';
-      msg = 'TAKE ' + dir + ' (' + actionVerb + ') - Read ' + next24Count + ' NEXT 24H items (' + panelBuyCount + ' BUY / ' + panelSellCount + ' SELL)' +
-        (netData ? ' + checked ' + (netData.internet_articles ? netData.internet_articles.length : 0) + ' web news (' + srcList + ')' : '') +
+      var alignCount = pillars.filter(function (p) { return p.side === dir; }).length;
+      msg = 'TAKE ' + dir + ' (' + alignCount + '/4 pillars aligned) - ' + (hasActiveActual ? 'Verified ACTUAL print + ' : '') +
+        next24Count + ' 24H items' + (netData ? ' + ' + (netData.internet_articles ? netData.internet_articles.length : 0) + ' web (' + srcList + ')' : '') +
         (dxyText ? ' | ' + dxyText : '') + (topCue ? '. Top: ' + topCue : '');
     }
 
@@ -1032,13 +1284,16 @@ export function loadModule(): void {
       webCount: netData && Array.isArray(netData.internet_articles) ? netData.internet_articles.length : webCount,
       panelBuyCount: panelBuyCount,
       panelSellCount: panelSellCount,
-      panelDir: panelDir,
-      webDir: webDir,
+      panelDir: calSide,
+      webDir: webSide,
       webBuyHits: webBuyHits,
       webSellHits: webSellHits,
       webState: webState,
       webSources: netData && Array.isArray(netData.sources_checked) ? netData.sources_checked : ['NEWS · NEXT 24H'],
       dxyText: dxyText,
+      us10yText: us10yText,
+      pillars: pillars,
+      releaseBadge: releaseBadge,
       msg: msg,
       market: mktLabel,
       items: displayItems
@@ -1085,11 +1340,24 @@ export function loadModule(): void {
     var sideCls = st.dir === 'BUY' ? 'buy' : st.dir === 'SELL' ? 'sell' : 'wait';
     var callText = st.dir === 'BUY' ? 'TAKE BUY &uarr;' : st.dir === 'SELL' ? 'TAKE SELL &darr;' : 'WAIT / MIXED &loz;';
     var netTagCls = st.webDir === 'BUY' ? 'buy' : st.webDir === 'SELL' ? 'sell' : sideCls;
+    var factorsHtml = '';
+    if (Array.isArray(st.pillars) && st.pillars.length) {
+      factorsHtml = '<div class="arp-pillars">' + st.pillars.map(function (p) {
+        var pc = p.side === 'BUY' ? 'buy' : p.side === 'SELL' ? 'sell' : 'wait';
+        var pSide = p.side === 'BUY' ? 'BUY &uarr;' : p.side === 'SELL' ? 'SELL &darr;' : 'NEUT';
+        return '<div class="arp-pillar ' + pc + '"><span>' + esc(p.label) + '</span><b>' + pSide + '</b></div>';
+      }).join('') + '</div>';
+    }
+    var alertHtml = st.releaseBadge
+      ? '<div class="arp-release-alert ' + (st.releaseBadge.cls || 'wait') + '">' +
+          '<b>' + esc(st.releaseBadge.tag) + '</b><span>' + esc(st.releaseBadge.text) + '</span>' +
+        '</div>'
+      : '';
     var itemsHtml = st.items.length
       ? st.items.map(function (it) {
           var cls = it.side === 'BUY' ? 'buy' : it.side === 'SELL' ? 'sell' : 'wait';
           var pill = it.side === 'BUY' ? 'BUY &uarr;' : it.side === 'SELL' ? 'SELL &darr;' : 'NEWS';
-          var kindCls = it.tagKind === 'WEB' ? 'web' : 'local';
+          var kindCls = it.tagKind === 'WEB' ? 'web' : (it.tagKind === 'LIVE' ? 'live' : 'local');
           return '<div class="arp-item ' + cls + '">' +
             '<div class="arp-item-top">' +
             '<span class="arp-badge-kind ' + kindCls + '">' + esc(it.tagKind) + '</span>' +
@@ -1107,10 +1375,13 @@ export function loadModule(): void {
         '<em>' + st.next24Count + ' 24H &middot; ' + st.webCount + ' WEB</em>' +
       '</div>' +
       '<div class="arp-net-bar">' +
-        '<span>24H PANEL: <b>' + st.panelBuyCount + ' BUY / ' + st.panelSellCount + ' SELL</b></span>' +
+        '<span>24H FIXED: <b>' + esc(fixed24hState.side) + ' ' + fixed24hState.winPct + '%</b> (B ' + fixed24hState.buyPct + '% / S ' + fixed24hState.sellPct + '%)</span>' +
         (st.dxyText ? '<span>' + esc(st.dxyText) + '</span>' : '') +
+        (st.us10yText ? '<span>' + esc(st.us10yText) + '</span>' : '') +
         '<em class="arp-net-tag ' + netTagCls + '">' + esc(st.webState) + '</em>' +
       '</div>' +
+      factorsHtml +
+      alertHtml +
       '<div class="arp-list">' + itemsHtml + '</div>' +
       '<div class="arp-verdict ' + sideCls + '">' +
         '<div class="arp-v-row">' +
@@ -1364,10 +1635,12 @@ export function loadModule(): void {
         scanState = st.scan && st.scan.state === 'scanning' ? 'scanning' : 'idle';
         newsFailures = 0;
         if (st.news_sig) newsServerSig = String(st.news_sig);
+        if (Array.isArray(st.dxy_bars_m5) && st.dxy_bars_m5.length) dxyBarsM5 = st.dxy_bars_m5;
         if (st.news_omitted) {
           applyExnessBrowser();
           renderSources(visibleEvents(Date.now() / 1000));
           fetchExnessBrowser();
+          renderNews();
           return;
         }
         applyExnessBrowser();
@@ -1453,7 +1726,7 @@ export function loadModule(): void {
     window.addEventListener('chart:market', function(e) {
       var d = e.detail || {}, next = String(d.symbol || (d.meta && d.meta.symbol) || symbol);
       var changed = next !== symbol;
-      if (changed) { newsSnapshotReady = false; eventReferences = Object.create(null); dirEstCache = Object.create(null); lastListRenderSig = Object.create(null); news = []; sourceStatus=[]; lastNewsHtml=Object.create(null); lastSourcesHtml=''; lastSourceSummary=''; newsServerSig=''; lastSavedSig=''; newsMergeGen++; cachedHeadlinesKey=''; workerEstimates=Object.create(null); workerBatchGen++; lastWorkerKey=''; lastQuoteNewsAt=0; lastQuoteNewsPrice=NaN; clearTimeout(quoteNewsTimer); quoteNewsTimer=null; if (newsAbort) newsAbort.abort(); clearTimeout(newsRetryTimer); newsRequest++; newsBusy = false; newsFailures=0; scanState='scanning'; }
+      if (changed) { newsSnapshotReady = false; eventReferences = Object.create(null); dirEstCache = Object.create(null); lastListRenderSig = Object.create(null); lastFixedRenderSig = ''; news = []; sourceStatus=[]; lastNewsHtml=Object.create(null); lastSourcesHtml=''; lastSourceSummary=''; newsServerSig=''; lastSavedSig=''; newsMergeGen++; cachedHeadlinesKey=''; workerEstimates=Object.create(null); workerBatchGen++; lastWorkerKey=''; lastQuoteNewsAt=0; lastQuoteNewsPrice=NaN; clearTimeout(quoteNewsTimer); quoteNewsTimer=null; if (newsAbort) newsAbort.abort(); clearTimeout(newsRetryTimer); newsRequest++; newsBusy = false; newsFailures=0; scanState='scanning'; }
       symbol = next; if (changed) restoreNews(); renderNews(); renderPressure(); fetchNews(true);
     });
     window.addEventListener('chart:tv-quote', function(e) {
@@ -1480,7 +1753,25 @@ export function loadModule(): void {
       var d = (e && e.detail) || {};
       if (!d.symbol || marketMatch(d.symbol, symbol)) renderPressure();
     });
-    refreshTimer = setInterval(function() { if (!document.hidden) { fetchNews(); renderPressure(); } }, 15000);
+    refreshTimer = setInterval(function() {
+      if (document.hidden) return;
+      var nowSec = Date.now() / 1000;
+      var releaseDue = news.some(function(ev) {
+        if (!ev || ev.kind === 'headline') return false;
+        var imp = String(ev.impact || 'low').toLowerCase();
+        if (imp !== 'high' && imp !== 'medium') return false;
+        var ts = Number(ev.ts || 0);
+        return ts >= nowSec - 240 && ts <= nowSec + 15 && !String(ev.actual == null ? '' : ev.actual).trim();
+      });
+      if (releaseDue && Date.now() - lastReleaseScanAt >= 20000) {
+        lastReleaseScanAt = Date.now();
+        exnessBrowser.nextFetch = 0;
+        fetchNews(true);
+      } else {
+        fetchNews();
+      }
+      renderPressure();
+    }, 15000);
     bindAiWorldRobot(); fetchNews(true); syncButton();
     requestAnimationFrame(function() { renderNews(); renderPressure(); updateMntTimers(); });
   }
@@ -1492,6 +1783,8 @@ export function loadModule(): void {
   });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
   window.ChartWorkspace = { relevanceFor: relevanceFor, impactFor: impactFor,
+    getDxyBarsM5: function() { return dxyBarsM5; },
+    fixed24hState: function() { return Object.assign({}, fixed24hState); },
     directionFor: function(ev, market) { return ev && marketMatch(market, symbol) ? directionalEstimate(ev, Date.now()/1000) : null; },
     expand: function(){setExpanded(true);}, close: function(){setExpanded(false);}, refresh: function(){fetchNews(true);renderPressure();},
     aiNewsState: function(){ return Object.assign({}, aiWorldState, { open: aiRobotOpen }); },

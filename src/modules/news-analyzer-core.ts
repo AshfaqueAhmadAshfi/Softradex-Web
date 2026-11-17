@@ -59,6 +59,7 @@ export interface NewsEstimateInput {
   headlinesPreSorted?: boolean;
   barsM5?: number[][];
   dxyBarsM5?: number[][];
+  resolveRunning?: boolean;
 }
 
 export interface NewsEstimateOutput {
@@ -678,8 +679,9 @@ export function computePostEventReaction(
     }
     if (chosen) {
       const bSec = normBarTsSec(chosen[0]);
-      // If candle straddles evTsSec, use its open (pre-news); if strictly before evTsSec, use close
-      baselinePrice = bSec === evTsSec ? Number(chosen[1]) : Number(chosen[4]);
+      // If candle straddles evTsSec [bSec, bSec+300), use its open (pre-news); only use close if candle finished strictly before evTsSec
+      const straddles = evTsSec >= bSec && evTsSec < bSec + 300;
+      baselinePrice = straddles ? Number(chosen[1]) : Number(chosen[4]);
     }
   }
 
@@ -707,7 +709,7 @@ function parseCalendarNum(raw: unknown): number {
   if (raw == null || raw === '') return NaN;
   const s = String(raw).trim().replace(/,/g, '');
   if (!s) return NaN;
-  const m = s.match(/^([+-]?\d+(?:\.\d+)?)\s*([%kmbKtT])?$/);
+  const m = s.match(/^([+-]?\d+(?:\.\d+)?)\s*([%kmbt])?$/i);
   if (!m) {
     const n = Number(s.replace(/[^\d.+-]/g, ''));
     return Number.isFinite(n) ? n : NaN;
@@ -722,29 +724,137 @@ function parseCalendarNum(raw: unknown): number {
   return val;
 }
 
+const ENERGY_SUPPLY_RE = /\b(crude oil inventories|oil inventories|oil stocks|distillate|gasoline inventories|natural gas storage|api weekly|eia crude|rig count|baker hughes)\b/i;
+
+function computePostEventReactionQuality(
+  barsM5: number[][] | undefined,
+  evTsSec: number,
+  nowSec: number,
+  curPrice: number,
+  baselinePrice: number,
+  atr: number,
+): { bodyConfirmed: boolean; wickRejection: boolean; twoSidedWhip: boolean; elapsedSec: number } {
+  const elapsedSec = Math.max(0, nowSec - evTsSec);
+  if (!Array.isArray(barsM5) || !barsM5.length || !(atr > 0) || !(baselinePrice > 0) || nowSec < evTsSec) {
+    return { bodyConfirmed: false, wickRejection: false, twoSidedWhip: false, elapsedSec };
+  }
+  const startBucket = Math.floor(evTsSec / 300) * 300;
+  let maxHigh = -Infinity;
+  let minLow = Infinity;
+  for (let i = 0; i < barsM5.length; i++) {
+    const b = barsM5[i];
+    if (!Array.isArray(b) || b.length < 5) continue;
+    const t = normBarTsSec(b[0]);
+    if (t < startBucket) continue;
+    const h = Number(b[2]);
+    const l = Number(b[3]);
+    if (Number.isFinite(h) && h > maxHigh) maxHigh = h;
+    if (Number.isFinite(l) && l < minLow) minLow = l;
+  }
+  if (!Number.isFinite(maxHigh) || !Number.isFinite(minLow)) {
+    return { bodyConfirmed: false, wickRejection: false, twoSidedWhip: false, elapsedSec };
+  }
+  const netAtr = (curPrice - baselinePrice) / atr;
+  const peakUpAtr = Math.max(0, (maxHigh - baselinePrice) / atr);
+  const peakDownAtr = Math.max(0, (baselinePrice - minLow) / atr);
+  // Opening whip/wick guard applies during the initial 4m release window; sustained multi-bar trends shouldn't stay flagged
+  const inOpeningWindow = elapsedSec <= 240;
+  const twoSidedWhip = inOpeningWindow && peakUpAtr >= 0.35 && peakDownAtr >= 0.35 && Math.abs(netAtr) < Math.max(peakUpAtr, peakDownAtr) * 0.65;
+  const upReject = inOpeningWindow && peakUpAtr >= 0.42 && (maxHigh - curPrice) / Math.max(atr * peakUpAtr, 1e-9) >= 0.55;
+  const downReject = inOpeningWindow && peakDownAtr >= 0.42 && (curPrice - minLow) / Math.max(atr * peakDownAtr, 1e-9) >= 0.55;
+  const wickRejection = twoSidedWhip || (netAtr >= 0 && upReject) || (netAtr <= 0 && downReject);
+  const bodyConfirmed = elapsedSec >= 120 && Math.abs(netAtr) >= 0.44 && !wickRejection;
+  return { bodyConfirmed, wickRejection, twoSidedWhip, elapsedSec };
+}
+
 /**
  * Determine if numeric actual vs forecast/previous indicates an economic surprise.
  */
-function numericSurpriseScore(ev: Record<string, any>, symbol: string): { score: number; hasActual: boolean; reason: string } {
+function numericSurpriseScore(ev: Record<string, any>, symbol: string): { score: number; hasActual: boolean; inLine: boolean; reason: string } {
   const actual = parseCalendarNum(ev.actual);
   const forecast = parseCalendarNum(ev.forecast);
   const previous = parseCalendarNum(ev.previous);
-  const comparison = Number.isFinite(actual) && Number.isFinite(forecast) ? forecast : previous;
-  const value = Number.isFinite(actual) ? actual : forecast;
   const evTitleLower = String(ev.title || ev.event || '').toLowerCase();
-  const inverse = INVERSE_RE.test(evTitleLower);
-  const delta = Number.isFinite(value) && Number.isFinite(comparison) ? signNum(value - comparison) * (inverse ? -1 : 1) : 0;
-  const curSign = newsCurrencySign(symbol, ev.currency || ev.country || '');
+  const symBase = canonicalNewsBase(symbol);
   const hasActual = Number.isFinite(actual);
 
-  if (delta && curSign) {
+  if (ENERGY_SUPPLY_RE.test(evTitleLower)) {
+    const isEnergy = /^(USOIL|UKOIL|XNGUSD|WTI|BRENT)/.test(symBase);
+    if (!isEnergy) return { score: 0, hasActual, inLine: false, reason: '' };
+    const value = Number.isFinite(actual) ? actual : forecast;
+    const ref = Number.isFinite(actual) && Number.isFinite(forecast) ? forecast : previous;
+    if (!Number.isFinite(value) || !Number.isFinite(ref)) return { score: 0, hasActual, inLine: false, reason: '' };
+    const diff = value - ref;
+    if (Math.abs(diff) <= 1e-9) return { score: 0, hasActual, inLine: hasActual, reason: hasActual ? 'Energy stock matches forecast' : '' };
+    const denom = Math.max(Math.abs(ref) * 0.15, Math.abs(value) * 0.15, 0.5);
+    const ratio = Math.min(1.5, Math.abs(diff) / denom);
+    const mag = hasActual ? 3.5 + ratio * 2.1 : ratio >= 0.15 ? 1.1 + ratio * 0.6 : 0;
+    if (!mag) return { score: 0, hasActual, inLine: false, reason: '' };
+    const dir = -signNum(diff); // Higher inventory / rigs = bearish energy supply pressure
     return {
-      score: delta * curSign * (hasActual ? 6 : 2.2),
+      score: dir * mag,
       hasActual,
-      reason: hasActual ? 'Actual vs forecast/previous surprise' : 'Forecast vs previous (pre-release)',
+      inLine: false,
+      reason: hasActual ? `Energy supply ${dir > 0 ? 'draw' : 'build'} (${ev.actual} vs ${Number.isFinite(forecast) ? ev.forecast : ev.previous})` : 'Forecast energy stock delta',
     };
   }
-  return { score: 0, hasActual, reason: '' };
+
+  const curSign = newsCurrencySign(symbol, ev.currency || ev.country || '');
+  if (!curSign) return { score: 0, hasActual, inLine: false, reason: '' };
+
+  const inverse = INVERSE_RE.test(evTitleLower) || /\b(unemployment|jobless|initial claims|continuing claims|layoff|job cuts?|challenger|bankruptc)/i.test(evTitleLower);
+  const invMult = inverse ? -1 : 1;
+  const imp = String(ev.impact || 'low').toLowerCase();
+  const impMult = imp === 'high' ? 1.0 : imp === 'medium' ? 0.78 : 0.48;
+
+  if (Number.isFinite(actual)) {
+    const ref = Number.isFinite(forecast) ? forecast : previous;
+    if (!Number.isFinite(ref)) return { score: 0, hasActual: true, inLine: false, reason: '' };
+    const diff = actual - ref;
+    const denom = Math.max(Math.abs(ref) * 0.12, Math.abs(actual) * 0.12, 0.15);
+    if (Math.abs(diff) <= 1e-9) {
+      // In-line print: check modest trend delta vs previous only if meaningful
+      if (Number.isFinite(previous) && Math.abs(actual - previous) / denom >= 0.18) {
+        const pDir = signNum(actual - previous) * invMult * curSign;
+        return {
+          score: pDir * 1.25 * impMult,
+          hasActual: true,
+          inLine: true,
+          reason: `In-line with forecast (${ev.actual}), ${actual > previous ? 'above' : 'below'} prior (${ev.previous})`,
+        };
+      }
+      return { score: 0, hasActual: true, inLine: true, reason: `Actual in-line with forecast (${ev.actual})` };
+    }
+    const rel = Math.abs(diff) / denom;
+    const rawMag = (3.4 + Math.min(3.4, rel * 2.1)) * impMult;
+    const rawSign = signNum(diff) * invMult * curSign;
+    const refLabel = Number.isFinite(forecast) ? ev.forecast : ev.previous;
+    return {
+      score: rawSign * rawMag,
+      hasActual: true,
+      inLine: false,
+      reason: `Actual ${diff * invMult > 0 ? 'beat' : 'miss'} (${ev.actual} vs ${refLabel}) -> ${rawSign > 0 ? 'bullish' : 'bearish'} ${symbol}`,
+    };
+  }
+
+  if (Number.isFinite(forecast) && Number.isFinite(previous)) {
+    const diff = forecast - previous;
+    const denom = Math.max(Math.abs(previous) * 0.12, Math.abs(forecast) * 0.12, 0.15);
+    const rel = Math.abs(diff) / denom;
+    if (Math.abs(diff) <= 1e-9 || rel < 0.12) {
+      return { score: 0, hasActual: false, inLine: true, reason: 'Forecast close to previous (neutral consensus)' };
+    }
+    const preCap = imp === 'high' ? 2.2 : imp === 'medium' ? 1.75 : 0.75;
+    const rawMag = Math.min(preCap, (1.1 + Math.min(1.2, rel * 0.75)) * (imp === 'high' ? 1.0 : imp === 'medium' ? 0.85 : 0.45));
+    const rawSign = signNum(diff) * invMult * curSign;
+    return {
+      score: rawSign * rawMag,
+      hasActual: false,
+      inLine: false,
+      reason: `Pre-release consensus (${ev.forecast} vs ${ev.previous})`,
+    };
+  }
+  return { score: 0, hasActual, inLine: false, reason: '' };
 }
 
 /**
@@ -778,8 +888,11 @@ export function estimateNewsDirection(input: NewsEstimateInput): NewsEstimateOut
     releaseScore += numSup.score;
     evidence.push(numSup.reason);
     if (hasActual) basis = 'RELEASE + MODEL';
-  } else if (input.impact && sideVal(input.impact.side || input.impact.direction)) {
-    const impW = hasActual ? 5 : 2.5;
+  } else if (numSup.reason) {
+    evidence.push(numSup.reason);
+  }
+  if (!numSup.score && input.impact && sideVal(input.impact.side || input.impact.direction)) {
+    const impW = hasActual ? 4.4 : 1.75;
     releaseScore += sideVal(input.impact.side || input.impact.direction) * impW;
     evidence.push(input.impact.reason || 'Market-specific event effect');
     if (hasActual) basis = 'RELEASE + MODEL';
@@ -862,44 +975,79 @@ export function estimateNewsDirection(input: NewsEstimateInput): NewsEstimateOut
       : null;
   const livePx = freshQ ? Number(freshQ.price) : undefined;
   const rx = computePostEventReaction(input.barsM5, evTs, now, livePx, m5Atr);
+  const rxQuality = computePostEventReactionQuality(input.barsM5, evTs, now, rx.curPrice, rx.baselinePrice, rx.atr);
   const dxyRx = computePostEventReaction(input.dxyBarsM5, evTs, now);
+
+  const isSpeechOrQualitative =
+    !isHeadline &&
+    !hasActual &&
+    /\b(speaks?|speech|remarks|testimony|press conference|minutes|statement|meeting)\b/i.test(evTitleLower);
+  // Pre-release context: M5 price/DXY is ONLY relevant when running, headline, or <= 20 min before release,
+  // and gently capped before start so chart candles never mass-bias all future 24H events into BUY/SELL.
+  const isNearTermForRx = isHeadline || isRunning || evTs - now <= 1200;
 
   let reactionScore = 0;
   let structureScore = 0;
 
-  if (market && canonicalNewsBase(market.symbol) === symBase && market.fresh && market.reads) {
-    // Intraday M5 + M15 alignment carries intraday truth during news, scaled modestly
+  if (isNearTermForRx && market && canonicalNewsBase(market.symbol) === symBase && market.fresh && market.reads) {
+    // Intraday M5 + M15 alignment carries intraday truth during active/imminent news
     const s5 = Number(market.reads.M5?.score || 0);
     const s15 = Number(market.reads.M15?.score || 0);
     const vScore = Number(market.vote?.score || 0);
-    const ltf = (s5 + s15) * 0.35 + vScore * 0.04;
+    const ltf = (s5 + s15) * (isRunning ? 0.35 : 0.14) + vScore * (isRunning ? 0.04 : 0.012);
     if (Math.abs(ltf) >= 0.25) {
-      structureScore = clampNum(ltf, 1.5);
+      structureScore = clampNum(ltf, isRunning ? 1.45 : 0.45);
       evidence.push('Live M5/M15 structure');
     }
   }
 
-  if (rx.ready) {
-    if (isRunning && rx.elapsedSec >= 45 && (Math.abs(rx.evMoveAtr) >= 0.35 || Math.abs(rx.impulse15mAtr) >= 0.5)) {
-      const rxRaw = rx.evMoveAtr * 2.1 + rx.impulse15mAtr * 1.1 + rx.slopeAtr * 0.6;
-      const rxCap = !hasActual ? 5.6 : 2.6;
-      reactionScore = clampNum(rxRaw, rxCap);
-      evidence.push(
-        `Live reaction ${rx.evMoveAtr >= 0 ? '+' : ''}${rx.evMoveAtr.toFixed(2)} ATR (${rx.evMoveAbs >= 0 ? '+' : ''}${rx.evMoveAbs.toFixed(rx.atr >= 1 ? 2 : 4)})`,
-      );
-    } else if (!isRunning && Math.abs(rx.impulse30mAtr) >= 0.45) {
-      reactionScore = clampNum(rx.impulse30mAtr * 1.15 + rx.slopeAtr * 0.5, 1.6);
+  const usdSign = newsCurrencySign(symbol, 'USD');
+  const dxyMove = isRunning
+    ? dxyRx.elapsedSec >= 60
+      ? dxyRx.evMoveAtr
+      : dxyRx.impulse15mAtr * 0.65
+    : dxyRx.impulse30mAtr;
+  const dxyDriverSign = usdSign !== 0 && dxyRx.ready && Math.abs(dxyMove) >= 0.25 ? signNum(dxyMove) * usdSign : 0;
+  const dxyDiverges =
+    isRunning &&
+    rx.ready &&
+    dxyRx.ready &&
+    usdSign !== 0 &&
+    Math.abs(dxyRx.evMoveAtr) >= 0.28 &&
+    Math.abs(rx.evMoveAtr) >= 0.38 &&
+    signNum(rx.evMoveAtr) !== signNum(dxyRx.evMoveAtr) * usdSign;
+
+  // Smooth pre-release momentum bridge across t = evTs (prevents cliff flip in first 180s)
+  const preMomentum =
+    rx.ready && isNearTermForRx && Math.abs(rx.impulse30mAtr) >= 0.45 ? rx.impulse30mAtr * 0.45 + rx.slopeAtr * 0.2 : 0;
+  const preCarry =
+    isRunning && !hasActual && rx.elapsedSec < 180 && preMomentum
+      ? clampNum(preMomentum * (1 - rx.elapsedSec / 180), 0.65)
+      : 0;
+
+  if (rx.ready && isNearTermForRx) {
+    if (!isRunning && Math.abs(rx.impulse30mAtr) >= 0.45) {
+      reactionScore = clampNum(preMomentum, 0.45);
       evidence.push(`Intraday 30m impulse (${rx.impulse30mAtr >= 0 ? '+' : ''}${rx.impulse30mAtr.toFixed(2)} ATR)`);
+    } else if (isRunning) {
+      if (preCarry) reactionScore += preCarry;
+      const canScoreLiveRx = (hasActual && rx.elapsedSec >= 60) || rx.elapsedSec >= 120;
+      if (canScoreLiveRx && (Math.abs(rx.evMoveAtr) >= 0.35 || Math.abs(rx.impulse15mAtr) >= 0.48)) {
+        const rxRaw = rx.evMoveAtr * 1.9 + rx.impulse15mAtr * 0.95 + rx.slopeAtr * 0.45;
+        const rxMult = rxQuality.bodyConfirmed && !dxyDiverges ? 1.0 : rxQuality.wickRejection || dxyDiverges ? 0.28 : 0.65;
+        const rxCap = hasActual ? 2.4 : rxQuality.bodyConfirmed ? 3.9 : 2.1;
+        reactionScore = clampNum(reactionScore * 0.35 + rxRaw * rxMult, rxCap);
+        evidence.push(
+          `Live M5 reaction ${rx.evMoveAtr >= 0 ? '+' : ''}${rx.evMoveAtr.toFixed(2)} ATR${rxQuality.bodyConfirmed ? ' (confirmed)' : ''}`,
+        );
+      }
     }
   }
 
-  if (dxyRx.ready && Math.abs(dxyRx.evMoveAtr || dxyRx.impulse15mAtr) >= 0.45) {
-    const usdSign = newsCurrencySign(symbol, 'USD');
-    if (usdSign !== 0) {
-      const dMove = isRunning ? dxyRx.evMoveAtr : dxyRx.impulse30mAtr;
-      reactionScore += clampNum(signNum(dMove) * Math.min(1.4, Math.abs(dMove)) * usdSign, 1.4);
-      evidence.push('Intraday DXY reaction');
-    }
+  if (isNearTermForRx && dxyRx.ready && dxyDriverSign !== 0 && Math.abs(dxyMove) >= 0.3 && !dxyDiverges) {
+    const dxyW = clampNum(dxyMove * usdSign * (isRunning ? 1.55 : 0.4), isRunning ? 1.85 : 0.45);
+    reactionScore += dxyW;
+    evidence.push(`DXY ${dxyMove >= 0 ? 'firm' : 'soft'} (${dxyMove >= 0 ? '+' : ''}${dxyMove.toFixed(2)} ATR)`);
   }
 
   // Combine directional drivers
@@ -907,47 +1055,140 @@ export function estimateNewsDirection(input: NewsEstimateInput): NewsEstimateOut
   let totalScore = fundAndTextScore + reactionScore + structureScore;
   let conflict = false;
 
-  // 5. ZERO-MISTAKE CONFLICT & PRE-EVENT GUARD
-  const isSpeechOrQualitative =
-    !isHeadline &&
-    !hasActual &&
-    /\b(speaks?|speech|remarks|testimony|press conference|minutes|statement|meeting)\b/i.test(evTitleLower);
+  // 5. ZERO-MISTAKE CONFLICT, STOP-HUNT SWEEP & DXY VERIFICATION GATE
 
   const reactionMove = isRunning ? rx.evMoveAtr : rx.impulse15mAtr;
-  const strongRxUp = rx.ready && (reactionMove >= 0.55 || rx.impulse15mAtr >= 0.68);
-  const strongRxDown = rx.ready && (reactionMove <= -0.55 || rx.impulse15mAtr <= -0.68);
-  const rxSide: 'BUY' | 'SELL' | '' = strongRxUp ? 'BUY' : strongRxDown ? 'SELL' : '';
+  const confirmedRxUp =
+    rx.ready &&
+    !rxQuality.wickRejection &&
+    !rxQuality.twoSidedWhip &&
+    !dxyDiverges &&
+    (isRunning ? rxQuality.bodyConfirmed && reactionMove >= 0.48 && rx.impulse15mAtr >= 0.4 : rx.impulse15mAtr >= 0.65);
+  const confirmedRxDown =
+    rx.ready &&
+    !rxQuality.wickRejection &&
+    !rxQuality.twoSidedWhip &&
+    !dxyDiverges &&
+    (isRunning ? rxQuality.bodyConfirmed && reactionMove <= -0.48 && rx.impulse15mAtr <= -0.4 : rx.impulse15mAtr <= -0.65);
+  const rxSide: 'BUY' | 'SELL' | '' = confirmedRxUp ? 'BUY' : confirmedRxDown ? 'SELL' : '';
   const textModelSide: 'BUY' | 'SELL' | '' =
-    fundAndTextScore >= 0.35 ? 'BUY' : fundAndTextScore <= -0.35 ? 'SELL' : '';
+    fundAndTextScore >= 0.65 ? 'BUY' : fundAndTextScore <= -0.65 ? 'SELL' : '';
+  const minOverrideSec = isSpeechOrQualitative ? 120 : 150;
 
   let side: 'BUY' | 'SELL' | 'WAIT' = 'WAIT';
 
-  if (isRunning && rxSide && textModelSide && rxSide !== textModelSide) {
-    // Live market broke strongly opposite to text/model! Never blindly counter-trade FOMC spikes.
-    if (!hasActual && (Math.abs(postTextScore) < 1.8 || Math.sign(postTextScore) === (rxSide === 'BUY' ? 1 : -1))) {
-      // Stale/ambiguous pre-speech bias contradicted by strong real post-event breakout -> follow live reaction!
-      totalScore = rxSide === 'BUY' ? Math.max(2.6, Math.abs(reactionScore)) : -Math.max(2.6, Math.abs(reactionScore));
-      side = rxSide;
-      basis = 'POST-EVENT REACTION';
-      evidence.unshift(`Market broke ${rxSide === 'BUY' ? 'UP' : 'DOWN'} post-news (+${Math.abs(reactionMove).toFixed(2)} ATR) — overriding stale pre-event text`);
-    } else {
-      // Genuine severe clash between strong release/breaking headlines and opposite live price -> WAIT!
+  if (
+    isRunning &&
+    !hasActual &&
+    rx.elapsedSec < 120 &&
+    rx.ready &&
+    (rxQuality.twoSidedWhip ||
+      rxQuality.wickRejection ||
+      (textModelSide && Math.abs(rx.evMoveAtr) >= 0.38 && signNum(rx.evMoveAtr) !== (textModelSide === 'BUY' ? 1 : -1)))
+  ) {
+    // Opening 0-120s liquidity sweep without actual print -> never flip pre-news BUY to SELL on stop-hunt wick
+    conflict = true;
+    side = 'WAIT';
+    basis = 'STOP-HUNT GUARD';
+    evidence.unshift(
+      `Opening volatility sweep (${rx.evMoveAtr >= 0 ? '+' : ''}${rx.evMoveAtr.toFixed(2)} ATR) — waiting for M5 close & actual release`,
+    );
+  } else if (dxyDiverges && !hasActual) {
+    conflict = true;
+    side = 'WAIT';
+    basis = 'DXY DIVERGENCE';
+    evidence.unshift('Price moved opposite DXY correlation — probable stop-hunt, waiting for confirmation');
+  } else if (isRunning && hasActual && Math.abs(releaseScore) >= 2.2) {
+    const releaseSide: 'BUY' | 'SELL' = releaseScore > 0 ? 'BUY' : 'SELL';
+    const oppMove = rx.ready && signNum(rx.evMoveAtr) !== signNum(releaseScore) ? Math.abs(rx.evMoveAtr) : 0;
+    if (rx.elapsedSec >= 240 && rxQuality.bodyConfirmed && oppMove >= 0.85 && !dxyDiverges) {
       conflict = true;
       side = 'WAIT';
-      basis = 'CONFLICT · WAIT';
-      evidence.unshift(`CONFLICT: News leans ${textModelSide} while live price moved ${rxSide === 'BUY' ? 'UP' : 'DOWN'} (${reactionMove >= 0 ? '+' : ''}${reactionMove.toFixed(2)} ATR) — wait for alignment`);
+      basis = 'PRICED-IN FADE · WAIT';
+      evidence.unshift(
+        `CONFLICT: Actual favors ${releaseSide} while price faded ${oppMove.toFixed(2)} ATR opposite — priced-in / squeeze risk`,
+      );
+    } else if (oppMove >= 0.65 && rx.elapsedSec < 240) {
+      conflict = true;
+      side = 'WAIT';
+      basis = 'AWAITING SETTLE · WAIT';
+      evidence.unshift(`Actual favors ${releaseSide} vs initial opposite spike (${oppMove.toFixed(2)} ATR) — waiting to settle`);
+    } else {
+      side = releaseSide;
+      basis = dxyDriverSign === signNum(releaseScore) ? 'ACTUAL + DXY CONFIRMED' : 'RELEASE + MODEL';
+      totalScore = releaseScore + clampNum(postTextScore * 0.6 + reactionScore * 0.6 + structureScore * 0.5, 2.5);
     }
-  } else if (!isRunning && isSpeechOrQualitative && !hasActual && Math.abs(totalScore) < 2.2 && !Math.abs(releaseScore)) {
+  } else if (isRunning && !hasActual && rx.ready && textModelSide && Math.abs(rx.evMoveAtr) >= 0.42 && signNum(rx.evMoveAtr) !== (textModelSide === 'BUY' ? 1 : -1)) {
+    const canOverride = rx.elapsedSec >= minOverrideSec && rxSide && rxSide !== textModelSide && Math.abs(postTextScore) < 1.8;
+    if (canOverride) {
+      totalScore = rxSide === 'BUY' ? Math.max(2.6, Math.abs(reactionScore)) : -Math.max(2.6, Math.abs(reactionScore));
+      side = rxSide;
+      basis = 'CONFIRMED M5 BREAKOUT';
+      evidence.unshift(
+        `Sustained M5 close ${rxSide === 'BUY' ? 'UP' : 'DOWN'} (${Math.abs(reactionMove).toFixed(2)} ATR) with DXY alignment after ${rx.elapsedSec}s`,
+      );
+    } else {
+      conflict = true;
+      side = 'WAIT';
+      basis = 'AWAITING CONFIRM · WAIT';
+      evidence.unshift(
+        `News leans ${textModelSide} while unconfirmed move went ${rx.evMoveAtr >= 0 ? 'UP' : 'DOWN'} (${rx.evMoveAtr >= 0 ? '+' : ''}${rx.evMoveAtr.toFixed(2)} ATR) — holding WAIT`,
+      );
+    }
+  } else if (!isRunning && Math.abs(releaseScore) >= 1.0 && Math.abs(structureScore + reactionScore) >= 1.1 && signNum(releaseScore) !== signNum(structureScore + reactionScore) && Math.abs(releaseScore + preTextScore) < 2.2) {
+    conflict = true;
+    side = 'WAIT';
+    basis = 'PRE-EVENT CONFLICT';
+    evidence.unshift('Pre-release consensus vs M5/M15 structure diverge — wait for alignment');
+  } else if (!isRunning && isSpeechOrQualitative && !hasActual && Math.abs(totalScore) < 2.4 && !Math.abs(releaseScore)) {
     // Pre-speech with no numeric actual and weak/mixed clues -> do not manufacture a fake trade signal!
     side = 'WAIT';
     basis = 'PENDING SPEECH';
-    evidence.push('Pre-speech neutral — wait for remarks & live M5 breakout');
-  } else if (Math.abs(totalScore) >= 0.55) {
-    side = totalScore > 0 ? 'BUY' : 'SELL';
-    if (isRunning && !hasActual && rxSide === side) basis = 'REACTION + MODEL';
+    evidence.push('Pre-speech neutral — wait for remarks & confirmed M5 breakout');
   } else {
-    side = 'WAIT';
-    basis = 'MIXED · WAIT';
+    const minConviction = isRunning ? 1.45 : !releaseScore && !preTextScore ? 1.95 : 1.6;
+    if (Math.abs(totalScore) >= minConviction) {
+      side = totalScore > 0 ? 'BUY' : 'SELL';
+      if (isRunning && !hasActual && rxSide === side) basis = 'CONFIRMED REACTION';
+    } else {
+      side = 'WAIT';
+      basis = 'MIXED · WAIT';
+    }
+  }
+
+  // RUNNING NEWS resolution: events/headlines that already occurred show live chart-backed direction (never WAIT)
+  if (input.resolveRunning && side === 'WAIT' && (isRunning || isHeadline)) {
+    let chartScore = 0;
+    if (rx.ready) {
+      const liveMove = isHeadline ? rx.impulse15mAtr : rx.evMoveAtr;
+      chartScore += liveMove * 2.1 + rx.impulse15mAtr * 1.2 + rx.impulse30mAtr * 0.55 + rx.slopeAtr * 0.75;
+    }
+    if (dxyRx.ready && dxyDriverSign !== 0) {
+      chartScore += clampNum(dxyMove * usdSign * 1.35, 1.8);
+    }
+    if (market && canonicalNewsBase(market.symbol) === symBase && market.fresh) {
+      const s5 = Number(market.reads?.M5?.score || 0);
+      const s15 = Number(market.reads?.M15?.score || 0);
+      const vScore = Number(market.vote?.score || 0);
+      chartScore += clampNum((s5 + s15) * 0.55 + vScore * 0.14, 2.2);
+    }
+    chartScore += clampNum(fundAndTextScore * (hasActual ? 0.9 : 0.65), 2.4);
+    if (Math.abs(chartScore) < 0.05 && freshQ && Number(freshQ.change_pct || 0) !== 0) {
+      chartScore = Number(freshQ.change_pct);
+    }
+    if (Math.abs(chartScore) < 0.01) {
+      chartScore = totalScore !== 0 ? totalScore : 0.6;
+    }
+    const resolvedSide: 'BUY' | 'SELL' = chartScore >= 0 ? 'BUY' : 'SELL';
+    side = resolvedSide;
+    conflict = false;
+    basis = hasActual ? 'ACTUAL + CHART FLOW' : 'CHART + NEWS FLOW';
+    const mag = Math.max(1.5, Math.min(5.8, Math.abs(chartScore)));
+    totalScore = resolvedSide === 'BUY' ? mag : -mag;
+    const rxTag = rx.ready
+      ? ` ${rx.evMoveAtr >= 0 ? '+' : ''}${(isHeadline ? rx.impulse15mAtr : rx.evMoveAtr).toFixed(2)} ATR`
+      : '';
+    evidence.unshift(`Chart reading ${resolvedSide}${rxTag} since release`);
   }
 
   if (!evidence.length) return null;

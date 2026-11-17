@@ -2469,10 +2469,41 @@ export function loadModule(): void {
           tp: tp,
           sl: sl,
           startAt: Number(p.startAt || p.startedQuoteAt || 0),
-          rr: Math.abs(tp - entry) / risk
+          rr: Math.abs(tp - entry) / risk,
+          saved: false,
+          savedStatus: 'RUNNING'
         });
       });
     });
+    if (Array.isArray(st.savedZones)) {
+      st.savedZones.forEach(function (z) {
+        if (!z) return;
+        var side = z.side === 'BUY' ? 'BUY' : z.side === 'SELL' ? 'SELL' : '';
+        var entry = Number(z.entry);
+        var tp = Number(z.tp);
+        var sl = Number(z.sl);
+        if (!side || !(entry > 0) || !(tp > 0) || !(sl > 0)) return;
+        if (side === 'BUY' && !(tp > entry && sl < entry)) return;
+        if (side === 'SELL' && !(tp < entry && sl > entry)) return;
+        var scale = String(z.scale || '');
+        var dedupKey = side + '|' + scale + '|' + entry.toFixed(4) + '|' + tp.toFixed(4) + '|' + sl.toFixed(4);
+        if (seen[dedupKey]) return;
+        seen[dedupKey] = true;
+        var risk = Math.max(1e-9, Math.abs(entry - sl));
+        out.push({
+          side: side,
+          scale: scale,
+          tfLabel: String(z.tfLabel || ''),
+          entry: entry,
+          tp: tp,
+          sl: sl,
+          startAt: Number(z.startAt || z.savedAt || 0),
+          rr: Math.abs(tp - entry) / risk,
+          saved: true,
+          savedStatus: String(z.status || 'OPEN')
+        });
+      });
+    }
     return out;
   }
 
@@ -2480,7 +2511,7 @@ export function loadModule(): void {
     var list = collectRunningSwingPositions();
     if (!list.length) return '0';
     return list.map(function (p) {
-      return p.side + ':' + (p.scale || '') + ':' + p.entry.toFixed(4) + ':' + p.tp.toFixed(4) + ':' + p.sl.toFixed(4) + ':' + (p.startAt || 0);
+      return p.side + ':' + (p.scale || '') + ':' + (p.saved ? '1:' + (p.savedStatus || '') : '0') + ':' + p.entry.toFixed(4) + ':' + p.tp.toFixed(4) + ':' + p.sl.toFixed(4) + ':' + (p.startAt || 0);
     }).join('|');
   }
 
@@ -2533,6 +2564,8 @@ export function loadModule(): void {
         side: pos.side,
         scale: pos.scale || '',
         tfLabel: pos.tfLabel || '',
+        saved: !!pos.saved,
+        savedStatus: pos.savedStatus || 'OPEN',
         entry: pos.entry,
         tp: pos.tp,
         sl: pos.sl,
@@ -2570,15 +2603,20 @@ export function loadModule(): void {
 
     boxes.forEach(function (box) {
       c.save();
+      if (box.saved) c.setLineDash([5, 3]);
       if (box.tpRect) {
-        c.fillStyle = tpFill;
+        c.fillStyle = box.saved
+          ? (isDark ? 'rgba(8, 153, 129, 0.14)' : 'rgba(8, 153, 129, 0.11)')
+          : tpFill;
         c.fillRect(box.tpRect.x, box.tpRect.y, box.tpRect.w, box.tpRect.h);
         c.strokeStyle = tpStroke;
         c.lineWidth = 1;
         c.strokeRect(box.tpRect.x + 0.5, box.tpRect.y + 0.5, Math.max(1, box.tpRect.w - 1), Math.max(1, box.tpRect.h - 1));
       }
       if (box.slRect) {
-        c.fillStyle = slFill;
+        c.fillStyle = box.saved
+          ? (isDark ? 'rgba(242, 54, 69, 0.14)' : 'rgba(242, 54, 69, 0.11)')
+          : slFill;
         c.fillRect(box.slRect.x, box.slRect.y, box.slRect.w, box.slRect.h);
         c.strokeStyle = slStroke;
         c.lineWidth = 1;
@@ -2586,10 +2624,11 @@ export function loadModule(): void {
       }
       if (box.yEntry >= box.topB && box.yEntry <= box.botB) {
         line(c, box.left, box.yEntry, box.right, box.yEntry,
-          isDark ? 'rgba(226, 232, 240, 0.90)' : 'rgba(30, 41, 59, 0.80)', 1.3);
+          isDark ? 'rgba(226, 232, 240, 0.90)' : 'rgba(30, 41, 59, 0.80)', 1.3, box.saved ? [5, 3] : undefined);
       }
+      c.setLineDash([]);
       // Diagonal dashed position line from starting candle entry strictly to the latest candle's real price
-      if (box.diagHasMove && box.diagEndX > box.diagStartX + 4) {
+      if (!box.saved && box.diagHasMove && box.diagEndX > box.diagStartX + 4) {
         var diagCol = box.diagInProfit ? COLORS.up : COLORS.down;
         line(c, box.diagStartX, box.diagStartY, box.diagEndX, box.diagEndY, hexAlpha(diagCol, 0.92), 1.4, [4, 3]);
         c.fillStyle = diagCol;
@@ -2615,7 +2654,9 @@ export function loadModule(): void {
       var tpEdgeVisible = box.yTp >= box.topB && box.yTp <= box.botB;
       var slEdgeVisible = box.ySl >= box.topB && box.ySl <= box.botB;
       var entryVisible = box.yEntry >= box.topB && box.yEntry <= box.botB;
-      var scaleTag = box.scale ? (box.scale + ' ') : '';
+      var scaleTag = (box.saved ? 'SAVED ' : '') + (box.scale ? (box.scale + ' ') : '');
+      var hitSuffix = box.saved && box.savedStatus === 'TP_HIT' ? ' · TP HIT ✓'
+        : box.saved && box.savedStatus === 'SL_HIT' ? ' · SL HIT ✕' : '';
 
       // Subtle dashed guides out to price scale + collision-free axis pills
       function axisPill(yPx, bg, text) {
@@ -2669,7 +2710,7 @@ export function loadModule(): void {
             var entLblY = box.side === 'BUY' ? box.yEntry - 7 : box.yEntry + 8;
             if (entLblY >= box.topB + 6 && entLblY <= box.botB - 6) {
               c.fillStyle = isDark ? 'rgba(241, 245, 249, 0.92)' : 'rgba(15, 23, 42, 0.90)';
-              c.fillText(box.side + ' ' + (box.scale || 'SWING') + ' · ' + formatChartPx(box.entry, digits), box.left + 6, entLblY, bw - 12);
+              c.fillText((box.saved ? 'PIN ' : '') + box.side + ' ' + (box.scale || 'SWING') + ' · ' + formatChartPx(box.entry, digits) + hitSuffix, box.left + 6, entLblY, bw - 12);
             }
           }
         }

@@ -5,6 +5,7 @@ import { fetchTvCandles, fetchTvQuote, getLiveMarketWatches, getSymbolMeta } fro
 import {
   analyzeFinancialText,
   computePostEventReaction,
+  estimateNewsDirection,
   inferMacroCurrency,
   isMacroNoiseHeadline,
   newsCurrencySign,
@@ -59,6 +60,8 @@ let state: CachedNews = {
 
 let lastFetchAt = 0;
 let fetching = false;
+let lastCalendarFastFetchAt = 0;
+let calendarFastFetching = false;
 let cacheLoaded = false;
 let newsStarted = false;
 let stateVersion = 1;
@@ -72,7 +75,350 @@ let cachedPayloadVersion = -1;
 let cachedNonHoliday: any[] = [];
 const TZ_FORMATTERS = new Map<string, Intl.DateTimeFormat>();
 
-const PROVIDER_KEYS = ['exness', 'forex-factory', 'binance', 'investing', 'google-news', 'fxstreet', 'coindesk', 'cnbc'];
+let dxyBarsCache: { exp: number; bars: number[][] } = { exp: 0, bars: [] };
+let dxyBarsPending: Promise<number[][]> | null = null;
+let us10yQuoteCache: { exp: number; quote: any } = { exp: 0, quote: null };
+let us10yPending: Promise<any> | null = null;
+
+function hasActiveReleaseWindow(nowSec: number): boolean {
+  for (const ev of state.events) {
+    if (!ev || ev.kind === 'headline') continue;
+    const imp = String(ev.impact || 'low').toLowerCase();
+    if (imp !== 'high' && imp !== 'medium') continue;
+    const ts = Number(ev.ts || 0);
+    if (ts >= nowSec - 300 && ts <= nowSec + 30 && !String(ev.actual ?? '').trim()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function getDxyM5Bars(force = false): Promise<number[][]> {
+  const now = Date.now();
+  if (!force && now < dxyBarsCache.exp && dxyBarsCache.bars.length) return dxyBarsCache.bars;
+  if (!dxyBarsPending) {
+    dxyBarsPending = fetchTvCandles('DXY', '5m', 50, 'TVC:DXY')
+      .then((res) => {
+        const bars = Array.isArray(res?.bars) ? res.bars.slice(-36) : [];
+        if (bars.length) dxyBarsCache = { exp: Date.now() + 20_000, bars };
+        return dxyBarsCache.bars;
+      })
+      .catch(() => dxyBarsCache.bars)
+      .finally(() => {
+        dxyBarsPending = null;
+      });
+  }
+  return dxyBarsCache.bars.length && !force ? dxyBarsCache.bars : dxyBarsPending;
+}
+
+export async function getUs10yQuote(force = false): Promise<any> {
+  const now = Date.now();
+  if (!force && now < us10yQuoteCache.exp && us10yQuoteCache.quote) return us10yQuoteCache.quote;
+  if (!us10yPending) {
+    us10yPending = fetchTvQuote('US10Y', 'TVC:US10Y')
+      .then((q) => {
+        if (q && Number(q.price) > 0) us10yQuoteCache = { exp: Date.now() + 25_000, quote: q };
+        return us10yQuoteCache.quote;
+      })
+      .catch(() => us10yQuoteCache.quote)
+      .finally(() => {
+        us10yPending = null;
+      });
+  }
+  return us10yQuoteCache.quote && !force ? us10yQuoteCache.quote : us10yPending;
+}
+
+function normalizeCalendarImpact(title: string, base: 'high' | 'medium' | 'low'): 'high' | 'medium' | 'low' {
+  if (base === 'high') return 'high';
+  if (/\b(fomc statement|interest rate|rate decision|fed chair|powell|warsh|non.?farm|nfp|cpi\b|pce\b)\b/i.test(title)) return 'high';
+  if (/\b(fomc|fed |ecb|boe|boj|rbnz|rba|boc)\b.*\b(speaks?|speech|minutes|testimony|press conference)\b|\b(gdp|retail sales|jobless|unemployment|employment|pmi)\b/i.test(title)) return 'medium';
+  return base;
+}
+
+const EXNESS_COUNTRY_TO_CURRENCY: Record<string, string> = {
+  US: 'USD', GB: 'GBP', UK: 'GBP', EU: 'EUR', EA: 'EUR', DE: 'EUR', FR: 'EUR', IT: 'EUR', ES: 'EUR',
+  NL: 'EUR', BE: 'EUR', AT: 'EUR', PT: 'EUR', IE: 'EUR', FI: 'EUR', GR: 'EUR', JP: 'JPY', CN: 'CNY',
+  AU: 'AUD', NZ: 'NZD', CA: 'CAD', CH: 'CHF', IN: 'INR', BR: 'BRL', ZA: 'ZAR', MX: 'MXN', RU: 'RUB',
+  SG: 'SGD', HK: 'HKD', KR: 'KRW', TR: 'TRY', NO: 'NOK', SE: 'SEK', DK: 'DKK', PL: 'PLN', CZ: 'CZK',
+  HU: 'HUF', CL: 'CLP', CO: 'COP', SA: 'SAR',
+};
+
+function fmtCalNum(raw: unknown, unit?: unknown): string {
+  if (raw === null || raw === undefined) return '';
+  const s = String(raw).trim();
+  if (!s || s === 'null' || s === 'undefined') return '';
+  const u = unit != null && unit !== 'null' ? String(unit).trim() : '';
+  if (u && !s.endsWith(u) && !/[%kmbKtT]$/.test(s)) return s + u;
+  return s;
+}
+
+async function fetchCalendarProvidersOnly(nowSec: number): Promise<Array<{
+  title: string;
+  currency: string;
+  ts: number;
+  impact: 'high' | 'medium' | 'low';
+  forecast: string;
+  previous: string;
+  actual: string;
+  source: string;
+}>> {
+  const collected: Array<{
+    title: string;
+    currency: string;
+    ts: number;
+    impact: 'high' | 'medium' | 'low';
+    forecast: string;
+    previous: string;
+    actual: string;
+    source: string;
+  }> = [];
+
+  const startIso = new Date((nowSec - 6 * 3600) * 1000).toISOString();
+  const endIso = new Date((nowSec + 48 * 3600) * 1000).toISOString();
+
+  await Promise.allSettled([
+    // 1. Exness Public Economic Calendar (returns array across pages with actual/forecast/previous & unit)
+    (async () => {
+      try {
+        let count = 0;
+        for (let page = 1; page <= 4; page++) {
+          const url = `https://pwapi.ex2b.com/api/v1/calendar/events/?start=${encodeURIComponent(startIso)}&end=${encodeURIComponent(endIso)}&lang=en&page=${page}`;
+          const res = await fetch(url, {
+            headers: {
+              'User-Agent': UA,
+              'Accept': 'application/json, text/plain, */*',
+              'Origin': 'https://www.exness.com',
+              'Referer': 'https://www.exness.com/',
+            },
+            signal: AbortSignal.timeout(7000),
+          });
+          if (!res.ok) break;
+          const payload: any = await res.json();
+          const rows = Array.isArray(payload) ? payload : Array.isArray(payload?.result) ? payload.result : Array.isArray(payload?.data) ? payload.data : [];
+          for (const r of rows) {
+            if (!r || r.isDayLongEvent) continue;
+            const title = String(r.title || r.name || '').replace(/([a-z])Speech\b/g, '$1 Speech').trim();
+            const parsedTime = typeof r.time === 'string' ? Math.floor(Date.parse(r.time) / 1000) : NaN;
+            const tsRaw = Number.isFinite(parsedTime) && parsedTime > 0 ? parsedTime : Number(r.timestamp || r.date || 0);
+            const ts = tsRaw > 1e11 ? Math.floor(tsRaw / 1000) : Math.floor(tsRaw);
+            if (!title || !Number.isFinite(ts) || ts <= 0) continue;
+            const impRaw = String(r.impact || r.importance || 'low').toLowerCase();
+            const baseImp: 'high' | 'medium' | 'low' =
+              impRaw === 'high' || Number(impRaw) >= 3 ? 'high' : impRaw === 'medium' || Number(impRaw) === 2 ? 'medium' : 'low';
+            const impact = normalizeCalendarImpact(title, baseImp);
+            const country = String(r.country || '').toUpperCase();
+            const curRaw = String(r.currency || '').toUpperCase();
+            const currency = EXNESS_COUNTRY_TO_CURRENCY[country] || (/^[A-Z]{3}$/.test(curRaw) ? curRaw : country || 'USD');
+            collected.push({
+              title,
+              currency,
+              ts,
+              impact,
+              forecast: fmtCalNum(r.forecast, r.unit),
+              previous: fmtCalNum(r.previous, r.unit),
+              actual: fmtCalNum(r.actual, r.unit),
+              source: 'exness',
+            });
+            count++;
+          }
+          if (rows.length < 50) break;
+        }
+        if (count > 0) {
+          state.source_status['exness'] = { state: 'ok', count: Math.max(count, state.sources['exness'] || 0), updated_ts: nowSec };
+        }
+      } catch {}
+    })(),
+    // 2. TradingView Economic Calendar API (fast real-time actual/forecast/previous across major economies)
+    (async () => {
+      try {
+        const url = `https://economic-calendar.tradingview.com/events?from=${encodeURIComponent(startIso)}&to=${encodeURIComponent(endIso)}&countries=US,EU,GB,JP,CA,AU,NZ,CH,CN`;
+        const res = await fetch(url, {
+          headers: {
+            'User-Agent': UA,
+            'Accept': 'application/json',
+            'Origin': 'https://www.tradingview.com',
+            'Referer': 'https://www.tradingview.com/',
+          },
+          signal: AbortSignal.timeout(7000),
+        });
+        if (!res.ok) return;
+        const body: any = await res.json();
+        const rows = Array.isArray(body?.result) ? body.result : Array.isArray(body) ? body : [];
+        let count = 0;
+        for (const r of rows) {
+          const title = String(r?.title || r?.indicator || '').trim();
+          const ts = Math.floor(Date.parse(String(r?.date || '')) / 1000);
+          if (!title || !Number.isFinite(ts) || ts <= 0) continue;
+          const impNum = Number(r?.importance ?? 0);
+          const baseImp: 'high' | 'medium' | 'low' = impNum >= 1 ? 'high' : impNum === 0 ? 'medium' : 'low';
+          const impact = normalizeCalendarImpact(title, baseImp);
+          const country = String(r?.country || '').toUpperCase();
+          const curRaw = String(r?.currency || '').toUpperCase();
+          const currency = /^[A-Z]{3}$/.test(curRaw) ? curRaw : EXNESS_COUNTRY_TO_CURRENCY[country] || 'USD';
+          const unit = r?.unit;
+          collected.push({
+            title,
+            currency,
+            ts,
+            impact,
+            forecast: fmtCalNum(r?.forecast ?? r?.forecastRaw, unit),
+            previous: fmtCalNum(r?.previous ?? r?.previousRaw, unit),
+            actual: fmtCalNum(r?.actual ?? r?.actualRaw, unit),
+            source: 'tradingview',
+          });
+          count++;
+        }
+        if (count > 0) {
+          state.source_status['tradingview'] = { state: 'ok', count: Math.max(count, state.sources['tradingview'] || 0), updated_ts: nowSec };
+        }
+      } catch {}
+    })(),
+    // 3. ForexFactory Calendar API
+    (async () => {
+      try {
+        const res = await fetch('https://nfs.faireconomy.media/ff_calendar_thisweek.json', {
+          headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(7000),
+        });
+        if (!res.ok) return;
+        const rows: any = await res.json();
+        if (!Array.isArray(rows)) return;
+        let count = 0;
+        for (const r of rows) {
+          const title = String(r.title || '').trim();
+          const ts = Math.floor(Date.parse(String(r.date || '')) / 1000);
+          if (!title || !Number.isFinite(ts) || ts <= 0) continue;
+          const currency = String(r.country || 'USD').toUpperCase();
+          const impRaw = String(r.impact || 'Low').toLowerCase();
+          const impact = normalizeCalendarImpact(title, impRaw.includes('high') ? 'high' : impRaw.includes('med') ? 'medium' : 'low');
+          collected.push({
+            title,
+            currency,
+            ts,
+            impact,
+            forecast: fmtCalNum(r.forecast),
+            previous: fmtCalNum(r.previous),
+            actual: fmtCalNum(r.actual),
+            source: 'forex-factory',
+          });
+          count++;
+        }
+        if (count > 0) {
+          state.source_status['forex-factory'] = { state: 'ok', count: Math.max(count, state.sources['forex-factory'] || 0), updated_ts: nowSec };
+        }
+      } catch {}
+    })(),
+  ]);
+  return collected;
+}
+
+function canonicalCalTitle(raw: string): string {
+  return String(raw || '')
+    .toLowerCase()
+    .replace(/\bcore retail sales\b/g, 'retail sales ex autos')
+    .replace(/\bcapacity utilization rate\b/g, 'capacity utilization')
+    .replace(/\bexport prices\b/g, 'export price index')
+    .replace(/\bimport prices\b/g, 'import price index')
+    .replace(/\bm\/m\b/g, 'mom')
+    .replace(/\bq\/q\b/g, 'qoq')
+    .replace(/\by\/y\b/g, 'yoy')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function mergeCalendarEntries(
+  merged: Map<string, any>,
+  entries: Array<{
+    title: string;
+    currency: string;
+    ts: number;
+    impact: 'high' | 'medium' | 'low';
+    forecast: string;
+    previous: string;
+    actual: string;
+    source: string;
+  }>,
+): boolean {
+  const byCanon = new Map<string, string>();
+  for (const [k, ev] of merged.entries()) {
+    if (ev && ev.kind !== 'headline' && ev.ts && ev.currency) {
+      byCanon.set(`${canonicalCalTitle(ev.title || '')}|${ev.ts}|${ev.currency}`, k);
+    }
+  }
+  const IMP_RANK: Record<string, number> = { low: 1, medium: 2, high: 3 };
+  let changed = false;
+  for (const entry of entries) {
+    const exactKey = `${entry.title}|${entry.ts}|${entry.currency}`;
+    const canonKey = `${canonicalCalTitle(entry.title)}|${entry.ts}|${entry.currency}`;
+    const existingKey = merged.has(exactKey) ? exactKey : byCanon.get(canonKey);
+    const prev = existingKey ? merged.get(existingKey) : null;
+    if (!prev) {
+      changed = true;
+      byCanon.set(canonKey, exactKey);
+      merged.set(exactKey, {
+        title: entry.title,
+        country: entry.currency,
+        currency: entry.currency,
+        ts: entry.ts,
+        date: new Date(entry.ts * 1000).toISOString(),
+        impact: entry.impact,
+        kind: 'event',
+        forecast: entry.forecast,
+        previous: entry.previous,
+        actual: entry.actual,
+        source: entry.source,
+        sources: [entry.source],
+      });
+      continue;
+    }
+    const key = existingKey!;
+    const nextActual = entry.actual || prev.actual || '';
+    const nextForecast = entry.forecast || prev.forecast || '';
+    const nextPrevious = entry.previous || prev.previous || '';
+    const bestImpact = (IMP_RANK[entry.impact] || 1) >= (IMP_RANK[String(prev.impact || 'low')] || 1) ? entry.impact : prev.impact;
+    if (nextActual !== (prev.actual || '') || nextForecast !== (prev.forecast || '') || bestImpact !== prev.impact) {
+      changed = true;
+    }
+    const sources = Array.from(new Set([...(Array.isArray(prev.sources) ? prev.sources : [prev.source]).filter(Boolean), entry.source]));
+    merged.set(key, {
+      ...prev,
+      impact: bestImpact,
+      forecast: nextForecast,
+      previous: nextPrevious,
+      actual: nextActual,
+      sources,
+    });
+  }
+  return changed;
+}
+
+export async function refreshCalendarActualsFast(force = false): Promise<boolean> {
+  loadNewsCache();
+  const now = Date.now();
+  const nowSec = Math.floor(now / 1000);
+  if (calendarFastFetching || fetching || (!force && now - lastCalendarFastFetchAt < 12_000)) return false;
+  calendarFastFetching = true;
+  lastCalendarFastFetchAt = now;
+  try {
+    const entries = await fetchCalendarProvidersOnly(nowSec);
+    if (!entries.length) return false;
+    const merged = new Map<string, any>();
+    for (const ev of state.events) {
+      merged.set(`${ev.title || ''}|${ev.ts || 0}|${ev.currency || ''}`, ev);
+    }
+    const changed = mergeCalendarEntries(merged, entries);
+    if (changed) {
+      state.events = Array.from(merged.values()).sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+      state.updated_ts = nowSec;
+      stateVersion++;
+    }
+    return changed;
+  } finally {
+    calendarFastFetching = false;
+  }
+}
+
+const PROVIDER_KEYS = ['exness', 'forex-factory', 'tradingview', 'binance', 'investing', 'google-news', 'fxstreet', 'coindesk', 'cnbc'];
 
 export function loadNewsCache(): void {
   if (cacheLoaded) return;
@@ -110,12 +456,16 @@ export async function refreshLiveNews(force = false): Promise<number> {
   loadNewsCache();
   newsStarted = true;
   const now = Date.now();
-  if (fetching || (!force && now - lastFetchAt < 180_000 && state.events.length > 0)) {
+  const nowSec = Math.floor(now / 1000);
+  if (fetching) return state.events.length;
+  if (!force && now - lastFetchAt < 180_000 && state.events.length > 0) {
+    if (hasActiveReleaseWindow(nowSec) && now - lastCalendarFastFetchAt >= 12_000) {
+      await refreshCalendarActualsFast(false);
+    }
     return state.events.length;
   }
   fetching = true;
   lastFetchAt = now;
-  const nowSec = Math.floor(now / 1000);
   const merged = new Map<string, any>();
 
   for (const ev of state.events) {
@@ -123,128 +473,10 @@ export async function refreshLiveNews(force = false): Promise<number> {
     merged.set(key, ev);
   }
 
-  function normalizeCalendarImpact(title: string, base: 'high' | 'medium' | 'low'): 'high' | 'medium' | 'low' {
-    if (base === 'high') return 'high';
-    if (/\b(fomc statement|interest rate|rate decision|fed chair|powell|warsh|non.?farm|nfp|cpi\b|pce\b)\b/i.test(title)) return 'high';
-    if (/\b(fomc|fed |ecb|boe|boj|rbnz|rba|boc)\b.*\b(speaks?|speech|minutes|testimony|press conference)\b/i.test(title)) return 'medium';
-    return base;
-  }
-
-  const IMP_RANK: Record<string, number> = { low: 1, medium: 2, high: 3 };
-  function upsertCalendarEvent(entry: {
-    title: string;
-    currency: string;
-    ts: number;
-    impact: 'high' | 'medium' | 'low';
-    forecast: string;
-    previous: string;
-    actual: string;
-    source: string;
-  }): void {
-    const key = `${entry.title}|${entry.ts}|${entry.currency}`;
-    const prev = merged.get(key);
-    if (!prev) {
-      merged.set(key, {
-        title: entry.title,
-        country: entry.currency,
-        currency: entry.currency,
-        ts: entry.ts,
-        date: new Date(entry.ts * 1000).toISOString(),
-        impact: entry.impact,
-        kind: 'event',
-        forecast: entry.forecast,
-        previous: entry.previous,
-        actual: entry.actual,
-        source: entry.source,
-        sources: [entry.source],
-      });
-      return;
-    }
-    const sources = Array.from(new Set([...(Array.isArray(prev.sources) ? prev.sources : [prev.source]).filter(Boolean), entry.source]));
-    const bestImpact = (IMP_RANK[entry.impact] || 1) >= (IMP_RANK[String(prev.impact || 'low')] || 1) ? entry.impact : prev.impact;
-    merged.set(key, {
-      ...prev,
-      impact: bestImpact,
-      forecast: entry.forecast || prev.forecast || '',
-      previous: entry.previous || prev.previous || '',
-      actual: entry.actual || prev.actual || '',
-      sources,
-    });
-  }
-
-  // 1. Exness Calendar API
-  try {
-    const url = `https://pwapi.ex2b.com/api/v1/calendar/events/?date_from=${(nowSec - 6 * 3600) * 1000}&date_to=${(nowSec + 7 * 86400) * 1000}&limit=500`;
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': UA,
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': 'https://www.exness.com',
-        'Referer': 'https://www.exness.com/',
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.ok) {
-      const payload: any = await res.json();
-      const rows = Array.isArray(payload?.result) ? payload.result : Array.isArray(payload?.data) ? payload.data : [];
-      let count = 0;
-      for (const r of rows) {
-        const title = String(r.name || r.title || '').trim();
-        const tsRaw = Number(r.timestamp || r.date || r.time || 0);
-        const ts = tsRaw > 1e11 ? Math.floor(tsRaw / 1000) : Math.floor(tsRaw);
-        if (!title || ts <= 0) continue;
-        const impNum = Number(r.importance || r.impact || 1);
-        const impact = normalizeCalendarImpact(title, impNum >= 3 ? 'high' : impNum === 2 ? 'medium' : 'low');
-        const currency = String(r.currency || r.country || 'USD').toUpperCase();
-        upsertCalendarEvent({
-          title,
-          currency,
-          ts,
-          impact,
-          forecast: String(r.forecast ?? ''),
-          previous: String(r.previous ?? ''),
-          actual: String(r.actual ?? ''),
-          source: 'exness',
-        });
-        count++;
-      }
-      state.source_status['exness'] = { state: 'ok', count: Math.max(count, state.sources['exness'] || 0), updated_ts: nowSec };
-    }
-  } catch {}
-
-  // 2. ForexFactory Calendar API
-  try {
-    const res = await fetch('https://nfs.faireconomy.media/ff_calendar_thisweek.json', {
-      headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.ok) {
-      const rows: any = await res.json();
-      if (Array.isArray(rows)) {
-        let count = 0;
-        for (const r of rows) {
-          const title = String(r.title || '').trim();
-          const ts = Math.floor(Date.parse(String(r.date || '')) / 1000);
-          if (!title || !Number.isFinite(ts) || ts <= 0) continue;
-          const currency = String(r.country || 'USD').toUpperCase();
-          const impRaw = String(r.impact || 'Low').toLowerCase();
-          const impact = normalizeCalendarImpact(title, impRaw.includes('high') ? 'high' : impRaw.includes('med') ? 'medium' : 'low');
-          upsertCalendarEvent({
-            title,
-            currency,
-            ts,
-            impact,
-            forecast: String(r.forecast ?? ''),
-            previous: String(r.previous ?? ''),
-            actual: String(r.actual ?? ''),
-            source: 'forex-factory',
-          });
-          count++;
-        }
-        state.source_status['forex-factory'] = { state: 'ok', count: Math.max(count, state.sources['forex-factory'] || 0), updated_ts: nowSec };
-      }
-    }
-  } catch {}
+  // 1, 2 & 3. Exness + TradingView + ForexFactory Calendar APIs
+  const calEntries = await fetchCalendarProvidersOnly(nowSec);
+  mergeCalendarEntries(merged, calEntries);
+  lastCalendarFastFetchAt = Date.now();
 
   // 3. Public Live RSS & Crypto News Headlines
   function inferHeadlineCurrency(text: string, fallback: string): { currency: string; impact: 'high' | 'medium' | 'low' } {
@@ -422,10 +654,23 @@ function buildSourcesArray(nowSec: number) {
   });
 }
 
+export async function maybeRefreshReleasesOnDemand(): Promise<void> {
+  ensureNewsStarted();
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (hasActiveReleaseWindow(nowSec) && Date.now() - lastCalendarFastFetchAt >= 12_000) {
+    await refreshCalendarActualsFast(false);
+  }
+}
+
 export function getNewsReadingPayload(symbol = 'XAUUSDm', metaOnly = false) {
   ensureNewsStarted();
   const nowSec = Math.floor(Date.now() / 1000);
-  void refreshLiveNews(false);
+  if (hasActiveReleaseWindow(nowSec) && Date.now() - lastCalendarFastFetchAt >= 12_000) {
+    void refreshCalendarActualsFast(false);
+  } else {
+    void refreshLiveNews(false);
+  }
+  void getDxyM5Bars(false);
   const sourcesArray = buildSourcesArray(nowSec);
   const { nonHolidayCount } = getProviderCounts();
   const sig = getNewsSignature();
@@ -438,6 +683,7 @@ export function getNewsReadingPayload(symbol = 'XAUUSDm', metaOnly = false) {
       updated_ts: state.updated_ts || nowSec,
       news_total: nonHolidayCount,
       events: [],
+      dxy_bars_m5: dxyBarsCache.bars,
       sources: sourcesArray,
       source_status: state.source_status,
     };
@@ -482,6 +728,7 @@ export function getNewsReadingPayload(symbol = 'XAUUSDm', metaOnly = false) {
     updated_ts: state.updated_ts || nowSec,
     news_total: cachedNonHoliday.length,
     events: cachedNonHoliday,
+    dxy_bars_m5: dxyBarsCache.bars,
     sources: sourcesArray,
     source_status: state.source_status,
   };
@@ -570,6 +817,28 @@ function buildInternetQueries(meta: ReturnType<typeof getSymbolMeta>, topics: st
   return { primary, yahoo, catalyst };
 }
 
+const ARTICLE_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'into', 'over', 'amid', 'after', 'before',
+  'says', 'said', 'will', 'could', 'would', 'ahead', 'today', 'market', 'markets', 'price', 'prices',
+  'news', 'update', 'report', 'reports', 'live', 'what', 'why', 'how', 'are', 'was', 'were',
+]);
+
+function titleTokens(title: string): string[] {
+  return String(title || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !ARTICLE_STOPWORDS.has(w));
+}
+
+function tokensOverlap(a: string[], b: string[]): number {
+  if (!a.length || !b.length) return 0;
+  const setB = new Set(b);
+  let hits = 0;
+  for (const w of a) if (setB.has(w)) hits++;
+  return hits / Math.max(1, Math.min(a.length, b.length));
+}
+
 export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: string[] = [], force = false) {
   const meta = getSymbolMeta(symbol);
   const cacheKey = `${meta.symbol}|${topics.slice(0, 2).join('|').toLowerCase()}`;
@@ -580,22 +849,40 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
   }
 
   const nowSec = Math.floor(nowMs / 1000);
+  if (hasActiveReleaseWindow(nowSec) && nowMs - lastCalendarFastFetchAt >= 12_000) {
+    await refreshCalendarActualsFast(false).catch(() => false);
+  }
+
   const { primary, yahoo, catalyst } = buildInternetQueries(meta, topics);
   const sourcesChecked: string[] = ['NEWS · NEXT 24H'];
   const articles: AiResearchArticle[] = [];
   const seenTitles = new Set<string>();
+  const keptTokens: Array<{ tokens: string[]; idx: number; engines: Set<string> }> = [];
 
   function pushArticle(rawTitle: string, engine: string, rawTs: number, url: string, desc = '', weightBoost = 1) {
     const { cleanTitle, publisher } = extractPublisher(rawTitle, engine);
     const key = cleanTitle.toLowerCase().replace(/\s+/g, ' ');
     if (!cleanTitle || seenTitles.has(key) || isMacroNoiseHeadline(cleanTitle)) return;
     seenTitles.add(key);
+
+    const tokens = titleTokens(cleanTitle);
+    for (const prev of keptTokens) {
+      if (tokensOverlap(tokens, prev.tokens) >= 0.6) {
+        if (!prev.engines.has(engine) && prev.engines.size < 3) {
+          prev.engines.add(engine);
+          articles[prev.idx].weight = Number(Math.min(2.4, articles[prev.idx].weight * 1.12).toFixed(3));
+        }
+        return;
+      }
+    }
+
     const ts = rawTs > 0 ? rawTs : nowSec;
     if (nowSec - ts > 86400 * 2) return;
     const scored = scoreInternetText(`${cleanTitle} ${desc}`, meta);
     // Crisp 2-hour recency decay so breaking headlines outrank 18h-old morning recaps
     const ageSec = Math.max(0, nowSec - ts);
     const recency = Math.max(0.18, Math.exp(-ageSec / 7200) * 1.45);
+    const idx = articles.length;
     articles.push({
       title: cleanTitle,
       source: publisher,
@@ -606,6 +893,7 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
       strength: scored.strength,
       weight: Number((recency * weightBoost * (scored.strength > 0 ? scored.strength / 100 : 0.25)).toFixed(3)),
     });
+    keptTokens.push({ tokens, idx, engines: new Set([engine]) });
   }
 
   async function fetchRssSearch(url: string, engineLabel: string, boost: number) {
@@ -649,8 +937,9 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
     fetchYahooSearch(),
     fetchTvQuote('DXY', 'TVC:DXY').catch(() => null),
     fetchFearAndGreed().catch(() => null),
-    fetchTvCandles(meta.symbol, '5m', 24).catch(() => null),
-    fetchTvCandles('DXY', '5m', 24, 'TVC:DXY').catch(() => null),
+    fetchTvCandles(meta.symbol, '5m', 48).catch(() => null),
+    fetchTvCandles('DXY', '5m', 48, 'TVC:DXY').catch(() => null),
+    getUs10yQuote(false).catch(() => null),
   ];
   if (catalyst) {
     tasks.push(fetchRssSearch(`https://news.google.com/rss/search?q=${encodeURIComponent(catalyst + ' when:1d')}&hl=en-US&gl=US&ceid=US:en`, 'Google Web Catalyst', 1.4));
@@ -661,6 +950,7 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
   const cryptoFg = settled[4]?.status === 'fulfilled' ? settled[4].value : null;
   const symCandles = settled[5]?.status === 'fulfilled' ? settled[5].value : null;
   const dxyCandles = settled[6]?.status === 'fulfilled' ? settled[6].value : null;
+  const us10yQuote = settled[7]?.status === 'fulfilled' ? settled[7].value : null;
 
   // Supplement with fresh breaking macro headlines already ingested from live wire (FXStreet/CNBC/Investing)
   const breakingWire = state.events
@@ -676,7 +966,7 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
 
   const watches = getLiveMarketWatches(false);
   const symWatch = watches.find(w => w.symbol === meta.symbol);
-  if (dxyQuote || symCandles || symWatch) sourcesChecked.push('TradingView Macro');
+  if (dxyQuote || symCandles || symWatch || us10yQuote) sourcesChecked.push('TradingView Macro');
 
   const symKey = meta.symbol.toUpperCase().replace(/M$/, '');
   const usdBase = /^(USDJPY|USDCAD|USDCHF|DXY)/.test(symKey);
@@ -684,6 +974,7 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
   // Measure TRUE intraday M5 price & DXY reaction (last 15m/60m) rather than yesterday's daily open
   const symBars: number[][] = Array.isArray(symCandles?.bars) ? symCandles.bars : [];
   const dxyBars: number[][] = Array.isArray(dxyCandles?.bars) ? dxyCandles.bars : [];
+  if (dxyBars.length) dxyBarsCache = { exp: Date.now() + 20_000, bars: dxyBars.slice(-36) };
   const symRx = computePostEventReaction(symBars, nowSec - 900, nowSec);
   const dxyRx = computePostEventReaction(dxyBars, nowSec - 3600, nowSec);
 
@@ -702,6 +993,77 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
   if (Math.abs(effectiveDxyMove) >= 0.035 || dxyAtrStrong) {
     const dirNum = dxyAtrStrong ? dxyRx.evMoveAtr : effectiveDxyMove;
     dxyImpact = dirNum < 0 ? (usdBase ? 'SELL' : 'BUY') : (usdBase ? 'BUY' : 'SELL');
+  }
+
+  // US10Y Treasury Yield correlation for Gold, Equities & USD pairs
+  const us10yPrice = Number(us10yQuote?.price || 0);
+  const us10yPct = Number(us10yQuote?.change_pct ?? us10yQuote?.change ?? 0);
+  let yieldSide: 'BUY' | 'SELL' | 'NEUTRAL' = 'NEUTRAL';
+  let yieldW = 0;
+  if (us10yPrice > 0 && Math.abs(us10yPct) >= 0.35 && (/^(XAU|XAG|USTEC|US500|US30|USDJPY)/.test(symKey) || newsCurrencySign(meta.symbol, 'USD') !== 0)) {
+    const yieldUpBullishForSym = /^(USDJPY|USDCAD|USDCHF)/.test(symKey);
+    yieldSide = us10yPct > 0 ? (yieldUpBullishForSym ? 'BUY' : 'SELL') : (yieldUpBullishForSym ? 'SELL' : 'BUY');
+    yieldW = Math.min(1.1, Math.abs(us10yPct) * 0.45);
+  }
+
+  // Evaluate active & imminent calendar events with actual surprise + stop-hunt guard
+  const localHeadlines = state.events
+    .filter((ev) => ev.kind === 'headline' && nowSec - Number(ev.ts || 0) <= 86400)
+    .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+  const impScoreRank: Record<string, number> = { high: 3, medium: 2, low: 1 };
+  const nearbyCalEvents = state.events
+    .filter((ev) => {
+      if (ev.kind === 'headline' || ev.impact === 'holiday') return false;
+      const ts = Number(ev.ts || 0);
+      return ts >= nowSec - 3600 && ts <= nowSec + 14400 && newsCurrencySign(meta.symbol, ev.currency || ev.country || '') !== 0;
+    })
+    .sort((a, b) => {
+      const aAct = Number(a.ts || 0) <= nowSec && Boolean(String(a.actual || '').trim()) ? 1 : 0;
+      const bAct = Number(b.ts || 0) <= nowSec && Boolean(String(b.actual || '').trim()) ? 1 : 0;
+      if (bAct !== aAct) return bAct - aAct;
+      const aImp = impScoreRank[String(a.impact || 'low')] || 1;
+      const bImp = impScoreRank[String(b.impact || 'low')] || 1;
+      if (bImp !== aImp) return bImp - aImp;
+      return Math.abs(Number(a.ts) - nowSec) - Math.abs(Number(b.ts) - nowSec);
+    });
+
+  let calBuyScore = 0;
+  let calSellScore = 0;
+  let releaseAlert: any = null;
+  for (const ev of nearbyCalEvents.slice(0, 12)) {
+    const est = estimateNewsDirection({
+      event: ev,
+      symbol: meta.symbol,
+      now: nowSec,
+      headlines: localHeadlines,
+      headlinesPreSorted: true,
+      barsM5: symBars,
+      dxyBarsM5: dxyBars,
+    });
+    if (!est) continue;
+    const evTs = Number(ev.ts || 0);
+    const dt = evTs - nowSec;
+    const imp = String(ev.impact || 'low').toLowerCase();
+    const impW = imp === 'high' ? 1.5 : imp === 'medium' ? 1.0 : 0.45;
+    const proxW = dt <= 0 && est.hasActual ? 2.4 : dt <= 0 ? 1.7 : dt <= 1800 ? 1.5 : dt <= 7200 ? 0.9 : 0.45;
+    const w = impW * proxW * (est.strength / 100);
+    if (!releaseAlert && (imp === 'high' || (imp === 'medium' && Math.abs(dt) <= 1800))) {
+      releaseAlert = {
+        title: String(ev.title || ''),
+        currency: String(ev.currency || ''),
+        impact: imp,
+        ts: evTs,
+        side: est.side,
+        basis: est.basis,
+        hasActual: Boolean(est.hasActual),
+        conflict: Boolean(est.conflict),
+        actual: ev.actual || '',
+        forecast: ev.forecast || '',
+        previous: ev.previous || '',
+      };
+    }
+    if (est.side === 'BUY') calBuyScore += w;
+    else if (est.side === 'SELL') calSellScore += w;
   }
 
   let webBuyScore = 0;
@@ -723,49 +1085,75 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
     }
   }
 
-  if (dxyImpact === 'BUY') webBuyScore += dxyBars.length >= 4 ? Math.min(1.6, 0.8 + Math.abs(dxy60mPct) * 4) : 1.1;
-  else if (dxyImpact === 'SELL') webSellScore += dxyBars.length >= 4 ? Math.min(1.6, 0.8 + Math.abs(dxy60mPct) * 4) : 1.1;
+  const dxyW = dxyImpact === 'NEUTRAL' ? 0 : dxyBars.length >= 4 ? Math.min(1.65, 0.8 + Math.abs(dxy60mPct) * 4) : 1.1;
+  let macroBuy = dxyImpact === 'BUY' ? dxyW : 0;
+  let macroSell = dxyImpact === 'SELL' ? dxyW : 0;
+  if (yieldSide === 'BUY') macroBuy += yieldW;
+  else if (yieldSide === 'SELL') macroSell += yieldW;
 
-  // Intraday M5 price impulse contributes cleanly (replacing stale 24h daily buyer_pct bias)
   const symImpulseAtr = symRx.ready ? Number(symRx.evMoveAtr.toFixed(2)) : 0;
   const symTrendM5: 'UP' | 'DOWN' | 'FLAT' = symRx.ready ? symRx.direction : 'FLAT';
-  if (symRx.ready && Math.abs(symImpulseAtr) >= 0.45) {
-    const pxW = Math.min(2.2, Math.abs(symImpulseAtr) * 0.95);
-    if (symImpulseAtr > 0) webBuyScore += pxW;
-    else webSellScore += pxW;
-  }
+  const structBuy = symRx.ready && symImpulseAtr >= 0.45 ? Math.min(2.1, symImpulseAtr * 0.95) : 0;
+  const structSell = symRx.ready && symImpulseAtr <= -0.45 ? Math.min(2.1, Math.abs(symImpulseAtr) * 0.95) : 0;
 
+  let totalBuy = calBuyScore + webBuyScore + macroBuy + structBuy;
+  let totalSell = calSellScore + webSellScore + macroSell + structSell;
   if (cryptoFg) {
-    if (cryptoFg.value >= 58) webBuyScore += 0.8;
-    else if (cryptoFg.value <= 38) webSellScore += 0.8;
+    if (cryptoFg.value >= 58) totalBuy += 0.8;
+    else if (cryptoFg.value <= 38) totalSell += 0.8;
   }
 
-  const newsNet = webBuyScore - webSellScore;
-  const textBuyOnly = Math.max(0, webBuyScore - (symImpulseAtr > 0.45 ? Math.min(2.2, symImpulseAtr * 0.95) : 0));
-  const textSellOnly = Math.max(0, webSellScore - (symImpulseAtr < -0.45 ? Math.min(2.2, Math.abs(symImpulseAtr) * 0.95) : 0));
-  const textSide: 'BUY' | 'SELL' | 'NEUTRAL' = textBuyOnly > textSellOnly + 0.15 ? 'BUY' : textSellOnly > textBuyOnly + 0.15 ? 'SELL' : 'NEUTRAL';
-  const conflict =
-    symRx.ready &&
-    Math.abs(symImpulseAtr) >= 0.65 &&
-    textSide !== 'NEUTRAL' &&
-    ((symImpulseAtr > 0 && textSide === 'SELL') || (symImpulseAtr < 0 && textSide === 'BUY'));
+  const calNet = calBuyScore - calSellScore;
+  const calSide: 'BUY' | 'SELL' | 'NEUTRAL' = calNet > 0.35 ? 'BUY' : calNet < -0.35 ? 'SELL' : 'NEUTRAL';
+  const webNet = webBuyScore - webSellScore;
+  const webTextSide: 'BUY' | 'SELL' | 'NEUTRAL' = webNet > 0.25 ? 'BUY' : webNet < -0.25 ? 'SELL' : 'NEUTRAL';
+  const macroNet = macroBuy - macroSell;
+  const macroSide: 'BUY' | 'SELL' | 'NEUTRAL' = macroNet > 0.35 ? 'BUY' : macroNet < -0.35 ? 'SELL' : 'NEUTRAL';
+  const structSide: 'BUY' | 'SELL' | 'NEUTRAL' = structBuy > 0.35 ? 'BUY' : structSell > 0.35 ? 'SELL' : 'NEUTRAL';
 
-  const totalScore = webBuyScore + webSellScore;
-  const hasRealSignal = buyHits + sellHits > 0 || Math.abs(symImpulseAtr) >= 0.65 || Math.abs(effectiveDxyMove) >= 0.12;
-  let webSide: 'BUY' | 'SELL' | 'NEUTRAL' = !hasRealSignal || totalScore <= 0.15 ? 'NEUTRAL' : newsNet > 0 ? 'BUY' : newsNet < 0 ? 'SELL' : 'NEUTRAL';
+  // Live hasActual high/medium release override: don't let stale pre-release web articles suppress verified actual data
+  if (releaseAlert?.hasActual && releaseAlert.side && releaseAlert.side !== 'WAIT' && !releaseAlert.conflict) {
+    if (releaseAlert.side === 'BUY') totalBuy += 2.2;
+    else if (releaseAlert.side === 'SELL') totalSell += 2.2;
+  }
+
+  const newsNet = totalBuy - totalSell;
+  const totalScore = totalBuy + totalSell;
+  const conflict =
+    Boolean(releaseAlert?.conflict) ||
+    (symRx.ready &&
+      Math.abs(symImpulseAtr) >= 0.65 &&
+      webTextSide !== 'NEUTRAL' &&
+      ((symImpulseAtr > 0 && webTextSide === 'SELL') || (symImpulseAtr < 0 && webTextSide === 'BUY')) &&
+      !(releaseAlert?.hasActual && releaseAlert.side === (symImpulseAtr > 0 ? 'BUY' : 'SELL')));
+
+  const hasRealSignal =
+    buyHits + sellHits > 0 ||
+    Math.abs(calNet) >= 0.45 ||
+    Math.abs(symImpulseAtr) >= 0.65 ||
+    Math.abs(effectiveDxyMove) >= 0.12;
+  let webSide: 'BUY' | 'SELL' | 'NEUTRAL' =
+    !hasRealSignal || totalScore <= 0.35 || Math.abs(newsNet) < 0.35
+      ? 'NEUTRAL'
+      : newsNet > 0
+        ? 'BUY'
+        : 'SELL';
   let confidence =
     webSide === 'NEUTRAL'
       ? 0
-      : Math.min(92, Math.max(52, Math.round(48 + (Math.abs(newsNet) / totalScore) * 34 + Math.min(10, (buyHits + sellHits) * 1.5))));
+      : Math.min(94, Math.max(54, Math.round(48 + (Math.abs(newsNet) / Math.max(0.5, totalScore)) * 34 + Math.min(12, (buyHits + sellHits) * 1.4 + (releaseAlert?.hasActual ? 8 : 0)))));
 
-  if (conflict) {
+  if (releaseAlert?.conflict && !releaseAlert?.hasActual) {
+    webSide = 'NEUTRAL';
+    confidence = 32;
+  } else if (conflict && !releaseAlert?.hasActual) {
     const freshTextSameSide = (symImpulseAtr > 0 && freshBuyScore > freshSellScore) || (symImpulseAtr < 0 && freshSellScore > freshBuyScore);
-    if (!freshTextSameSide && Math.abs(symImpulseAtr) >= 0.85 && Math.max(freshBuyScore, freshSellScore) < 2.0) {
+    if (!freshTextSameSide && Math.abs(symImpulseAtr) >= 0.85 && Math.max(freshBuyScore, freshSellScore) < 2.0 && macroSide !== (symImpulseAtr > 0 ? 'SELL' : 'BUY')) {
       webSide = symImpulseAtr > 0 ? 'BUY' : 'SELL';
       confidence = Math.min(68, Math.max(54, Math.round(52 + Math.abs(symImpulseAtr) * 8)));
     } else if (!freshTextSameSide) {
       webSide = 'NEUTRAL';
-      confidence = 35;
+      confidence = 36;
     }
   }
 
@@ -777,6 +1165,13 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
     checked_at: nowSec,
     sources_checked: sourcesChecked,
     internet_articles: articles.slice(0, 10),
+    release_alert: releaseAlert,
+    factors: {
+      calendar: { side: calSide, net: Number(calNet.toFixed(2)), has_actual: Boolean(releaseAlert?.hasActual) },
+      web: { side: webTextSide, net: Number(webNet.toFixed(2)), buy_hits: buyHits, sell_hits: sellHits },
+      macro: { side: macroSide, net: Number(macroNet.toFixed(2)), dxy_side: dxyImpact, us10y_side: yieldSide },
+      structure: { side: structSide, net: Number((structBuy - structSell).toFixed(2)), sym_atr: symImpulseAtr, trend_m5: symTrendM5 },
+    },
     macro: {
       dxy_price: dxyQuote?.price ?? (dxyBars.length ? dxyBars[dxyBars.length - 1][4] : null),
       dxy_change_pct: Number.isFinite(effectiveDxyMove) ? Number(effectiveDxyMove.toFixed(2)) : 0,
@@ -784,6 +1179,8 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
       dxy_60m_pct: Number.isFinite(dxy60mPct) ? Number(dxy60mPct.toFixed(2)) : 0,
       dxy_impact_for_symbol: dxyImpact,
       dxy_atr_impulse: dxyRx.ready ? Number(dxyRx.evMoveAtr.toFixed(2)) : 0,
+      us10y_price: us10yPrice || null,
+      us10y_change_pct: Number.isFinite(us10yPct) ? Number(us10yPct.toFixed(2)) : 0,
       tv_change_pct: symWatch?.change_pct ?? 0,
       tv_buyer_pct: symWatch?.buyer_pct ?? 50,
       sym_atr_impulse: symImpulseAtr,
@@ -801,7 +1198,8 @@ export async function researchMarketWithInternet(symbol = 'XAUUSDm', topics: str
     },
   };
 
-  aiResearchCache.set(cacheKey, { exp: nowMs + 35_000, data: payload });
+  const cacheTtl = hasActiveReleaseWindow(nowSec) ? 12_000 : 35_000;
+  aiResearchCache.set(cacheKey, { exp: nowMs + cacheTtl, data: payload });
   return payload;
 }
 

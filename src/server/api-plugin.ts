@@ -13,11 +13,20 @@ import {
 } from './tv-feed';
 import {
   buildSessionsPayload,
+  getDxyM5Bars,
   getNewsReadingPayload,
   getNewsSignature,
+  maybeRefreshReleasesOnDemand,
   refreshLiveNews,
   researchMarketWithInternet,
 } from './news-feed';
+import {
+  clearAdminLockCookie,
+  enforceApiLock,
+  isAdminAuthed,
+  isAdminKeyRequired,
+  issueAdminLockCookie,
+} from './api-security';
 
 let sessionMarket = 'XAUUSDm';
 let aiMarket = 'XAUUSDm';
@@ -267,6 +276,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
   const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
   const pathname = urlObj.pathname;
   if (!pathname.startsWith('/api/')) return false;
+  if (!enforceApiLock(req, res, pathname)) return true;
 
   const method = (req.method || 'GET').toUpperCase();
 
@@ -310,19 +320,31 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       servers: {},
       common_servers: [],
       known_servers: [],
-      auth_required: false,
-      authed: true,
+      auth_required: isAdminKeyRequired(),
+      authed: isAdminAuthed(req),
     });
     return true;
   }
 
   if (pathname === '/api/auth') {
-    sendJson(res, 200, { ok: true, auth_required: false, authed: true, ttl_sec: 43200 });
+    sendJson(res, 200, { ok: true, auth_required: isAdminKeyRequired(), authed: isAdminAuthed(req), ttl_sec: 43200 });
     return true;
   }
 
-  if (pathname === '/api/login' || pathname === '/api/logout') {
-    sendJson(res, 200, { ok: true, auth_required: false, authed: pathname === '/api/login', ttl_sec: 43200 });
+  if (pathname === '/api/login') {
+    const body = await readBody(req);
+    const ok = issueAdminLockCookie(req, res, String(body?.password || ''));
+    if (!ok) {
+      sendJson(res, 401, { ok: false, auth_required: true, authed: false, error: 'Invalid access password' });
+      return true;
+    }
+    sendJson(res, 200, { ok: true, auth_required: isAdminKeyRequired(), authed: true, ttl_sec: 43200 });
+    return true;
+  }
+
+  if (pathname === '/api/logout') {
+    clearAdminLockCookie(req, res);
+    sendJson(res, 200, { ok: true, auth_required: isAdminKeyRequired(), authed: false, ttl_sec: 43200 });
     return true;
   }
 
@@ -393,10 +415,18 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     const scan = urlObj.searchParams.get('scan') === '1' || urlObj.searchParams.get('scan') === 'true';
     const have = (urlObj.searchParams.get('have') || '').trim();
     if (scan) await refreshLiveNews(true);
+    else await maybeRefreshReleasesOnDemand();
+    const dxyBarsM5 = await getDxyM5Bars(false);
     const sig = getNewsSignature();
     const omitNews = Boolean(!scan && have && have === sig);
     const payload = getNewsReadingPayload(symbol, omitNews);
-    sendJson(res, 200, omitNews ? { ...payload, news_omitted: true, news_sig: sig } : { ...payload, news_sig: sig });
+    sendJson(
+      res,
+      200,
+      omitNews
+        ? { ...payload, dxy_bars_m5: dxyBarsM5, news_omitted: true, news_sig: sig }
+        : { ...payload, dxy_bars_m5: dxyBarsM5, news_sig: sig },
+    );
     return true;
   }
 

@@ -4895,9 +4895,10 @@ function renderBot5(d) {
   const panelM5Bars = swingStruct && swingStruct.frames && Array.isArray(swingStruct.frames.M5) &&
     window.DashboardPanels.canonical(swingStruct.symbol || panelSymbol) === window.DashboardPanels.canonical(panelSymbol)
     ? swingStruct.frames.M5.slice(-64) : undefined;
+  const dxyM5 = workspace && workspace.getDxyBarsM5 ? workspace.getDxyBarsM5() : undefined;
   const estimateEvent = event => window.NewsDirection && window.NewsDirection.estimate({
     event, symbol: panelSymbol, now: Date.now()/1000, quote: window.SOFT_TV_QUOTE, market: swingState,
-    barsM5: panelM5Bars,
+    barsM5: panelM5Bars, dxyBarsM5: dxyM5 && dxyM5.length >= 4 ? dxyM5 : undefined,
     impact: workspace && workspace.impactFor ? workspace.impactFor(event, panelSymbol) : null,
     headlines: allNewsList.filter(n => n.kind === 'headline') });
   const evEstimate = ev && ((workspace && workspace.directionFor && workspace.directionFor(ev, panelSymbol)) || estimateEvent(ev));
@@ -4990,6 +4991,7 @@ function renderBot5(d) {
           if (window.DashboardPanels.canonical(symbol) === window.DashboardPanels.canonical(panelSymbol) && evEstimate) return evEstimate;
           return window.NewsDirection && window.NewsDirection.estimate({ event, symbol, now,
             market: context.market, quote: context.quote, headlines: context.headlines,
+            dxyBarsM5: dxyM5 && dxyM5.length >= 4 ? dxyM5 : undefined,
             headlinesPreSorted: context.headlinesPreSorted,
             impact: workspace && workspace.impactFor ? workspace.impactFor(event, symbol) : null });
         }, symbol => ({ market: swingState && swingState.fresh &&
@@ -7119,8 +7121,11 @@ function renderFeed(d) {
 
 /* ----------------------------------------------------------------- footer */
 function renderFooter(d) {
-  const src = { public: 'source: public market APIs', none: 'source: waiting for API data' }[d.source] || 'source: idle';
-  setCell($('foot-source'), src);
+  const footSrc = $('foot-source');
+  if (footSrc) {
+    footSrc.textContent = '';
+    footSrc.hidden = true;
+  }
   setCell($('foot-latency'), `engine ${d.engine_latency_ms ?? '—'} ms`);
   setCell($('foot-version'), `${CFG.app || 'SoftradeX'} v${CFG.version || '1.0.0'}`);
   const now = new Date();
