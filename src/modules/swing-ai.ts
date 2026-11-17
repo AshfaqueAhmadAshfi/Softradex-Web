@@ -110,6 +110,8 @@ export function loadModule(): void {
   var directionModels = { BUY: null, SELL: null };
   var lastCompletedSignals = {};
   var savedPlanSignatures = { BUY: '', SELL: '' };
+  var runningSeqCounter = 0;
+  var manualScalePickAt = { BUY: 0, SELL: 0 };
   var BOARDS = [
     { id: 'swing-ai-board', prefix: 'sai-', side: 'SELL' },
     { id: 'buy-swing-ai-board', prefix: 'sbi-', side: 'BUY' }
@@ -891,13 +893,32 @@ export function loadModule(): void {
     if (p.running && Number.isFinite(p.observedEntry)) {
       p.observedRR = Math.abs(p.target - p.observedEntry) / Math.max(1e-9, Math.abs(p.stop - p.observedEntry));
     }
-    // Preserve exact prices across reload even if the watch window elapsed offline.
+    // Preserve exact prices and original start candle across reload even if the watch window elapsed offline.
     if (p.endAt <= now) {
-      p.startAt = nextBarOpen(now);
+      if (!p.running) p.startAt = nextBarOpen(now);
       p.endAt = now + Math.max(MIN_ETA_MIN, Number(p.etaMin) || 30) * 60000;
     }
     p.restored = true;
     return p;
+  }
+
+  function attachScaleSummaries(p, shortP, majorP) {
+    if (!p) return null;
+    p.shortSwing = summaryOf(shortP);
+    p.majorSwing = summaryOf(majorP);
+    return p;
+  }
+
+  function pickLatestRunning(a, b) {
+    var aRun = !!(a && a.running && !a.hit && !a.doneAt);
+    var bRun = !!(b && b.running && !b.hit && !b.doneAt);
+    if (aRun && !bRun) return a;
+    if (bRun && !aRun) return b;
+    if (!aRun && !bRun) return null;
+    var aSeq = Number(a.runningSeq) || 0, bSeq = Number(b.runningSeq) || 0;
+    if (aSeq !== bSeq) return aSeq > bSeq ? a : b;
+    var aStart = Number(a.startAt) || 0, bStart = Number(b.startAt) || 0;
+    return bStart > aStart ? b : a;
   }
 
   function restorePlans() {
@@ -914,7 +935,9 @@ export function loadModule(): void {
           ['SHORT', 'MAJOR'].forEach(function (sc) {
             var sp = saved.scales[sc];
             if (isValidPlanShape(sp, side)) {
+              tvInstrument = saved.tvSymbol;
               lockedScales[side][sc] = hydrateRestoredPlan(sp, now);
+              runningSeqCounter = Math.max(runningSeqCounter, Number(sp.runningSeq) || 0);
             }
           });
         }
@@ -922,7 +945,33 @@ export function loadModule(): void {
         var p = saved.plan;
         if (isValidPlanShape(p, side)) {
           tvInstrument = saved.tvSymbol;
-          plans[side] = hydrateRestoredPlan(p, now);
+          var restored = hydrateRestoredPlan(p, now);
+          runningSeqCounter = Math.max(runningSeqCounter, Number(restored.runningSeq) || 0);
+          if (restored.scale && (restored.scale === 'SHORT' || restored.scale === 'MAJOR')) {
+            var existingScale = lockedScales[side][restored.scale];
+            var restoredTs = Math.max(restored.lastQuoteAt || 0, restored.evaluatedQuoteAt || 0, restored.created || 0);
+            var existingTs = existingScale ? Math.max(existingScale.lastQuoteAt || 0, existingScale.evaluatedQuoteAt || 0, existingScale.created || 0) : 0;
+            if (!existingScale || (restored.running && !existingScale.running) ||
+                (restored.signalId === existingScale.signalId && restoredTs >= existingTs)) {
+              lockedScales[side][restored.scale] = restored;
+            }
+            plans[side] = attachScaleSummaries(lockedScales[side][restored.scale], lockedScales[side].SHORT, lockedScales[side].MAJOR);
+          } else {
+            plans[side] = attachScaleSummaries(restored, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+          }
+        }
+        var latestRun = pickLatestRunning(lockedScales[side].SHORT, lockedScales[side].MAJOR);
+        if (latestRun && (!plans[side] || !plans[side].running || scaleMode[side] === 'AUTO')) {
+          scaleMode[side] = latestRun.scale || scaleMode[side];
+          plans[side] = attachScaleSummaries(latestRun, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+        } else if (!plans[side]) {
+          var pref = scaleMode[side];
+          var fallback = (pref === 'SHORT' || pref === 'MAJOR')
+            ? lockedScales[side][pref]
+            : (lockedScales[side].SHORT || lockedScales[side].MAJOR);
+          if (fallback) {
+            plans[side] = attachScaleSummaries(fallback, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+          }
         }
       } catch (e) {}
     });
@@ -1040,6 +1089,13 @@ export function loadModule(): void {
 
   function ensureScaleLock(side, scaleKey, candidateSetup, now) {
     var existing = lockedScales[side][scaleKey];
+    if (existing && (existing.hit || existing.doneAt)) {
+      if (plans[side] === existing && now - (existing.hitAt || existing.doneAt) <= FAIL_REBUILD_MS) {
+        return existing;
+      }
+      lockedScales[side][scaleKey] = null;
+      existing = null;
+    }
     if (isPlanStructurallyAlive(existing, side, now)) {
       return existing;
     }
@@ -1078,10 +1134,13 @@ export function loadModule(): void {
     result.major = majorLocked;
 
     var chosenScale = scaleMode[side];
+    var latestRun = pickLatestRunning(shortLocked, majorLocked);
     var picked = null;
     if (chosenScale === 'SHORT') picked = shortLocked || majorLocked;
     else if (chosenScale === 'MAJOR') picked = majorLocked || shortLocked;
-    else {
+    else if (latestRun) {
+      picked = latestRun;
+    } else {
       // AUTO: keep existing active locked plan's scale if alive; otherwise let AI pick highest-conviction
       var cur = plans[side];
       if (cur && isPlanStructurallyAlive(cur, side, now)) {
@@ -1118,8 +1177,12 @@ export function loadModule(): void {
   function applyScaleChoice(side, nextMode) {
     if (!/^(AUTO|SHORT|MAJOR)$/.test(nextMode)) return;
     scaleMode[side] = nextMode;
+    manualScalePickAt[side] = Date.now();
     saveModes();
     var now = Date.now();
+    // Advance existing locked scales first using real market state; never create a detached clone
+    // or restart timers when toggling SHORT M5·15 / MAJOR H1·H4 / AI.
+    stepPlanLifecycle(side, now);
     if (bootCandlesReady) {
       directionModels[side] = evaluateDirection(side, now);
       var dm = directionModels[side];
@@ -1129,12 +1192,17 @@ export function loadModule(): void {
           ? (dm && dm.major) || lockedScales[side].MAJOR
           : (dm && dm.picked) || lockedScales[side].SHORT || lockedScales[side].MAJOR;
       if (targetPlan) {
-        plans[side] = cloneSummaryPlan(targetPlan, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+        plans[side] = attachScaleSummaries(targetPlan, lockedScales[side].SHORT, lockedScales[side].MAJOR);
         savePlan(side);
       }
-    } else if (lockedScales[side][nextMode] && nextMode !== 'AUTO') {
-      plans[side] = cloneSummaryPlan(lockedScales[side][nextMode], lockedScales[side].SHORT, lockedScales[side].MAJOR);
-      savePlan(side);
+    } else {
+      var fallbackPlan = nextMode === 'AUTO'
+        ? (plans[side] || lockedScales[side].SHORT || lockedScales[side].MAJOR)
+        : lockedScales[side][nextMode];
+      if (fallbackPlan) {
+        plans[side] = attachScaleSummaries(fallbackPlan, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+        savePlan(side);
+      }
     }
     paint(now);
   }
@@ -1153,14 +1221,6 @@ export function loadModule(): void {
     };
   }
 
-  function cloneSummaryPlan(p, shortP, majorP) {
-    if (!p) return null;
-    return Object.assign({}, p, {
-      shortSwing: summaryOf(shortP),
-      majorSwing: summaryOf(majorP)
-    });
-  }
-
   function buildPlanForSide(side, now) {
     var selected = directionModels[side];
     if (!selected || !selected.eligible || !selected.picked) {
@@ -1172,7 +1232,7 @@ export function loadModule(): void {
       return;
     }
     planNotes[side] = '';
-    plans[side] = cloneSummaryPlan(selected.picked, selected.short, selected.major);
+    plans[side] = attachScaleSummaries(selected.picked, selected.short, selected.major);
     savePlan(side);
   }
 
@@ -1189,14 +1249,12 @@ export function loadModule(): void {
   function syncSummaries(side) {
     var p = plans[side];
     if (!p || p.hit || p.doneAt) return;
-    p.shortSwing = summaryOf(lockedScales[side].SHORT);
-    p.majorSwing = summaryOf(lockedScales[side].MAJOR);
+    attachScaleSummaries(p, lockedScales[side].SHORT, lockedScales[side].MAJOR);
     savePlan(side);
   }
 
-  function stepPlanLifecycle(side, now) {
-    var p = plans[side];
-    if (!p || p.hit || p.doneAt) return;
+  function stepPlanLifecycleForPlan(p, side, now) {
+    if (!p || p.hit || p.doneAt) return false;
     var buy = side === 'BUY';
 
     // When the exchange session is closed, do not artificially trigger fills
@@ -1204,8 +1262,9 @@ export function loadModule(): void {
     if (!marketOpen) {
       if (!p.running && p.endAt < now + 15 * 60000) {
         p.endAt = now + p.etaMin * 60000;
+        return true;
       }
-      return;
+      return false;
     }
 
     if (now >= p.endAt) {
@@ -1213,8 +1272,7 @@ export function loadModule(): void {
         // Keep armed structural swing locked until filled or stop-invalidated; renew watch window.
         p.startAt = nextBarOpen(now);
         p.endAt = now + Math.max(MIN_ETA_MIN, p.etaMin) * 60000;
-        savePlan(side);
-        return;
+        return true;
       }
       if (now - p.startAt > MAX_RESTORE_AGE_MS) {
         p.doneAt = now;
@@ -1222,19 +1280,18 @@ export function loadModule(): void {
         p.exitPrice = price > 0 ? price : p.target;
         p.exitAt = now;
         pushLog(p, 'timeout');
-        return;
+        return true;
       }
       p.endAt = now + Math.max(15, Math.round(p.etaMin * 0.5)) * 60000;
-      savePlan(side);
+      return true;
     }
 
-    if (!quoteFresh(now)) return;
+    if (!quoteFresh(now)) return false;
 
     if (!p.running) {
-      if (updatedAt <= Math.max(p.quoteAt || 0, p.evaluatedQuoteAt || 0)) return;
+      if (updatedAt <= Math.max(p.quoteAt || 0, p.evaluatedQuoteAt || 0)) return false;
       p.evaluatedQuoteAt = updatedAt;
       p.evaluatedPrice = price;
-      savePlan(side);
 
       // Check structural SL invalidation while armed
       if (buy ? price <= p.stop : price >= p.stop) {
@@ -1242,39 +1299,38 @@ export function loadModule(): void {
         p.outcome = 'invalidated';
         p.exitPrice = price;
         p.exitAt = now;
-        if (p.scale && lockedScales[side][p.scale] === p) lockedScales[side][p.scale] = null;
-        savePlan(side);
-        return;
+        return true;
       }
 
       var oppSide = buy ? 'SELL' : 'BUY';
       var oppRunning = !!(plans[oppSide] && plans[oppSide].running);
       var myModelConf = directionModels[side] ? Number(directionModels[side].confidence) || 0 : p.confidence;
-      if (oppRunning && myModelConf < 55) return;
+      if (oppRunning && myModelConf < 55) return true;
 
       var spreadTol = p.atr * ENTRY_TOLERANCE_ATR;
       var reached = p.entryMode === 'retrace'
         ? (buy ? price <= p.entry + spreadTol : price >= p.entry - spreadTol)
         : (buy ? price >= p.entry - spreadTol : price <= p.entry + spreadTol);
-      if (!reached) return;
-      if (price >= Math.max(p.target, p.stop) || price <= Math.min(p.target, p.stop)) return;
+      if (!reached) return true;
+      if (price >= Math.max(p.target, p.stop) || price <= Math.min(p.target, p.stop)) return true;
 
       var observedRR = Math.abs(p.target - price) / Math.max(1e-9, Math.abs(p.stop - price));
-      if (!Number.isFinite(observedRR) || observedRR < MIN_RR) return;
+      if (!Number.isFinite(observedRR) || observedRR < MIN_RR) return true;
 
       p.observedEntry = price;
       p.observedRR = observedRR;
       p.running = true;
       p.startAt = now;
+      p.runningSeq = ++runningSeqCounter;
       p.endAt = now + p.etaMin * 60000;
       p.startedQuoteAt = updatedAt;
       p.lastQuoteAt = updatedAt;
       p.restored = false;
-      savePlan(side);
-      return;
+      p._justStartedNow = true;
+      return true;
     }
 
-    if (updatedAt <= Math.max(p.startedQuoteAt || 0, p.lastQuoteAt || 0)) return;
+    if (updatedAt <= Math.max(p.startedQuoteAt || 0, p.lastQuoteAt || 0)) return false;
     p.lastQuoteAt = updatedAt;
     p.restored = false;
 
@@ -1283,20 +1339,85 @@ export function loadModule(): void {
       p.hitAt = now;
       p.exitPrice = price;
       p.exitAt = now;
-      if (p.scale && lockedScales[side][p.scale]) lockedScales[side][p.scale] = null;
       pushLog(p, 'hit');
-      return;
+      return true;
     }
     if (buy ? price <= p.stop : price >= p.stop) {
       p.doneAt = now;
       p.outcome = 'miss';
       p.exitPrice = price;
       p.exitAt = now;
-      if (p.scale && lockedScales[side][p.scale]) lockedScales[side][p.scale] = null;
       pushLog(p, 'miss');
-      return;
+      return true;
     }
-    savePlan(side);
+    return true;
+  }
+
+  function stepPlanLifecycle(side, now) {
+    var tracked = [];
+    [plans[side], lockedScales[side].SHORT, lockedScales[side].MAJOR].forEach(function (sp) {
+      if (sp && tracked.indexOf(sp) === -1) tracked.push(sp);
+    });
+    var changed = false;
+    var newlyStarted = [];
+    tracked.forEach(function (sp) {
+      var wasRunning = !!sp.running;
+      if (sp._justStartedNow) delete sp._justStartedNow;
+      if (stepPlanLifecycleForPlan(sp, side, now)) changed = true;
+      if (!wasRunning && sp.running && sp._justStartedNow) {
+        delete sp._justStartedNow;
+        newlyStarted.push(sp);
+      }
+    });
+    // Auto-switch the board to whichever scale (SHORT or MAJOR) just started running
+    // (or the latest one started when both are running together).
+    if (newlyStarted.length) {
+      var targetStarted = newlyStarted.length > 1
+        ? pickLatestRunning(newlyStarted[0], newlyStarted[1])
+        : newlyStarted[0];
+      if (targetStarted) {
+        if (targetStarted.scale === 'SHORT' || targetStarted.scale === 'MAJOR') {
+          scaleMode[side] = targetStarted.scale;
+          saveModes();
+        }
+        plans[side] = attachScaleSummaries(targetStarted, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+        changed = true;
+      }
+    } else {
+      // If current plan isn't running yet and another scale is actively running (not overridden after it started)
+      var runningLatest = pickLatestRunning(lockedScales[side].SHORT, lockedScales[side].MAJOR);
+      if (runningLatest && (!plans[side] || (!plans[side].running && !(manualScalePickAt[side] > (runningLatest.startAt || 0))))) {
+        if (runningLatest.scale === 'SHORT' || runningLatest.scale === 'MAJOR') {
+          scaleMode[side] = runningLatest.scale;
+          saveModes();
+        }
+        plans[side] = attachScaleSummaries(runningLatest, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+        changed = true;
+      }
+    }
+    if (changed) savePlan(side);
+  }
+
+  function clearExpiredFinishedScales(side, now) {
+    var displayedFinished = false;
+    ['SHORT', 'MAJOR'].forEach(function (sc) {
+      var sp = lockedScales[side][sc];
+      if (!sp || (!sp.hit && !sp.doneAt)) return;
+      var finishedAt = sp.hitAt || sp.doneAt || 0;
+      if (plans[side] !== sp || now - finishedAt > FAIL_REBUILD_MS) {
+        if (plans[side] === sp) displayedFinished = true;
+        lockedScales[side][sc] = null;
+      }
+    });
+    if (displayedFinished) {
+      var stillRunning = pickLatestRunning(lockedScales[side].SHORT, lockedScales[side].MAJOR);
+      if (stillRunning && (stillRunning.scale === 'SHORT' || stillRunning.scale === 'MAJOR')) {
+        scaleMode[side] = stillRunning.scale;
+        saveModes();
+        plans[side] = attachScaleSummaries(stillRunning, lockedScales[side].SHORT, lockedScales[side].MAJOR);
+        savePlan(side);
+      }
+    }
   }
 
   function maybeRebuild(now) {
@@ -1305,6 +1426,9 @@ export function loadModule(): void {
     });
     if (!bootCandlesReady) return;
 
+    ['BUY', 'SELL'].forEach(function (side) {
+      clearExpiredFinishedScales(side, now);
+    });
     directionModels = {
       BUY: evaluateDirection('BUY', now),
       SELL: evaluateDirection('SELL', now)
@@ -1321,7 +1445,7 @@ export function loadModule(): void {
         reloadedOnFinish = true;
         loadCandles();
       }
-      if (finished && plans[side] && plans[side].scale) {
+      if (finished && plans[side] && plans[side].scale && lockedScales[side][plans[side].scale] === plans[side]) {
         lockedScales[side][plans[side].scale] = null;
       }
       buildPlanForSide(side, now);
@@ -1407,14 +1531,34 @@ export function loadModule(): void {
     };
   }
 
+  var lastSwingEventSig = '';
+  function scaleSigPart(p) {
+    return p ? [!!p.running, !!p.hit, !!p.doneAt, p.observedEntry || p.entry, p.target, p.stop, p.startAt].join(':') : '';
+  }
+  function notifySwingState() {
+    var sig = [
+      symbol,
+      scaleSigPart(plans.BUY),
+      scaleSigPart(plans.SELL),
+      scaleSigPart(lockedScales.BUY.SHORT),
+      scaleSigPart(lockedScales.BUY.MAJOR),
+      scaleSigPart(lockedScales.SELL.SHORT),
+      scaleSigPart(lockedScales.SELL.MAJOR)
+    ].join('|');
+    if (sig === lastSwingEventSig) return;
+    lastSwingEventSig = sig;
+    window.dispatchEvent(new CustomEvent('swing:state', { detail: { symbol: symbol } }));
+  }
+
   function paint(now) {
     now = now || Date.now();
     ['BUY', 'SELL'].forEach(function (side) {
+      stepPlanLifecycle(side, now);
       var p = plans[side];
-      if (p && !p.hit && !p.doneAt) stepPlanLifecycle(side, now);
       if (p && !p.logged && (p.hit || p.doneAt)) pushLog(p, p.outcome || (p.hit ? 'hit' : 'miss'));
     });
     BOARDS.forEach(function (board) { paintBoard(now, board); });
+    notifySwingState();
   }
 
   var lastFactorHtmlByBoard = Object.create(null);
@@ -1627,6 +1771,17 @@ export function loadModule(): void {
       return;
     }
     if (acceptQuote(soft)) return;
+    var inflight = window.__SOFT_QUOTE_INFLIGHT;
+    if (inflight && inflight.symbol === symbol && (Date.now() - inflight.at) < 3000 && inflight.promise) {
+      priceBusy = true;
+      var gen0 = marketGeneration, sym0 = symbol;
+      inflight.promise.then(function (q) {
+        if (gen0 === marketGeneration && sym0 === symbol && q) acceptQuote(q);
+      }).finally(function () {
+        if (gen0 === marketGeneration) priceBusy = false;
+      });
+      return;
+    }
     var host = window.TvChartHost;
     if (!document.hidden && host && typeof host.refreshQuote === 'function') { host.refreshQuote(); }
     var requestedSymbol = symbol, generation = marketGeneration;
@@ -1749,6 +1904,7 @@ export function loadModule(): void {
     }
     symbol = s;
     savedPlanSignatures = { BUY: '', SELL: '' };
+    manualScalePickAt = { BUY: 0, SELL: 0 };
     marketGeneration++;
     priceBusy = false;
     candleBusy = false;

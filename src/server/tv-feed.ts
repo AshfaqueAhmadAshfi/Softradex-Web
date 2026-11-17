@@ -166,7 +166,7 @@ const BAR_TTL_MS: Record<string, number> = {
   '15m': 18000,
   '1h': 35000,
   '4h': 60000,
-  '1d': 120000,
+  '1d': 600000,
 };
 
 type TvSessionHandler = (method: string, params: any[]) => void;
@@ -556,9 +556,9 @@ export async function fetchTvCandles(symbol: string, tf = '5m', count = 500, tar
   const tv = resolveTvSymbol(symbol, target);
   const resCode = RESOLUTIONS[tf] || '5';
   const clampedCount = Math.min(5000, Math.max(50, Number(count) || 500));
-  // Always fetch at least 500 bars for canonical shared cache so smaller callers
-  // (e.g. SwingAI 140) never overwrite or truncate ChartIndicators' 500-bar view.
-  const fetchCount = Math.max(clampedCount, 500);
+  // Always fetch at least 500 bars for intraday shared cache so smaller callers
+  // never truncate ChartIndicators' 500-bar view, while D1 outlook scans stay compact.
+  const fetchCount = tf === '1d' && clampedCount <= 150 ? 120 : Math.max(clampedCount, 500);
   const key = `${tv}|${tf}`;
   const now = Date.now();
   const cached = barCache.get(key);

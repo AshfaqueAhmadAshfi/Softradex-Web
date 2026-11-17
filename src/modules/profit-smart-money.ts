@@ -1,5 +1,7 @@
 // @ts-nocheck
 /* Consolidated TypeScript module */
+import { detectSmartMoney } from './smc-core';
+
 export function loadModule(): void {
   (window as any).SOFTRADEX_PUBLIC_ONLY = true;
 
@@ -324,281 +326,7 @@ export function loadModule(): void {
     return { mult: 1, unit: '1 unit/lot', minLot: 0.01 };
   }
 
-  // Detect unmitigated Order Blocks (OB), Fair Value Gaps (FVG) & OTE 61.8% zones.
-  function detectSmartMoney(frames, livePrice, nowMs) {
-    var price = Number(livePrice);
-    if (!(price > 0) || !frames) return { buy: [], sell: [] };
-    var candidates = [];
-    var tfDefs = [
-      { key: 'M5', duration: 300000, weight: 1 },
-      { key: 'M15', duration: 900000, weight: 2 },
-      { key: 'H1', duration: 3600000, weight: 3 }
-    ];
-
-    tfDefs.forEach(function (tf) {
-      var bars = barsFor(frames[tf.key], tf.duration, nowMs);
-      if (bars.length < 15) return;
-      var lastClose = Number(bars[bars.length - 1][4]);
-      if (!(lastClose > 0)) return;
-      var mismatch = Math.abs(price - lastClose) / lastClose;
-      var scale = mismatch > 0.08 ? (price / lastClose) : 1;
-      var a = atrOf(bars) * scale;
-      if (!(a > 0)) return;
-
-      var startIdx = Math.max(3, bars.length - 55);
-      for (var i = startIdx; i < bars.length - 2; i++) {
-        var b = bars[i];
-        var open = Number(b[1]) * scale;
-        var high = Number(b[2]) * scale;
-        var low = Number(b[3]) * scale;
-        var close = Number(b[4]) * scale;
-
-        // 1. Bullish & Bearish Fair Value Gaps (3-candle imbalance).
-        var bPrev = bars[i - 1];
-        var bNext = bars[i + 1];
-        var prevHigh = Number(bPrev[2]) * scale;
-        var prevLow = Number(bPrev[3]) * scale;
-        var nextHigh = Number(bNext[2]) * scale;
-        var nextLow = Number(bNext[3]) * scale;
-
-        if (nextLow > prevHigh && (nextLow - prevHigh) >= a * 0.12) {
-          var fvgBuyEntry = prevHigh + (nextLow - prevHigh) * 0.5;
-          if (fvgBuyEntry <= price * 1.0015 && prevHigh < price) {
-            var fvgBuyMitigated = false;
-            for (var k1 = i + 2; k1 < bars.length; k1++) {
-              if (Number(bars[k1][3]) * scale <= prevHigh) { fvgBuyMitigated = true; break; }
-            }
-            if (!fvgBuyMitigated) {
-              var fvgBuyStop = Math.min(prevLow, prevHigh - a * 0.35);
-              var fvgBuyRisk = Math.max(a * 0.4, fvgBuyEntry - fvgBuyStop);
-              candidates.push({
-                id: tf.key + ':BU-FVG:' + barTime(b[0]),
-                side: 'buy',
-                kind: 'BU-FVG',
-                tf: tf.key,
-                weight: tf.weight,
-                entry: fvgBuyEntry,
-                zoneLow: prevHigh,
-                zoneHigh: nextLow,
-                stop: fvgBuyEntry - fvgBuyRisk,
-                tp1: fvgBuyEntry + fvgBuyRisk * 1.5,
-                tp2: fvgBuyEntry + fvgBuyRisk * 2.5,
-                band: a * 0.22,
-                time: barTime(b[0]),
-                note: tf.key + ' Bullish Fair Value Gap (unfilled 3-bar displacement imbalance)'
-              });
-            }
-          }
-        }
-
-        if (nextHigh < prevLow && (prevLow - nextHigh) >= a * 0.12) {
-          var fvgSellEntry = prevLow - (prevLow - nextHigh) * 0.5;
-          if (fvgSellEntry >= price * 0.9985 && prevLow > price) {
-            var fvgSellMitigated = false;
-            for (var k2 = i + 2; k2 < bars.length; k2++) {
-              if (Number(bars[k2][2]) * scale >= prevLow) { fvgSellMitigated = true; break; }
-            }
-            if (!fvgSellMitigated) {
-              var fvgSellStop = Math.max(prevHigh, prevLow + a * 0.35);
-              var fvgSellRisk = Math.max(a * 0.4, fvgSellStop - fvgSellEntry);
-              candidates.push({
-                id: tf.key + ':BE-FVG:' + barTime(b[0]),
-                side: 'sell',
-                kind: 'BE-FVG',
-                tf: tf.key,
-                weight: tf.weight,
-                entry: fvgSellEntry,
-                zoneLow: nextHigh,
-                zoneHigh: prevLow,
-                stop: fvgSellEntry + fvgSellRisk,
-                tp1: fvgSellEntry - fvgSellRisk * 1.5,
-                tp2: fvgSellEntry - fvgSellRisk * 2.5,
-                band: a * 0.22,
-                time: barTime(b[0]),
-                note: tf.key + ' Bearish Fair Value Gap (unfilled 3-bar supply imbalance)'
-              });
-            }
-          }
-        }
-
-        // 2. Bullish Order Block (last bearish candle before bullish displacement + structure break).
-        var laEnd = Math.min(bars.length, i + 4);
-        var maxAfterClose = -Infinity, minAfterClose = Infinity;
-        for (var la = i + 1; la < laEnd; la++) {
-          var cv = Number(bars[la][4]) * scale;
-          if (cv > maxAfterClose) maxAfterClose = cv;
-          if (cv < minAfterClose) minAfterClose = cv;
-        }
-        var priorStart = Math.max(0, i - 3);
-        var priorHigh = -Infinity, priorLow = Infinity;
-        for (var pr = priorStart; pr < i; pr++) {
-          var ph = Number(bars[pr][2]) * scale;
-          var pl = Number(bars[pr][3]) * scale;
-          if (ph > priorHigh) priorHigh = ph;
-          if (pl < priorLow) priorLow = pl;
-        }
-
-        if (close <= open && (maxAfterClose - low) >= a * 0.85 && maxAfterClose > priorHigh) {
-          var obBuyEntry = low + (high - low) * 0.6;
-          if (obBuyEntry <= price * 1.001 && low < price) {
-            var obBuyInvalidated = false;
-            for (var k3 = i + 2; k3 < bars.length; k3++) {
-              if (Number(bars[k3][3]) * scale < low) { obBuyInvalidated = true; break; }
-            }
-            if (!obBuyInvalidated) {
-              var obBuyStop = low - a * 0.25;
-              var obBuyRisk = Math.max(a * 0.45, obBuyEntry - obBuyStop);
-              candidates.push({
-                id: tf.key + ':BU-OB:' + barTime(b[0]),
-                side: 'buy',
-                kind: 'BU-OB',
-                tf: tf.key,
-                weight: tf.weight + 1,
-                entry: obBuyEntry,
-                zoneLow: low,
-                zoneHigh: high,
-                stop: obBuyEntry - obBuyRisk,
-                tp1: obBuyEntry + obBuyRisk * 1.5,
-                tp2: obBuyEntry + obBuyRisk * 2.5,
-                band: a * 0.25,
-                time: barTime(b[0]),
-                note: tf.key + ' Bullish Order Block (unmitigated institutional demand before BOS)'
-              });
-            }
-          }
-        }
-
-        // 3. Bearish Order Block (last bullish candle before bearish displacement + structure break).
-        if (close >= open && (high - minAfterClose) >= a * 0.85 && minAfterClose < priorLow) {
-          var obSellEntry = high - (high - low) * 0.6;
-          if (obSellEntry >= price * 0.999 && high > price) {
-            var obSellInvalidated = false;
-            for (var k4 = i + 2; k4 < bars.length; k4++) {
-              if (Number(bars[k4][2]) * scale > high) { obSellInvalidated = true; break; }
-            }
-            if (!obSellInvalidated) {
-              var obSellStop = high + a * 0.25;
-              var obSellRisk = Math.max(a * 0.45, obSellStop - obSellEntry);
-              candidates.push({
-                id: tf.key + ':BE-OB:' + barTime(b[0]),
-                side: 'sell',
-                kind: 'BE-OB',
-                tf: tf.key,
-                weight: tf.weight + 1,
-                entry: obSellEntry,
-                zoneLow: low,
-                zoneHigh: high,
-                stop: obSellEntry + obSellRisk,
-                tp1: obSellEntry - obSellRisk * 1.5,
-                tp2: obSellEntry - obSellRisk * 2.5,
-                band: a * 0.25,
-                time: barTime(b[0]),
-                note: tf.key + ' Bearish Order Block (unmitigated institutional supply before BOS)'
-              });
-            }
-          }
-        }
-      }
-
-      // 4. Fibonacci OTE (61.8% - 70.5% Golden Pocket) on recent 30-bar swing range.
-      var win = bars.slice(-30);
-      var hiIdx = 0, loIdx = 0;
-      win.forEach(function (row, idx) {
-        if (Number(row[2]) >= Number(win[hiIdx][2])) hiIdx = idx;
-        if (Number(row[3]) <= Number(win[loIdx][3])) loIdx = idx;
-      });
-      var swingHi = Number(win[hiIdx][2]) * scale;
-      var swingLo = Number(win[loIdx][3]) * scale;
-      var span = swingHi - swingLo;
-      if (span >= a * 1.4) {
-        var oteBuy618 = swingHi - span * 0.618;
-        var oteBuy705 = swingHi - span * 0.705;
-        if (oteBuy618 < price && swingLo < oteBuy705) {
-          var oteBuyRisk = Math.max(a * 0.5, oteBuy618 - (swingLo - a * 0.15));
-          candidates.push({
-            id: tf.key + ':BU-OTE:' + barTime(win[loIdx][0]),
-            side: 'buy',
-            kind: 'OTE 61.8%',
-            tf: tf.key,
-            weight: tf.weight,
-            entry: oteBuy618,
-            zoneLow: oteBuy705,
-            zoneHigh: oteBuy618,
-            stop: oteBuy618 - oteBuyRisk,
-            tp1: oteBuy618 + oteBuyRisk * 1.5,
-            tp2: Math.max(swingHi, oteBuy618 + oteBuyRisk * 2.5),
-            band: a * 0.2,
-            time: barTime(win[loIdx][0]),
-            note: tf.key + ' Golden Pocket OTE (61.8%–70.5% Fibonacci discount pullback)'
-          });
-        }
-        var oteSell618 = swingLo + span * 0.618;
-        var oteSell705 = swingLo + span * 0.705;
-        if (oteSell618 > price && swingHi > oteSell705) {
-          var oteSellRisk = Math.max(a * 0.5, (swingHi + a * 0.15) - oteSell618);
-          candidates.push({
-            id: tf.key + ':BE-OTE:' + barTime(win[hiIdx][0]),
-            side: 'sell',
-            kind: 'OTE 61.8%',
-            tf: tf.key,
-            weight: tf.weight,
-            entry: oteSell618,
-            zoneLow: oteSell618,
-            zoneHigh: oteSell705,
-            stop: oteSell618 + oteSellRisk,
-            tp1: oteSell618 - oteSellRisk * 1.5,
-            tp2: Math.min(swingLo, oteSell618 - oteSellRisk * 2.5),
-            band: a * 0.2,
-            time: barTime(win[hiIdx][0]),
-            note: tf.key + ' Golden Pocket OTE (61.8%–70.5% Fibonacci premium rally)'
-          });
-        }
-      }
-    });
-
-    function mergeSide(side) {
-      var list = candidates.filter(function (c) { return c.side === side; })
-        .sort(function (a, b) { return a.entry - b.entry; });
-      var groups = [];
-      list.forEach(function (c) {
-        var cur = groups[groups.length - 1];
-        var tol = Math.max(c.band || 0, price * 0.0005);
-        if (!cur || Math.abs(c.entry - cur.entry) > tol) {
-          groups.push(Object.assign({}, c, { count: 1, tags: [c.kind + ' · ' + c.tf] }));
-          return;
-        }
-        cur.count += 1;
-        if (c.weight >= cur.weight) {
-          cur.kind = c.kind;
-          cur.tf = c.tf;
-          cur.note = c.note;
-        }
-        cur.weight += c.weight;
-        cur.entry = (cur.entry + c.entry) / 2;
-        cur.zoneLow = Math.min(cur.zoneLow, c.zoneLow);
-        cur.zoneHigh = Math.max(cur.zoneHigh, c.zoneHigh);
-        cur.stop = side === 'buy' ? Math.min(cur.stop, c.stop) : Math.max(cur.stop, c.stop);
-        var risk = Math.abs(cur.entry - cur.stop);
-        cur.tp1 = side === 'buy' ? cur.entry + risk * 1.5 : cur.entry - risk * 1.5;
-        cur.tp2 = side === 'buy' ? cur.entry + risk * 2.5 : cur.entry - risk * 2.5;
-        var tag = c.kind + ' · ' + c.tf;
-        if (cur.tags.indexOf(tag) < 0) cur.tags.push(tag);
-      });
-      return groups.map(function (g) {
-        var distPct = Math.abs(price - g.entry) / price * 100;
-        var inZone = price >= g.zoneLow && price <= g.zoneHigh || distPct <= 0.08;
-        var state = inZone ? 'IN ZONE' : distPct <= 0.35 ? 'NEAR' : 'READY';
-        return Object.assign(g, { distPct: distPct, state: state });
-      }).sort(function (a, b) {
-        return a.distPct - b.distPct || b.weight - a.weight;
-      }).slice(0, 6);
-    }
-
-    return {
-      buy: mergeSide('buy'),
-      sell: mergeSide('sell')
-    };
-  }
+  // Smart Money OB / FVG / OTE detection is shared via detectSmartMoney in smc-core.ts.
 
   // Synthesize 6-Factor Confluence, Safe SL (beyond SL liquidity clusters) & Lot Sizing.
   function computeProfitRadar(ctx) {
@@ -762,19 +490,21 @@ export function loadModule(): void {
     if (!panel) return;
     if ($('smc-market')) $('smc-market').textContent = symbol || 'MARKET';
     if ($('smc-price')) $('smc-price').textContent = quote ? px(quote.price) : '—';
-    var totalZones = (smcZones.buy ? smcZones.buy.length : 0) + (smcZones.sell ? smcZones.sell.length : 0);
+    var buyRows = ((smcZones && smcZones.buy) || []).filter(function (z) { return Number(z.accuracy) > 60; });
+    var sellRows = ((smcZones && smcZones.sell) || []).filter(function (z) { return Number(z.accuracy) > 60; });
+    var totalZones = buyRows.length + sellRows.length;
     if ($('smc-status')) {
       $('smc-status').textContent = !quote
         ? 'Waiting for live quote'
         : totalZones
-          ? 'M5 / M15 / H1 · ' + totalZones + ' active zones'
-          : 'M5 / M15 / H1 · scanning…';
+          ? 'M5 / M15 / H1 · >60% accuracy · ' + totalZones + ' zones'
+          : 'M5 / M15 / H1 · no >60% accuracy zones yet';
     }
 
     ['buy', 'sell'].forEach(function (side) {
       var listEl = $('smc-' + side + '-list');
       var countEl = $('smc-' + side + '-count');
-      var rows = (smcZones && smcZones[side]) || [];
+      var rows = side === 'buy' ? buyRows : sellRows;
       if (countEl) countEl.textContent = rows.length + ' zones';
       if (!listEl) return;
       var opened = Object.create(null);
@@ -784,7 +514,9 @@ export function loadModule(): void {
         });
       }
       var html = rows.map(function (z) {
-        var badge = z.state === 'IN ZONE' ? 'IN ZONE' : z.distPct.toFixed(2) + '%';
+        var acc = Math.round(Number(z.accuracy) || 0);
+        var stateTxt = z.state === 'IN ZONE' ? 'IN ZONE' : z.distPct.toFixed(2) + '%';
+        var badge = acc + '% · ' + stateTxt;
         return '<details class="slz-row smc-row ' + side + '" data-key="' + esc(z.id) + '"' + (opened[z.id] ? ' open' : '') + '>' +
           '<summary>' +
             '<b>' + esc(px(z.entry)) + '</b>' +
@@ -793,14 +525,14 @@ export function loadModule(): void {
             '<i>›</i>' +
           '</summary>' +
           '<div class="slz-details smc-details">' +
-            '<b>' + (side === 'buy' ? 'BUY DEMAND PLAN' : 'SELL SUPPLY PLAN') + ':</b> ' +
+            '<b>' + (side === 'buy' ? 'BUY DEMAND PLAN' : 'SELL SUPPLY PLAN') + ' (' + acc + '% accuracy):</b> ' +
             'Entry <b>' + esc(px(z.entry)) + '</b> · Safe SL <b>' + esc(px(z.stop)) + '</b> · ' +
             'TP1 (1.5R) <b>' + esc(px(z.tp1)) + '</b> · TP2 (2.5R) <b>' + esc(px(z.tp2)) + '</b><br>' +
             'Zone band: ' + esc(px(z.zoneLow)) + ' – ' + esc(px(z.zoneHigh)) + ' (' + esc(z.tags.join(' + ')) + ').<br>' +
             esc(z.note) + '.' +
           '</div>' +
         '</details>';
-      }).join('') || '<div class="slz-empty">No unmitigated ' + (side === 'buy' ? 'BUY demand OB/FVG' : 'SELL supply OB/FVG') + ' confirmed yet.</div>';
+      }).join('') || '<div class="slz-empty">No ' + (side === 'buy' ? 'BUY demand OB/FVG' : 'SELL supply OB/FVG') + ' above 60% accuracy yet.</div>';
       if (listEl.innerHTML !== html) listEl.innerHTML = html;
     });
     notifyChartModules();
@@ -907,7 +639,7 @@ export function loadModule(): void {
 
   function smcZoneSig(z) {
     return [
-      z.id, z.kind, z.tf, z.entry, z.stop, z.tp1, z.tp2,
+      z.id, z.kind, z.tf, z.accuracy || 0, z.entry, z.stop, z.tp1, z.tp2,
       z.zoneLow, z.zoneHigh,
       Array.isArray(z.tags) ? z.tags.join('+') : ''
     ].join(':');
@@ -983,7 +715,7 @@ export function loadModule(): void {
           var reqAt = Number(h.at) || Date.now();
           lastStructureAt = reqAt;
           lastSmcPrice = reqPrice;
-          workerApi.detectSmc(reqSym, { M5: h.frames.M5, M15: h.frames.M15, H1: h.frames.H1 }, reqPrice, reqAt)
+          workerApi.detectSmc(reqSym, { M5: h.frames.M5, M15: h.frames.M15, H1: h.frames.H1 }, reqPrice, Date.now())
             .then(function (res) {
               if (reqGen !== smcWorkerGen || reqSym !== symbol || !res || !res.smcZones) return;
               smcZones = res.smcZones;

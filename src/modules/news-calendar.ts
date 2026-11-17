@@ -1,146 +1,25 @@
 // @ts-nocheck
 /* Consolidated TypeScript module */
+import {
+  analyzeFinancialText,
+  canonicalNewsBase,
+  computePostEventReaction,
+  estimateNewsDirection,
+  isMacroNoiseHeadline,
+} from './news-analyzer-core';
+
 export function loadModule(): void {
   (window as any).SOFTRADEX_PUBLIC_ONLY = true;
 
 // ==================== news-direction.js ====================
-/* Selected-market directional estimates from release data, RSS text and live
-   structure. Signal strength is a model score, not a calibrated probability. */
+/* Selected-market directional estimates backed by shared clause-aware NLP,
+   release surprise math, and live M5/DXY post-event price reaction verification. */
 (function () {
   'use strict';
-  function base(v) {
-    var key = String(v || '').replace(/m$/, '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-    return ({XAUUSD247:'XAUUSD',BTCUSD:'BTCUSDT',ETHUSD:'ETHUSDT',USTECX100:'USTEC',NAS100:'USTEC'})[key] || key;
-  }
-  function sign(n) { return n > 0 ? 1 : n < 0 ? -1 : 0; }
-  function clamp(n, limit) { return Math.max(-limit, Math.min(limit, n)); }
-  function side(v) { return /BUY|UP|BULL/i.test(v || '') ? 1 : /SELL|DOWN|BEAR/i.test(v || '') ? -1 : 0; }
-  function currencySign(symbol, currency) {
-    var key = base(symbol), c = String(currency || '').toUpperCase();
-    if (c === key || (c === 'TECH' && /USTEC|US500|US30|^[A-Z]{2,5}$/.test(key))) return 1;
-    if (c === 'OIL' && /USOIL|UKOIL|XNG/.test(key)) return 1;
-    if (c === 'BTC' && /^(BTC|ETH|SOL|XRP|BNB|DOGE|ADA|LTC)/.test(key)) return 1;
-    if (/^(XAU|XAG|XPT|XPD)/.test(key) && c === key.slice(0,3)) return 1;
-    if (/^[A-Z]{6}$/.test(key) && c === key.slice(0,3)) return 1;
-    if (/^[A-Z]{6}$/.test(key) && c === key.slice(3)) return -1;
-    if (c === 'USD') {
-      if (key === 'DXY' || /^USD/.test(key)) return 1;
-      if (/USD[T]?$/.test(key) || /^(USTEC|US500|US30|USOIL|UKOIL|[A-Z]{2,5})$/.test(key)) return -1;
-    }
-    return 0;
-  }
-  var UP_WORDS = 'rall(?:y|ies)|ris(?:e|es|ing)|gain(?:s|ing)?|jump(?:s)?|surge(?:s)?|rebound(?:s)?|bullish|upside';
-  var DOWN_WORDS = 'fall(?:s|ing)?|drop(?:s|ping)?|slip(?:s|ping)?|slide(?:s|ing)?|sell.?off|bearish|headwinds|downside|declin(?:e|es|ing)';
-  var POS_GENERIC_RE = new RegExp('\\b(?:' + UP_WORDS + '|stronger)\\b');
-  var NEG_GENERIC_RE = new RegExp('\\b(?:' + DOWN_WORDS + '|weaker)\\b');
-  var HAWK_RE = /\b(hawkish|rate hike|hike rates|tightening|higher for longer)\b/;
-  var DOVE_RE = /\b(dovish|rate cut|cut rates|easing)\b/;
-  var FED_RE = /\b(fed|fomc|federal reserve)\b/;
-  var ECB_RE = /\becb\b/;
-  var BOE_RE = /\bboe\b/;
-  var BOJ_RE = /\bboj\b/;
-  var INVERSE_RE = /unemployment|jobless|claims|job cut|oil inventories|oil stocks/;
-  var NAME_RE_CACHE = Object.create(null);
-  function nameRegexes(names) {
-    var c = NAME_RE_CACHE[names];
-    if (!c) {
-      c = NAME_RE_CACHE[names] = {
-        pos: new RegExp('\\b(?:' + names + ')\\b.{0,35}\\b(?:' + UP_WORDS + ')\\b'),
-        neg: new RegExp('\\b(?:' + names + ')\\b.{0,35}\\b(?:' + DOWN_WORDS + ')\\b')
-      };
-    }
-    return c;
-  }
-  var TOPIC_PATTERNS = ['fed|fomc|rate|central bank','inflation|cpi|pce|ppi','jobs|payroll|nfp|claims|unemployment',
-    'oil|crude|opec|energy','bitcoin|crypto|ethereum','gold|bullion|silver','gdp|growth|pmi|retail',
-    'stock|nasdaq|earnings|equities'].map(function(k) { return new RegExp('\\b(?:'+k+')\\b', 'i'); });
-
-  function textBias(text, symbol, currency) {
-    var t = String(text || '').toLowerCase(), key = base(symbol);
-    var names = /^XAU/.test(key) ? 'gold|bullion' : /^XAG/.test(key) ? 'silver' : /^BTC/.test(key) ? 'bitcoin|btc' : /^ETH/.test(key) ? 'ethereum|ether' : /USOIL|UKOIL/.test(key) ? 'oil|crude|brent|wti' : /USTEC/.test(key) ? 'nasdaq|tech stocks' : '';
-    if (names) {
-      var nre = nameRegexes(names);
-      var pos = nre.pos.test(t);
-      var neg = nre.neg.test(t);
-      if (pos !== neg) return pos ? 1 : -1;
-    }
-    // Policy wording concerns the named central bank's currency, even when
-    // the headline was classified as a gold story by the RSS parser.
-    var policyCurrency = FED_RE.test(t) ? 'USD' : ECB_RE.test(t) ? 'EUR' : BOE_RE.test(t) ? 'GBP' : BOJ_RE.test(t) ? 'JPY' : currency;
-    var hawk = HAWK_RE.test(t);
-    var dove = DOVE_RE.test(t);
-    if (hawk !== dove) return (hawk ? 1 : -1) * currencySign(symbol, policyCurrency);
-    var positive = POS_GENERIC_RE.test(t);
-    var negative = NEG_GENERIC_RE.test(t);
-    return positive === negative ? 0 : (positive ? 1 : -1) * currencySign(symbol, currency);
-  }
-  function matchedTopics(text) {
-    var t = String(text || '');
-    var out = [];
-    for (var i = 0; i < TOPIC_PATTERNS.length; i++) {
-      if (TOPIC_PATTERNS[i].test(t)) out.push(TOPIC_PATTERNS[i]);
-    }
-    return out;
-  }
   function estimate(input) {
-    var ev = input.event, symbol = input.symbol, now = input.now || Date.now()/1000;
-    var score = 0, evidence = [], basis = 'MODEL BIAS', q = input.quote, market = input.market;
-    function add(n, reason) { if (n) { score += n; evidence.push(reason); } }
-    var actual = ev.actual != null && ev.actual !== '' ? Number(ev.actual) : NaN;
-    var forecast = ev.forecast != null && ev.forecast !== '' ? Number(ev.forecast) : NaN;
-    var previous = ev.previous != null && ev.previous !== '' ? Number(ev.previous) : NaN;
-    var comparison = isFinite(actual) && isFinite(forecast) ? forecast : previous;
-    var value = isFinite(actual) ? actual : forecast;
-    var evTitleLower = String(ev.title || '').toLowerCase();
-    var inverse = INVERSE_RE.test(evTitleLower);
-    var delta = isFinite(value) && isFinite(comparison) ? sign(value-comparison) * (inverse ? -1 : 1) : 0;
-    if (delta && currencySign(symbol, ev.currency || ev.country)) {
-      add(delta * currencySign(symbol, ev.currency || ev.country) * (isFinite(actual) ? 6 : 3),
-        isFinite(actual) ? 'Actual vs forecast/previous surprise' : 'Forecast vs previous: pre-release estimate');
-      if (isFinite(actual)) basis = 'RELEASE + MODEL';
-    } else if (input.impact && side(input.impact.side || input.impact.direction)) {
-      add(side(input.impact.side || input.impact.direction) * (isFinite(actual) ? 5 : 3), input.impact.reason || 'Market-specific event effect');
-      if (isFinite(actual)) basis = 'RELEASE + MODEL';
-    }
-    add(textBias(ev.title + ' ' + (ev.description || ''), symbol, ev.currency || ev.country) * 2, 'Headline / RSS excerpt wording');
-    var matched = matchedTopics(ev.title), seen = Object.create(null), related = [], contextScore = 0;
-    var srcHeadlines = input.headlinesPreSorted
-      ? (input.headlines || [])
-      : (input.headlines || []).filter(function(h) { return h.ts <= now && h.ts >= now-86400; }).sort(function(a,b) { return b.ts-a.ts; });
-    for (var hi = 0; hi < srcHeadlines.length && related.length < 40; hi++) {
-      var h = srcHeadlines[hi];
-      if (!h) continue;
-      if (input.headlinesPreSorted && (h.ts > now || h.ts < now - 86400)) continue;
-      var key = h._titleLower || String(h.title || '').toLowerCase();
-      if (seen[key] || key === evTitleLower) continue;
-      if (matched.length) {
-        var topicHit = false;
-        for (var ti = 0; ti < matched.length; ti++) { if (matched[ti].test(h.title || '')) { topicHit = true; break; } }
-        if (!topicHit) continue;
-      }
-      seen[key] = true;
-      var bias = h._bias !== undefined ? h._bias : textBias(h.title + ' ' + (h.description || ''), symbol, h.currency || h.country);
-      if (bias) { contextScore += bias * Math.exp(-(now-h.ts)/21600); related.push({title:h.title,source:h.source,ts:h.ts}); }
-    }
-    add(clamp(contextScore,2), related.length + ' related published headline(s)');
-    if (market && market.symbol === symbol && market.fresh && market.vote) {
-      add(clamp(Number(market.vote.score) / 12 || 0, 1.5), 'Live multi-timeframe price structure');
-    }
-    if (q && q.symbol === symbol && now*1000-q.at <= 15000 && q.at <= now*1000+5000 && Number(q.price)>0) {
-      add(clamp(Number(q.change) / 0.3 || 0, 1), 'TradingView daily price change');
-      // Resolve an otherwise tied model using observed market continuation.
-      if (!score) { score = Number(q.change) < 0 ? -0.05 : 0.05; evidence.push('Flat/mixed evidence: low-strength continuation bias'); }
-    }
-    if (!evidence.length) return null;
-    var chosen = score >= 0 ? 'BUY' : 'SELL', prediction = input.prediction || {};
-    var atr = market && market.symbol === symbol && market.fresh && market.reads.M5 ? Number(market.reads.M5.atr) : 0;
-    var move = Math.abs(Number(prediction.move_abs != null ? prediction.move_abs : prediction.move_dollar) || 0);
-    if (!move && atr) move = atr * ({high:3,medium:2,low:1.25}[ev.impact] || 1.25);
-    return {market:symbol,side:chosen,direction:chosen === 'BUY' ? 'UP' : 'DOWN',move_abs:move,
-      strength:Math.min(90,Math.round(20+Math.abs(score)*9)),score:Math.round(score*100)/100,
-      basis:basis,reason:evidence.join(' · '),related:related.slice(0,4),at:now*1000};
+    return estimateNewsDirection(input);
   }
-  window.NewsDirection = {estimate:estimate};
+  window.NewsDirection = { estimate: estimate };
 })();
 
 
@@ -317,7 +196,19 @@ export function loadModule(): void {
     }
     return null;
   }
+  var _relCache = new WeakMap();
   function relevanceFor(ev, targetSymbol) {
+    targetSymbol = targetSymbol || symbol;
+    if (!ev || typeof ev !== 'object') return null;
+    var rMap = _relCache.get(ev);
+    var rSymKey = marketBase(targetSymbol);
+    if (rMap && Object.prototype.hasOwnProperty.call(rMap, rSymKey)) return rMap[rSymKey];
+    var computed = computeRelevanceFor(ev, targetSymbol);
+    if (!rMap) { rMap = Object.create(null); _relCache.set(ev, rMap); }
+    rMap[rSymKey] = computed;
+    return computed;
+  }
+  function computeRelevanceFor(ev, targetSymbol) {
     targetSymbol = targetSymbol || symbol;
     if ((ev.sources || [ev.source]).indexOf('binance') >= 0) {
       // A coin listing is specific to that asset. USD quotation alone does not
@@ -418,26 +309,62 @@ export function loadModule(): void {
     var p = ev.predicted_move;
     return p && marketMatch(p.market, symbol) ? p : null;
   }
+  var NEWS_LOCK_KEY = 'softradex.news.bias.v2';
+  function getLiveM5Bars() {
+    try {
+      var st = window.SwingAI && typeof window.SwingAI.structure === 'function' ? window.SwingAI.structure() : null;
+      if (st && st.symbol && !marketMatch(st.symbol, symbol)) return [];
+      var m5 = st && st.frames && Array.isArray(st.frames.M5) ? st.frames.M5 : [];
+      return m5.length ? m5.slice(-64) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+  var dirEstCache = Object.create(null);
+  var dirEstBucket = 0;
   function directionalEstimate(ev, now) {
     if (!window.NewsDirection) return null;
     if (!locksRestored) {
       locksRestored = true;
-      try { lockedDirections = JSON.parse(localStorage.getItem('softradex.news.bias.v1') || '{}'); } catch(e) {}
+      try { lockedDirections = JSON.parse(localStorage.getItem(NEWS_LOCK_KEY) || '{}'); } catch(e) {}
       if (!lockedDirections || typeof lockedDirections !== 'object') lockedDirections = Object.create(null);
     }
     var key = marketBase(symbol) + '|' + eventKey(ev), phase = phaseFor(ev, now);
-    if (phase === 'running' && lockedDirections[key] && lockedDirections[key].expires > now) return lockedDirections[key];
+    var m5Bars = getLiveM5Bars(), qLive = liveQuote();
+    var locked = lockedDirections[key];
+    if (phase === 'running' && locked && locked.expires > now) {
+      var evHasActual = ev.actual != null && String(ev.actual).trim() !== '';
+      var lockedStaleActual = evHasActual && !locked.hasActual;
+      var rx = m5Bars.length ? computePostEventReaction(m5Bars, Number(ev.ts) || now, now, qLive ? Number(qLive.price) : undefined) : null;
+      var lockedReversed = !!(rx && rx.ready && (
+        (locked.side === 'SELL' && rx.evMoveAtr >= 0.72) ||
+        (locked.side === 'BUY' && rx.evMoveAtr <= -0.72)
+      ));
+      if (!lockedStaleActual && !lockedReversed) return locked;
+      delete lockedDirections[key];
+    }
     var wEst = workerEstimates[key];
-    if (wEst && now - (wEst.at / 1000) <= 15) return wEst;
-    var imp = impactFor(ev), state = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
+    if (wEst && now - (wEst.at / 1000) <= 12) return wEst;
+    var bucketNow = Math.floor(now / 15);
+    if (dirEstBucket !== bucketNow) { dirEstCache = Object.create(null); dirEstBucket = bucketNow; }
+    var swState = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
+    var qB = qLive ? Math.round(Number(qLive.price) / (Number(qLive.price) * 0.0005 || 1)) : 0;
+    var swSig = swState && swState.fresh ? (swState.verdict || '') + ':' + Math.round((Number(swState.score) || 0) * 10) : '';
+    var dCacheKey = key + '|' + newsMergeGen + '|' + qB + '|' + swSig + '|' + String(ev.actual || '') + '|' + m5Bars.length;
+    if (Object.prototype.hasOwnProperty.call(dirEstCache, dCacheKey)) return dirEstCache[dCacheKey];
+    var imp = impactFor(ev);
     var estimate = window.NewsDirection.estimate({symbol:symbol,event:ev,impact:imp,prediction:predictionFor(ev,imp),
-      quote:liveQuote(),market:state,now:now,headlines:getRelevantHeadlines(now),headlinesPreSorted:true});
-    if (phase === 'running' && estimate) {
+      quote:qLive,market:swState,now:now,headlines:getRelevantHeadlines(now),headlinesPreSorted:true,barsM5:m5Bars});
+    // Never lock qualitative speeches/unreleased events at t=0 before post-speech headlines & live reaction unfold
+    var canLock = phase === 'running' && estimate && estimate.side !== 'WAIT' &&
+      (estimate.hasActual || now >= Number(ev.ts) + 900);
+    if (canLock) {
       estimate.locked = true; estimate.expires = Number(ev.ts) + impactWindow(ev);
       lockedDirections[key] = estimate;
       Object.keys(lockedDirections).forEach(function(k) { if (lockedDirections[k].expires <= now) delete lockedDirections[k]; });
-      try { localStorage.setItem('softradex.news.bias.v1',JSON.stringify(lockedDirections)); } catch(e) {}
+      try { localStorage.setItem(NEWS_LOCK_KEY, JSON.stringify(lockedDirections)); } catch(e) {}
     }
+    dirEstCache[dCacheKey] = estimate;
     return estimate;
   }
   function moveAmount(prediction) {
@@ -594,9 +521,22 @@ export function loadModule(): void {
       if (node.textContent !== entryTxt) node.textContent = entryTxt;
     }
   }
+  var lastListRenderSig = Object.create(null);
   function renderNewsList(id, rows, now) {
     var list = $(id);
     if (!list) return;
+    var qL = liveQuote();
+    var qSig = qL ? Math.round(Number(qL.price) / (Number(qL.price) * 0.0005 || 1)) : 0;
+    var swL = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
+    var swLSig = swL && swL.fresh ? (swL.verdict || '') + ':' + Math.round((Number(swL.score) || 0) * 10) : '';
+    var sigParts = [symbol, newsMergeGen, workerBatchGen, qSig, swLSig, Math.floor(now / 15), rows.length];
+    for (var si = 0; si < rows.length; si++) {
+      var r0 = rows[si];
+      sigParts.push(r0.ts, phaseFor(r0, now), r0.actual || '', r0.impact || '', r0.kind || '');
+    }
+    var listSig = sigParts.join('|');
+    if (lastListRenderSig[id] === listSig) return;
+    lastListRenderSig[id] = listSig;
     var opened = Object.create(null);
     if (list.querySelectorAll) Array.prototype.forEach.call(list.querySelectorAll('details[open]'), function(el) { opened[el.dataset.key] = true; });
     var contextStarted = false;
@@ -636,7 +576,7 @@ export function loadModule(): void {
       return heading + '<details class="mnt-row ' + impact + ' ' + phase + '"' + attrs + ' data-kind="' + esc(ev.kind || 'calendar') + '"' + (monitoring && !recentHeadline(ev, now) ? ' data-monitoring-fallback="true"' : '') + ' data-key="' + esc(key) + '"' + (opened[key] ? ' open' : '') + '>' +
         '<summary class="mnt-summary" title="' + esc(title + ' · ' + (timed ? dateLabel + ': ' : '') + scheduled) + '">' +
         clockHtml + '<span class="mnt-event-info"><b class="mnt-name">' + esc(title) + '</b>' + startHtml + '<small class="mnt-row-sources">' + esc(sourceNames) + '</small></span>' +
-        '<span class="mnt-summary-side ' + side.toLowerCase() + '" title="' + (prediction ? 'Estimated ' + side + ' bias · ' + prediction.strength + '% model strength' : 'Data unavailable') + '">' + (side === 'BUY' ? 'BUY ↑' : side === 'SELL' ? 'SELL ↓' : 'DATA') + '</span>' +
+        '<span class="mnt-summary-side ' + side.toLowerCase() + '" title="' + (prediction ? 'Estimated ' + side + ' bias · ' + prediction.strength + '% model strength' : 'Data unavailable') + '">' + (side === 'BUY' ? 'BUY ↑' : side === 'SELL' ? 'SELL ↓' : side === 'WAIT' ? 'WAIT ◇' : 'DATA') + '</span>' +
         '<strong class="mnt-summary-move ' + side.toLowerCase() + '">' + signed + moveText(moveAmount(prediction)) + '</strong><i class="mnt-chevron">›</i></summary>' +
         '<div class="mnt-details"><b class="mnt-full-title">' + esc(title) + '</b>' +
         '<div class="mnt-start-info"><b>' + (timed ? dateLabel.toUpperCase() : 'IMPACT TIMING') + ':</b> ' + esc(scheduled) + '</div>' +
@@ -655,9 +595,10 @@ export function loadModule(): void {
       '</details>';
     }).join('') : '<div class="mnt-empty">' + (id === 'running-news-list' ? 'No running release or recent headline to monitor for ' : 'No relevant upcoming release or recent headline for ') + esc(symbol || 'this market') + '.</div>';
     if (html !== lastNewsHtml[id]) {
-      var scroll = list.scrollTop;
+      var hadPrev = Boolean(lastNewsHtml[id]);
+      var scroll = hadPrev ? list.scrollTop : 0;
       list.innerHTML = html;
-      list.scrollTop = scroll;
+      if (hadPrev && scroll > 0) list.scrollTop = scroll;
       lastNewsHtml[id] = html;
     }
   }
@@ -672,7 +613,8 @@ export function loadModule(): void {
     if (workerApi && typeof workerApi.estimateNews === 'function' && workerApi.available && workerApi.available() && rows.length > 12) {
       var qLive = liveQuote(), sLive = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
       var qBucket = qLive ? Math.round(qLive.price / (qLive.price * 0.0005 || 1)) : 0;
-      var wKey = symbol + '|' + newsMergeGen + '|' + qBucket + '|' + (sLive ? Number(sLive.updatedAt || 0) : 0);
+      var sSig = sLive && sLive.fresh ? (sLive.verdict || '') + ':' + Math.round((Number(sLive.score) || 0) * 10) : '';
+      var wKey = symbol + '|' + newsMergeGen + '|' + qBucket + '|' + sSig;
       if (wKey !== lastWorkerKey) {
         lastWorkerKey = wKey;
         var reqGen = ++workerBatchGen;
@@ -687,6 +629,7 @@ export function loadModule(): void {
           quote: qLive,
           market: sLive,
           headlines: getRelevantHeadlines(now),
+          barsM5: getLiveM5Bars(),
           items: reqItems
         }).then(function(res) {
           if (reqGen !== workerBatchGen || reqSym !== symbol || !res || !res.estimates) return;
@@ -703,8 +646,9 @@ export function loadModule(): void {
     setText('rnews-market', symbol || 'MARKET');
     setText('mnt-count', upcoming.length + ' EVENTS · ' + headlines.length + ' HEADLINES' + (scanState === 'idle' ? '' : ' · ' + scanState.toUpperCase()));
     setText('rnews-count', active.length + ' RELEASES · ' + monitoredHeadlines.length + ' HEADLINES');
-    renderNewsList('mnt-list', upcoming.concat(headlines), now);
+    renderNewsList('mnt-list', upcoming.concat(headlines.slice(0, 40)), now);
     renderNewsList('running-news-list', running, now);
+    updateAiWorldRobot(upcoming, headlines, now, running, false);
     if (window.RunningNewsAlerts) window.RunningNewsAlerts.observe({
       market: marketBase(symbol), label: symbol, now: now, ready: newsSnapshotReady,
       events: active.concat(recent).map(function(ev) {
@@ -714,6 +658,563 @@ export function loadModule(): void {
       })
     });
     renderSources(rows);
+  }
+  var aiWorldState = {
+    dir: 'WAIT', pct: 0, headlineCount: 0, next24Count: 0, webCount: 0,
+    panelBuyCount: 0, panelSellCount: 0, panelDir: 'WAIT',
+    webDir: 'WAIT', webState: 'SCANNING', webSources: [],
+    dxyText: '', msg: 'Reading NEXT 24H news & checking global feeds...', items: [], market: 'MARKET'
+  };
+  var aiRobotOpen = false, aiRobotPinned = false, aiCloseTimer = null;
+  var aiInternetCache = Object.create(null);
+  var lastRobotInputs = { upcoming: [], headlines: [], running: [] };
+
+  function clearAiCloseTimer() {
+    if (aiCloseTimer) { clearTimeout(aiCloseTimer); aiCloseTimer = null; }
+  }
+
+  function inferWorldMacroSide(ev, sym) {
+    var title = String((ev && (ev.title || ev.event)) || '');
+    if (isMacroNoiseHeadline(title)) return { side: 'WAIT', strength: 0 };
+    var txt = (title + ' ' + String((ev && ev.description) || '') + ' ' + String((ev && ev.predicted_move) || '')).trim();
+    var mkt = String(canonicalNewsBase(sym || symbol || 'XAUUSD'));
+    var cur = String((ev && (ev.currency || ev.country)) || (/^XAU/.test(mkt) ? 'XAU' : 'USD')).toUpperCase();
+    var res = analyzeFinancialText(txt, mkt, cur);
+    var score = res.score;
+    if (!score && ev && ev.predicted_move) {
+      if (/\b(buy|up|rise|bull|rally|surge|higher)\b/i.test(ev.predicted_move)) score = 1;
+      else if (/\b(sell|down|drop|bear|fall|dip|lower)\b/i.test(ev.predicted_move)) score = -1;
+    }
+    if (score >= 0.4) return { side: 'BUY', strength: Math.min(86, Math.round(56 + score * 12)) };
+    if (score <= -0.4) return { side: 'SELL', strength: Math.min(86, Math.round(56 + Math.abs(score) * 12)) };
+    return { side: 'WAIT', strength: 0 };
+  }
+
+  function ageLabel(ts, nowSec) {
+    var t = Number(ts) || 0;
+    if (!t) return 'LIVE';
+    var diff = Math.round(t - nowSec);
+    if (diff > 60) {
+      var mAhead = Math.round(diff / 60);
+      return mAhead >= 60 ? 'in ' + Math.round(mAhead / 60) + 'h' : 'in ' + mAhead + 'm';
+    }
+    var ago = Math.max(1, Math.round((nowSec - t) / 60));
+    if (ago < 60) return ago + 'm ago';
+    if (ago < 1440) return Math.round(ago / 60) + 'h ago';
+    return Math.round(ago / 1440) + 'd ago';
+  }
+
+  function collectNext24Topics(next24List) {
+    var topics = [], seenT = Object.create(null);
+    for (var i = 0; i < next24List.length && topics.length < 3; i++) {
+      var ev = next24List[i];
+      if (!ev || !ev.title) continue;
+      var imp = String(ev.impact || '').toLowerCase();
+      if (imp !== 'high' && imp !== 'medium' && i > 2) continue;
+      var t = String(ev.title).trim().slice(0, 60);
+      var k = t.toLowerCase();
+      if (t && !seenT[k]) { seenT[k] = true; topics.push(t); }
+    }
+    return topics;
+  }
+
+  function ensureInternetResearch(next24List, force) {
+    var sym = String(symbol || 'XAUUSDm').trim();
+    if (!sym) return;
+    var cache = aiInternetCache[sym];
+    var nowMs = Date.now();
+    var ttl = force ? 15000 : 45000;
+    if (cache && (cache.busy || (!force && nowMs - cache.ts < ttl) || (force && cache.data && nowMs - cache.ts < 15000))) {
+      return;
+    }
+    var prevData = cache ? cache.data : null;
+    aiInternetCache[sym] = { ts: nowMs, busy: true, data: prevData, failed: false };
+    var topics = collectNext24Topics(next24List || []);
+    var qs = '/api/softradex-ai/research?symbol=' + encodeURIComponent(sym) +
+      (topics.length ? '&topics=' + encodeURIComponent(topics.join('||')) : '') +
+      (force ? '&force=1' : '');
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var abortTimer = controller ? setTimeout(function () { controller.abort(); }, 10000) : null;
+    fetch(qs, { cache: 'no-store', signal: controller ? controller.signal : undefined })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (data) {
+        if (!data || !data.ok) return;
+        var cur = aiInternetCache[sym] || { ts: 0, busy: false, data: null };
+        cur.ts = Date.now();
+        cur.busy = false;
+        cur.failed = false;
+        cur.data = data;
+        aiInternetCache[sym] = cur;
+        if (sym === String(symbol || 'XAUUSDm').trim()) {
+          updateAiWorldRobot(lastRobotInputs.upcoming, lastRobotInputs.headlines, Date.now() / 1000, lastRobotInputs.running, true);
+        }
+      })
+      .catch(function () {
+        if (aiInternetCache[sym]) {
+          aiInternetCache[sym].busy = false;
+          aiInternetCache[sym].failed = true;
+          if (aiRobotOpen && sym === String(symbol || 'XAUUSDm').trim()) {
+            updateAiWorldRobot(lastRobotInputs.upcoming, lastRobotInputs.headlines, Date.now() / 1000, lastRobotInputs.running, true);
+          }
+        }
+      })
+      .finally(function () { if (abortTimer) clearTimeout(abortTimer); });
+  }
+
+  function buildWorldNewsDigest(upcoming, headlines, now, running) {
+    var pool = [];
+    var seen = Object.create(null);
+    var seenTitle = Object.create(null);
+    var runningTimed = (Array.isArray(running) ? running : []).filter(function (e) { return e && e.kind !== 'headline' && phaseFor(e, now) === 'running'; });
+    var next24Raw = (Array.isArray(running) ? running : [])
+      .concat(Array.isArray(upcoming) ? upcoming : [])
+      .concat(Array.isArray(headlines) ? headlines : []);
+
+    var panelBuyScore = 0, panelSellScore = 0, panelBuyCount = 0, panelSellCount = 0, next24Count = 0;
+    var freshPanelBuy = 0, freshPanelSell = 0;
+
+    function recencyFactor(ev) {
+      var ts = Number(ev.ts) || now;
+      var age = now - ts;
+      if (ev.kind !== 'headline' && phaseFor(ev, now) === 'running') return 2.0;
+      if (age < 0) return Math.abs(age) <= 3 * 3600 ? 1.4 : 0.9;
+      if (age <= 2700) return 2.0;
+      if (age <= 7200) return 1.35;
+      if (age <= 21600) return 0.65;
+      return 0.25;
+    }
+
+    function pushPanelItem(ev, fromNext24) {
+      if (!ev) return;
+      var k = eventKey(ev);
+      var rawTitle = String(ev.title || ev.event || 'Market news');
+      var tk = rawTitle.trim().toLowerCase().replace(/\s+/g, ' ');
+      if (!tk || isMacroNoiseHeadline(rawTitle) || seen[k] || seenTitle[tk]) return;
+      seen[k] = true;
+      seenTitle[tk] = true;
+
+      // Read exact adjacent direction shown next to the news row in NEWS · NEXT 24H
+      var pred = directionalEstimate(ev, now);
+      var hasPanelDir = !!(pred && (pred.side === 'BUY' || pred.side === 'SELL'));
+      var inferred = hasPanelDir
+        ? { side: pred.side, strength: Math.max(25, Number(pred.strength) || 64) }
+        : (pred && pred.side === 'WAIT' ? { side: 'WAIT', strength: 0 } : inferWorldMacroSide(ev, symbol));
+
+      var imp = String(ev.impact || 'low').toLowerCase();
+      var impW = imp === 'high' ? 1.5 : imp === 'medium' ? 1.2 : 0.9;
+      var kindW = ev.kind === 'headline' ? 1.1 : 1.35;
+      var timeW = recencyFactor(ev);
+      var strW = inferred.strength > 0 ? inferred.strength / 100 : 0.35;
+      var weight = impW * kindW * timeW * strW;
+      var srcNames = (ev.sources || [ev.source || 'calendar']).map(function (srcKey) { return SOURCE_NAMES[srcKey] || srcKey; }).filter(Boolean).join(' + ');
+
+      if (fromNext24) {
+        next24Count++;
+        var isVeryRecent = (now - (Number(ev.ts) || now)) <= 10800;
+        if (inferred.side === 'BUY') {
+          panelBuyScore += weight; panelBuyCount++;
+          if (isVeryRecent) freshPanelBuy += weight;
+        } else if (inferred.side === 'SELL') {
+          panelSellScore += weight; panelSellCount++;
+          if (isVeryRecent) freshPanelSell += weight;
+        }
+      }
+
+      pool.push({
+        key: k,
+        tagKind: '24H',
+        title: rawTitle,
+        src: srcNames || 'NEXT 24H',
+        when: ageLabel(ev.ts, now),
+        ts: Number(ev.ts) || 0,
+        kind: ev.kind || 'event',
+        impact: imp,
+        hasPanelDir: hasPanelDir,
+        side: inferred.side,
+        strength: inferred.strength,
+        weight: weight
+      });
+    }
+
+    for (var i = 0; i < next24Raw.length; i++) pushPanelItem(next24Raw[i], true);
+
+    // Also inspect wider loaded items if NEXT 24H had few items
+    var extra = (Array.isArray(news) ? news : []).slice().sort(function (a, b) {
+      return (Number(b && b.ts) || 0) - (Number(a && a.ts) || 0);
+    });
+    for (var j = 0; j < extra.length && pool.length < 18; j++) {
+      if (relevanceFor(extra[j])) pushPanelItem(extra[j], true);
+    }
+
+    // Fuse Full-Internet Research from /api/softradex-ai/research + live M5/OrderFlow checks
+    var symKey = String(symbol || 'XAUUSDm').trim();
+    var netEntry = aiInternetCache[symKey];
+    var netData = netEntry && netEntry.data ? netEntry.data : null;
+    var webBuyScore = 0, webSellScore = 0, freshWebBuy = 0, freshWebSell = 0, webBuyHits = 0, webSellHits = 0, webCount = 0;
+    var webItems = [];
+    var dxyText = '';
+    var mac = (netData && netData.macro) || {};
+
+    if (netData && Array.isArray(netData.internet_articles)) {
+      for (var w = 0; w < netData.internet_articles.length; w++) {
+        var art = netData.internet_articles[w];
+        if (!art || !art.title) continue;
+        var wTitle = String(art.title).trim();
+        if (isMacroNoiseHeadline(wTitle)) continue;
+        var wtk = wTitle.toLowerCase().replace(/\s+/g, ' ');
+        var wSide = (art.side === 'BUY' || art.side === 'SELL') ? art.side : inferWorldMacroSide({ title: wTitle }, symbol).side;
+        var wStr = Number(art.strength) || (wSide === 'WAIT' ? 0 : 62);
+        var artTs = Number(art.ts) || now;
+        var artDecay = Math.max(0.2, Math.exp(-Math.max(0, now - artTs) / 7200));
+        var wWt = Number(art.weight) || (wSide === 'WAIT' ? 0.25 : 0.95 * artDecay);
+        var artFresh = (now - artTs) <= 10800;
+        if (wSide === 'BUY') {
+          webBuyScore += wWt; webBuyHits++;
+          if (artFresh) freshWebBuy += wWt;
+        } else if (wSide === 'SELL') {
+          webSellScore += wWt; webSellHits++;
+          if (artFresh) freshWebSell += wWt;
+        }
+        if (wtk && !seenTitle[wtk]) {
+          seenTitle[wtk] = true;
+          webCount++;
+          webItems.push({
+            key: 'web|' + wtk,
+            tagKind: 'WEB',
+            title: wTitle,
+            src: String(art.source || art.engine || 'INTERNET'),
+            when: ageLabel(artTs, now),
+            ts: artTs,
+            kind: 'web',
+            impact: 'high',
+            side: wSide,
+            strength: wStr,
+            weight: wWt
+          });
+        }
+      }
+      if (mac.dxy_impact_for_symbol === 'BUY' || mac.dxy_impact_for_symbol === 'SELL') {
+        var dxyMove = Number(mac.dxy_60m_pct != null && mac.sym_atr_impulse != null ? mac.dxy_60m_pct : (mac.dxy_change_pct || 0));
+        dxyText = 'DXY ' + (dxyMove >= 0 ? '+' : '') + dxyMove.toFixed(2) + '% -> ' + mac.dxy_impact_for_symbol;
+        var dxyW = Math.min(1.5, Math.max(0.9, 0.8 + Math.abs(dxyMove) * 2.5));
+        if (mac.dxy_impact_for_symbol === 'BUY') webBuyScore += dxyW;
+        else webSellScore += dxyW;
+      }
+    }
+
+    // Check real-time client M5 post-news reaction (anchored at running release ts, or last 15m for live headlines)
+    var m5Bars = getLiveM5Bars();
+    var qLive = liveQuote();
+    var swState = window.SwingAI && typeof window.SwingAI.state === 'function' ? window.SwingAI.state() : null;
+    var m5Atr = swState && swState.reads && swState.reads.M5 ? Number(swState.reads.M5.atr) || 0 : 0;
+    var hasRunningRelease = runningTimed.length > 0;
+    var baselineTs = hasRunningRelease ? Number(runningTimed[0].ts) : (now - 900);
+    var clientRx = m5Bars.length ? computePostEventReaction(m5Bars, baselineTs, now, qLive ? Number(qLive.price) : undefined, m5Atr) : null;
+    var liveRxAtr = clientRx && clientRx.ready
+      ? (hasRunningRelease ? clientRx.evMoveAtr : clientRx.impulse15mAtr)
+      : (mac.sym_atr_impulse != null ? Number(mac.sym_atr_impulse) : 0);
+    var hasLiveRx = (clientRx && clientRx.ready) || (mac.sym_atr_impulse != null);
+
+    if (hasLiveRx && Math.abs(liveRxAtr) >= 0.45) {
+      var rxW = Math.min(2.8, Math.abs(liveRxAtr) * 1.15);
+      if (liveRxAtr > 0) webBuyScore += rxW;
+      else webSellScore += rxW;
+      if (!dxyText) {
+        dxyText = 'M5 LIVE ' + (liveRxAtr >= 0 ? '+' : '') + liveRxAtr.toFixed(2) + ' ATR -> ' + (liveRxAtr > 0 ? 'BUY' : 'SELL');
+      } else {
+        dxyText += ' | M5 ' + (liveRxAtr >= 0 ? '+' : '') + liveRxAtr.toFixed(2) + ' ATR';
+      }
+    } else if (!hasLiveRx && (webBuyHits + webSellHits > 0)) {
+      if (Number(mac.tv_buyer_pct) >= 56) webBuyScore += 0.65;
+      else if (Number(mac.tv_buyer_pct) > 0 && Number(mac.tv_buyer_pct) <= 44) webSellScore += 0.65;
+    }
+
+    // Real multi-exchange order flow confirmation when meaningful prints are flowing
+    var flowApi = window.MultiExchangeOrderFlow;
+    var flowTotals = flowApi && typeof flowApi.getOpenTotals === 'function' ? flowApi.getOpenTotals() : null;
+    if (flowTotals && (Number(flowTotals.buy || 0) + Number(flowTotals.sell || 0)) > 0) {
+      var fTotal = Number(flowTotals.buy) + Number(flowTotals.sell);
+      var fBuyPct = (Number(flowTotals.buy) / fTotal) * 100;
+      if (fBuyPct >= 58) webBuyScore += 0.65;
+      else if (fBuyPct <= 42) webSellScore += 0.65;
+    }
+
+    var panelTotal = panelBuyScore + panelSellScore;
+    var panelDir = panelTotal <= 0 ? 'WAIT' : panelBuyScore >= panelSellScore ? 'BUY' : 'SELL';
+    var webTotal = webBuyScore + webSellScore;
+    var webDir = webTotal <= 0 ? 'WAIT' : webBuyScore >= webSellScore ? 'BUY' : 'SELL';
+
+    var totalBuy = panelBuyScore + webBuyScore;
+    var totalSell = panelSellScore + webSellScore;
+    var combinedTotal = totalBuy + totalSell;
+
+    var dir = 'WAIT', pct = 0, conflictWarn = false;
+    var rxThresh = hasRunningRelease ? 0.65 : 1.35;
+    var hasStrongLiveUp = hasLiveRx && liveRxAtr >= rxThresh;
+    var hasStrongLiveDown = hasLiveRx && liveRxAtr <= -rxThresh;
+
+    if (combinedTotal > 0) {
+      var rawDir = totalBuy >= totalSell ? 'BUY' : 'SELL';
+      var liveOppose = (rawDir === 'SELL' && hasStrongLiveUp) || (rawDir === 'BUY' && hasStrongLiveDown);
+      if (liveOppose) {
+        var oppLiveSide = liveRxAtr > 0 ? 'BUY' : 'SELL';
+        var freshOppText = oppLiveSide === 'BUY' ? (freshPanelSell + freshWebSell) : (freshPanelBuy + freshWebBuy);
+        if (freshOppText < 2.2 && Math.abs(liveRxAtr) >= 0.85) {
+          dir = oppLiveSide;
+          pct = Math.min(72, Math.max(55, Math.round(52 + Math.abs(liveRxAtr) * 8)));
+        } else {
+          conflictWarn = true;
+          dir = 'WAIT';
+          pct = 42;
+        }
+      } else if (mac.conflict && ((panelBuyCount + panelSellCount === 0) || webDir === 'WAIT')) {
+        conflictWarn = true;
+        dir = 'WAIT';
+        pct = 40;
+      } else if (Math.abs(totalBuy - totalSell) / combinedTotal >= 0.04) {
+        dir = totalBuy > totalSell ? 'BUY' : 'SELL';
+        pct = Math.max(54, Math.min(96, Math.round((Math.max(totalBuy, totalSell) / combinedTotal) * 100)));
+      } else if (mac.dxy_impact_for_symbol === 'BUY' || mac.dxy_impact_for_symbol === 'SELL') {
+        dir = mac.dxy_impact_for_symbol;
+        pct = 54;
+      } else {
+        dir = 'WAIT';
+        pct = 45;
+      }
+    }
+
+    var webState = '24H LOCAL';
+    if (conflictWarn) webState = 'CONFLICT · WAIT';
+    else if (netEntry && netEntry.busy && !netData) webState = 'CHECKING WEB...';
+    else if (netData && Array.isArray(netData.sources_checked) && netData.sources_checked.length > 1) {
+      if (webDir === 'WAIT') webState = 'WEB SCANNED';
+      else if (hasStrongLiveUp && dir === 'BUY' && panelDir === 'SELL') webState = 'PRICE + WEB -> BUY';
+      else if (hasStrongLiveDown && dir === 'SELL' && panelDir === 'BUY') webState = 'PRICE + WEB -> SELL';
+      else if (panelDir !== 'WAIT' && panelDir === webDir) webState = 'WEB CONFIRMED ' + dir;
+      else if (panelDir !== 'WAIT' && panelDir !== dir) webState = 'WEB REVISED -> ' + dir;
+      else webState = 'WEB DATA -> ' + dir;
+    }
+
+    // Build top visible list combining NEXT 24H rows (sorted by recency/impact) + live Web check headlines
+    pool.sort(function (a, b) {
+      var ai = a.impact === 'high' ? 2 : a.impact === 'medium' ? 1 : 0;
+      var bi = b.impact === 'high' ? 2 : b.impact === 'medium' ? 1 : 0;
+      return b.weight - a.weight || (bi - ai) || b.ts - a.ts;
+    });
+    var displayItems = [];
+    var pIdx = 0, wIdx = 0;
+    while (displayItems.length < 5 && (pIdx < pool.length || wIdx < webItems.length)) {
+      if (pIdx < pool.length && (displayItems.length < 3 || wIdx >= webItems.length)) displayItems.push(pool[pIdx++]);
+      else if (wIdx < webItems.length) displayItems.push(webItems[wIdx++]);
+    }
+
+    var mktLabel = symbol || 'MARKET';
+    var topCue = displayItems[0] ? displayItems[0].title : '';
+    var srcList = (netData && Array.isArray(netData.sources_checked) ? netData.sources_checked : ['NEWS · NEXT 24H']).slice(0, 4).join(', ');
+    var msg = '';
+    if (conflictWarn) {
+      msg = 'WAIT (Price/News Conflict) - Headlines leaned ' + (totalBuy >= totalSell ? 'BUY' : 'SELL') + ' while live M5 price moved ' +
+        (liveRxAtr > 0 ? 'UP +' : 'DOWN ') + liveRxAtr.toFixed(2) + ' ATR. Do NOT counter-trade until price & news align.';
+    } else if (dir === 'WAIT') {
+      msg = 'No clear directional consensus yet for ' + mktLabel + ' - waiting for confirmed news or live M5 breakout.';
+    } else {
+      var actionVerb = webState.indexOf('CONFIRMED') >= 0 ? 'Confirmed' : webState.indexOf('PRICE') >= 0 ? 'Live price + web confirmed' : webState.indexOf('REVISED') >= 0 ? 'Revised via internet check' : 'Aligned';
+      msg = 'TAKE ' + dir + ' (' + actionVerb + ') - Read ' + next24Count + ' NEXT 24H items (' + panelBuyCount + ' BUY / ' + panelSellCount + ' SELL)' +
+        (netData ? ' + checked ' + (netData.internet_articles ? netData.internet_articles.length : 0) + ' web news (' + srcList + ')' : '') +
+        (dxyText ? ' | ' + dxyText : '') + (topCue ? '. Top: ' + topCue : '');
+    }
+
+    return {
+      dir: dir,
+      pct: pct,
+      headlineCount: next24Count + webCount,
+      next24Count: next24Count,
+      webCount: netData && Array.isArray(netData.internet_articles) ? netData.internet_articles.length : webCount,
+      panelBuyCount: panelBuyCount,
+      panelSellCount: panelSellCount,
+      panelDir: panelDir,
+      webDir: webDir,
+      webBuyHits: webBuyHits,
+      webSellHits: webSellHits,
+      webState: webState,
+      webSources: netData && Array.isArray(netData.sources_checked) ? netData.sources_checked : ['NEWS · NEXT 24H'],
+      dxyText: dxyText,
+      msg: msg,
+      market: mktLabel,
+      items: displayItems
+    };
+  }
+
+  function ensureAiRobotPop() {
+    var pop = $('mnt-ai-robot-pop');
+    var host = document.fullscreenElement || $('dash') || document.body;
+    if (!pop) {
+      pop = document.createElement('div');
+      pop.id = 'mnt-ai-robot-pop';
+      pop.className = 'mnt-ai-robot-pop';
+      pop.setAttribute('role', 'dialog');
+      pop.setAttribute('aria-label', 'Softradex AI World News Reader');
+      pop.hidden = true;
+      pop.addEventListener('mouseenter', clearAiCloseTimer);
+      pop.addEventListener('mouseleave', scheduleCloseAiPop);
+      pop.addEventListener('pointerenter', clearAiCloseTimer);
+    }
+    if (host && pop.parentElement !== host) host.appendChild(pop);
+    return pop;
+  }
+
+  function positionAiRobotPop(btn, pop) {
+    if (!btn || !pop) return;
+    var r = btn.getBoundingClientRect();
+    var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+    var vh = window.innerHeight || document.documentElement.clientHeight || 800;
+    var pw = Math.min(352, vw - 16);
+    pop.style.width = pw + 'px';
+    var ph = pop.offsetHeight || 280;
+    var left = r.right - pw;
+    if (left < 8) left = Math.max(8, Math.min(vw - pw - 8, r.left));
+    var top = r.bottom + 8;
+    if (top + ph > vh - 8) top = Math.max(8, r.top - ph - 8);
+    pop.style.left = Math.round(left) + 'px';
+    pop.style.top = Math.round(top) + 'px';
+  }
+
+  function renderAiRobotPopContent() {
+    var pop = ensureAiRobotPop();
+    var st = aiWorldState;
+    var sideCls = st.dir === 'BUY' ? 'buy' : st.dir === 'SELL' ? 'sell' : 'wait';
+    var callText = st.dir === 'BUY' ? 'TAKE BUY &uarr;' : st.dir === 'SELL' ? 'TAKE SELL &darr;' : 'WAIT / MIXED &loz;';
+    var netTagCls = st.webDir === 'BUY' ? 'buy' : st.webDir === 'SELL' ? 'sell' : sideCls;
+    var itemsHtml = st.items.length
+      ? st.items.map(function (it) {
+          var cls = it.side === 'BUY' ? 'buy' : it.side === 'SELL' ? 'sell' : 'wait';
+          var pill = it.side === 'BUY' ? 'BUY &uarr;' : it.side === 'SELL' ? 'SELL &darr;' : 'NEWS';
+          var kindCls = it.tagKind === 'WEB' ? 'web' : 'local';
+          return '<div class="arp-item ' + cls + '">' +
+            '<div class="arp-item-top">' +
+            '<span class="arp-badge-kind ' + kindCls + '">' + esc(it.tagKind) + '</span>' +
+            '<span class="arp-src">' + esc(it.src) + '</span>' +
+            '<span class="arp-when">' + esc(it.when) + '</span>' +
+            '<b class="arp-pill ' + cls + '">' + pill + '</b></div>' +
+            '<div class="arp-title">' + esc(it.title) + '</div></div>';
+        }).join('')
+      : '<div class="arp-empty">Softradex AI is reading NEXT 24H news &amp; scanning the internet for ' + esc(st.market || symbol || 'MARKET') + '...</div>';
+
+    pop.innerHTML =
+      '<div class="arp-head">' +
+        '<span class="arp-head-dot ' + sideCls + '"></span>' +
+        '<b>SOFTRADEX AI &middot; ' + esc(st.market || symbol || 'MARKET') + '</b>' +
+        '<em>' + st.next24Count + ' 24H &middot; ' + st.webCount + ' WEB</em>' +
+      '</div>' +
+      '<div class="arp-net-bar">' +
+        '<span>24H PANEL: <b>' + st.panelBuyCount + ' BUY / ' + st.panelSellCount + ' SELL</b></span>' +
+        (st.dxyText ? '<span>' + esc(st.dxyText) + '</span>' : '') +
+        '<em class="arp-net-tag ' + netTagCls + '">' + esc(st.webState) + '</em>' +
+      '</div>' +
+      '<div class="arp-list">' + itemsHtml + '</div>' +
+      '<div class="arp-verdict ' + sideCls + '">' +
+        '<div class="arp-v-row">' +
+          '<span class="arp-v-lbl">FINAL AI DIRECTION</span>' +
+          '<strong class="arp-v-call ' + sideCls + '">' + callText + '</strong>' +
+          '<em class="arp-v-pct">' + (st.pct ? st.pct + '% CONF' : 'SCANNING') + '</em>' +
+        '</div>' +
+        '<div class="arp-v-bar"><i class="' + sideCls + '" style="width:' + Math.max(8, st.pct || 18) + '%"></i></div>' +
+        '<p class="arp-v-msg">' + esc(st.msg) + '</p>' +
+      '</div>';
+    return pop;
+  }
+
+  function openAiRobotPop(pin) {
+    clearAiCloseTimer();
+    if (pin === true) aiRobotPinned = true;
+    var btn = $('mnt-ai-robot');
+    if (!btn) return;
+    aiRobotOpen = true;
+    var next24Raw = lastRobotInputs.running.concat(lastRobotInputs.upcoming, lastRobotInputs.headlines);
+    ensureInternetResearch(next24Raw, false);
+    var pop = renderAiRobotPopContent();
+    pop.hidden = false;
+    btn.classList.add('open');
+    btn.setAttribute('aria-expanded', 'true');
+    positionAiRobotPop(btn, pop);
+  }
+
+  function closeAiRobotPop(force) {
+    clearAiCloseTimer();
+    if (aiRobotPinned && !force) return;
+    aiRobotOpen = false;
+    aiRobotPinned = false;
+    var btn = $('mnt-ai-robot');
+    var pop = $('mnt-ai-robot-pop');
+    if (btn) {
+      btn.classList.remove('open');
+      btn.setAttribute('aria-expanded', 'false');
+    }
+    if (pop) pop.hidden = true;
+  }
+
+  function scheduleCloseAiPop() {
+    clearAiCloseTimer();
+    if (aiRobotPinned) return;
+    aiCloseTimer = setTimeout(function () { closeAiRobotPop(false); }, 170);
+  }
+
+  function bindAiWorldRobot() {
+    var btn = $('mnt-ai-robot');
+    if (!btn || btn.dataset.aiBound) return;
+    btn.dataset.aiBound = '1';
+    btn.addEventListener('mouseenter', function () { openAiRobotPop(false); });
+    btn.addEventListener('pointerenter', function () { openAiRobotPop(false); });
+    btn.addEventListener('focus', function () { openAiRobotPop(false); });
+    btn.addEventListener('mouseleave', scheduleCloseAiPop);
+    btn.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (aiRobotOpen && aiRobotPinned) closeAiRobotPop(true);
+      else openAiRobotPop(true);
+    });
+    document.addEventListener('click', function (e) {
+      if (!aiRobotOpen) return;
+      var t = e.target;
+      var pop = $('mnt-ai-robot-pop');
+      if (btn.contains(t) || (pop && pop.contains(t))) return;
+      closeAiRobotPop(true);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && aiRobotOpen) closeAiRobotPop(true);
+    });
+    window.addEventListener('resize', function () {
+      if (aiRobotOpen) positionAiRobotPop($('mnt-ai-robot'), $('mnt-ai-robot-pop'));
+    });
+  }
+
+  function updateAiWorldRobot(upcoming, headlines, now, running, skipFetch) {
+    bindAiWorldRobot();
+    lastRobotInputs = {
+      upcoming: Array.isArray(upcoming) ? upcoming : [],
+      headlines: Array.isArray(headlines) ? headlines : [],
+      running: Array.isArray(running) ? running : []
+    };
+    if (!skipFetch) {
+      ensureInternetResearch(lastRobotInputs.running.concat(lastRobotInputs.upcoming, lastRobotInputs.headlines), false);
+    }
+    aiWorldState = buildWorldNewsDigest(lastRobotInputs.upcoming, lastRobotInputs.headlines, now, lastRobotInputs.running);
+    var btn = $('mnt-ai-robot');
+    var badge = $('mnt-ai-bot-side');
+    if (btn) {
+      btn.classList.toggle('is-buy', aiWorldState.dir === 'BUY');
+      btn.classList.toggle('is-sell', aiWorldState.dir === 'SELL');
+      btn.classList.toggle('is-wait', aiWorldState.dir === 'WAIT');
+    }
+    if (badge) {
+      var cls = aiWorldState.dir === 'BUY' ? 'buy' : aiWorldState.dir === 'SELL' ? 'sell' : 'wait';
+      badge.className = cls;
+      badge.textContent = aiWorldState.dir === 'BUY' ? 'BUY' : aiWorldState.dir === 'SELL' ? 'SELL' : (aiWorldState.headlineCount ? 'WAIT' : 'SCAN');
+    }
+    if (aiRobotOpen) {
+      var pop = renderAiRobotPopContent();
+      positionAiRobotPop(btn, pop);
+    }
   }
   function updateWindow(nowSec) {
     var minute = Math.floor((nowSec || Date.now() / 1000) / 60);
@@ -952,7 +1453,7 @@ export function loadModule(): void {
     window.addEventListener('chart:market', function(e) {
       var d = e.detail || {}, next = String(d.symbol || (d.meta && d.meta.symbol) || symbol);
       var changed = next !== symbol;
-      if (changed) { newsSnapshotReady = false; eventReferences = Object.create(null); news = []; sourceStatus=[]; lastNewsHtml=Object.create(null); lastSourcesHtml=''; lastSourceSummary=''; newsServerSig=''; lastSavedSig=''; newsMergeGen++; cachedHeadlinesKey=''; workerEstimates=Object.create(null); workerBatchGen++; lastWorkerKey=''; lastQuoteNewsAt=0; lastQuoteNewsPrice=NaN; clearTimeout(quoteNewsTimer); quoteNewsTimer=null; if (newsAbort) newsAbort.abort(); clearTimeout(newsRetryTimer); newsRequest++; newsBusy = false; newsFailures=0; scanState='scanning'; }
+      if (changed) { newsSnapshotReady = false; eventReferences = Object.create(null); dirEstCache = Object.create(null); lastListRenderSig = Object.create(null); news = []; sourceStatus=[]; lastNewsHtml=Object.create(null); lastSourcesHtml=''; lastSourceSummary=''; newsServerSig=''; lastSavedSig=''; newsMergeGen++; cachedHeadlinesKey=''; workerEstimates=Object.create(null); workerBatchGen++; lastWorkerKey=''; lastQuoteNewsAt=0; lastQuoteNewsPrice=NaN; clearTimeout(quoteNewsTimer); quoteNewsTimer=null; if (newsAbort) newsAbort.abort(); clearTimeout(newsRetryTimer); newsRequest++; newsBusy = false; newsFailures=0; scanState='scanning'; }
       symbol = next; if (changed) restoreNews(); renderNews(); renderPressure(); fetchNews(true);
     });
     window.addEventListener('chart:tv-quote', function(e) {
@@ -980,7 +1481,8 @@ export function loadModule(): void {
       if (!d.symbol || marketMatch(d.symbol, symbol)) renderPressure();
     });
     refreshTimer = setInterval(function() { if (!document.hidden) { fetchNews(); renderPressure(); } }, 15000);
-    fetchNews(true); renderNews(); renderPressure(); updateMntTimers(); syncButton();
+    bindAiWorldRobot(); fetchNews(true); syncButton();
+    requestAnimationFrame(function() { renderNews(); renderPressure(); updateMntTimers(); });
   }
   // Keep the impact countdown alive even when the workspace init is delayed
   // or the panel is re-mounted; a hidden browser tab is throttled by Chrome.
@@ -992,8 +1494,25 @@ export function loadModule(): void {
   window.ChartWorkspace = { relevanceFor: relevanceFor, impactFor: impactFor,
     directionFor: function(ev, market) { return ev && marketMatch(market, symbol) ? directionalEstimate(ev, Date.now()/1000) : null; },
     expand: function(){setExpanded(true);}, close: function(){setExpanded(false);}, refresh: function(){fetchNews(true);renderPressure();},
-    newsState: function(){var now=Date.now()/1000; return {symbol:symbol,sources:sourceStatus,events:visibleEvents(now),
-      signals:visibleEvents(now).map(function(e) { return {title:e.title,phase:phaseFor(e,now),estimate:directionalEstimate(e,now)}; })};} };
+    aiNewsState: function(){ return Object.assign({}, aiWorldState, { open: aiRobotOpen }); },
+    newsState: function(){
+      var now = Date.now() / 1000;
+      var evs = visibleEvents(now);
+      var res = { symbol: symbol, sources: sourceStatus, events: evs };
+      var cachedSigs = null;
+      Object.defineProperty(res, 'signals', {
+        enumerable: true,
+        get: function() {
+          if (!cachedSigs) {
+            cachedSigs = evs.map(function(e) {
+              return { title: e.title, phase: phaseFor(e, now), estimate: directionalEstimate(e, now) };
+            });
+          }
+          return cachedSigs;
+        }
+      });
+      return res;
+    } };
 })();
 
 

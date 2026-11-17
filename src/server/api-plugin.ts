@@ -16,6 +16,7 @@ import {
   getNewsReadingPayload,
   getNewsSignature,
   refreshLiveNews,
+  researchMarketWithInternet,
 } from './news-feed';
 
 let sessionMarket = 'XAUUSDm';
@@ -23,6 +24,26 @@ let aiMarket = 'XAUUSDm';
 let aiTimeframe = 'M5';
 
 const RES_TO_REQ = new WeakMap<ServerResponse, IncomingMessage>();
+
+const venueTradeCache = new Map<string, { exp: number; data: any }>();
+const inflightVenueTrades = new Map<string, Promise<any>>();
+const VENUE_CACHE_TTL_MS = 7500;
+let stateRespCache: { key: string; exp: number; json: string; gz: Buffer } | null = null;
+
+function sendPreencoded(res: ServerResponse, status: number, json: string, gz: Buffer | null): void {
+  const req = RES_TO_REQ.get(res);
+  const wantsGzip = Boolean(gz && json.length >= 1024 && /\bgzip\b/i.test(String(req?.headers?.['accept-encoding'] || '')));
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  if (wantsGzip && gz) {
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Vary', 'Accept-Encoding');
+    res.end(gz);
+  } else {
+    res.end(json);
+  }
+}
 
 function sendJson(res: ServerResponse, status: number, body: any): void {
   const payload = JSON.stringify(body);
@@ -65,7 +86,7 @@ function readBody(req: IncomingMessage): Promise<any> {
   });
 }
 
-async function fetchVenueTrades(venue: string, market: string, limit = 80) {
+async function fetchVenueTradesUncached(venue: string, market: string, limit = 80) {
   const v = String(venue || 'binance').toLowerCase();
   const base = String(market || 'BTC').toUpperCase().replace(/USDT?M?$/, '').replace(/M$/, '') || 'BTC';
   const coin = ['XAU', 'GOLD', 'XAUUSD', 'XAUUSD247'].includes(base) ? 'PAXG' : base;
@@ -217,6 +238,30 @@ async function fetchVenueTrades(venue: string, market: string, limit = 80) {
   return { ok: true, venue: v, market: coin, trades: [] };
 }
 
+async function fetchVenueTrades(venue: string, market: string, limit = 80) {
+  const v = String(venue || 'binance').toLowerCase();
+  const base = String(market || 'BTC').toUpperCase().replace(/USDT?M?$/, '').replace(/M$/, '') || 'BTC';
+  const coin = ['XAU', 'GOLD', 'XAUUSD', 'XAUUSD247'].includes(base) ? 'PAXG' : base;
+  const lim = Math.min(200, Math.max(20, Number(limit) || 80));
+  const key = `${v}|${coin}|${lim}`;
+  const now = Date.now();
+  const hit = venueTradeCache.get(key);
+  if (hit && now < hit.exp) return hit.data;
+  let pending = inflightVenueTrades.get(key);
+  if (!pending) {
+    pending = fetchVenueTradesUncached(v, market, lim)
+      .then((data) => {
+        venueTradeCache.set(key, { exp: Date.now() + VENUE_CACHE_TTL_MS, data });
+        return data;
+      })
+      .finally(() => {
+        if (inflightVenueTrades.get(key) === pending) inflightVenueTrades.delete(key);
+      });
+    inflightVenueTrades.set(key, pending);
+  }
+  return pending;
+}
+
 export async function handleApiRequest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   RES_TO_REQ.set(res, req);
   const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
@@ -285,8 +330,14 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     const have = (urlObj.searchParams.get('have') || '').trim();
     const sig = getNewsSignature();
     const omitNews = Boolean(have && have === sig);
+    const cacheKey = `${omitNews ? '1' : '0'}|${sig}|${sessionMarket}|${aiMarket}|${aiTimeframe}`;
+    const nowMs = Date.now();
+    if (stateRespCache && stateRespCache.key === cacheKey && nowMs < stateRespCache.exp) {
+      sendPreencoded(res, 200, stateRespCache.json, stateRespCache.gz);
+      return true;
+    }
     const newsPayload = getNewsReadingPayload(sessionMarket, omitNews);
-    const nowSec = Math.floor(Date.now() / 1000);
+    const nowSec = Math.floor(nowMs / 1000);
     const watches = getLiveMarketWatches(false);
 
     const bot5: any = {
@@ -312,7 +363,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       bot5.news = newsPayload.events;
     }
 
-    sendJson(res, 200, {
+    const body = {
       version: 3,
       connected: true,
       public_only: true,
@@ -326,7 +377,14 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       market_watch: watches,
       bot3: buildBot3Payload(sessionMarket),
       bot5,
-    });
+    };
+    const json = JSON.stringify(body);
+    let gz: Buffer | null = null;
+    try {
+      if (json.length >= 1024) gz = zlib.gzipSync(json);
+    } catch {}
+    if (gz) stateRespCache = { key: cacheKey, exp: nowMs + 1500, json, gz };
+    sendPreencoded(res, 200, json, gz);
     return true;
   }
 
@@ -339,6 +397,16 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     const omitNews = Boolean(!scan && have && have === sig);
     const payload = getNewsReadingPayload(symbol, omitNews);
     sendJson(res, 200, omitNews ? { ...payload, news_omitted: true, news_sig: sig } : { ...payload, news_sig: sig });
+    return true;
+  }
+
+  if (pathname === '/api/softradex-ai/research') {
+    const symbol = urlObj.searchParams.get('symbol') || sessionMarket || 'XAUUSDm';
+    const topicsRaw = (urlObj.searchParams.get('topics') || '').trim();
+    const topics = topicsRaw ? topicsRaw.split('||').map(s => s.trim()).filter(Boolean).slice(0, 3) : [];
+    const force = urlObj.searchParams.get('force') === '1' || urlObj.searchParams.get('force') === 'true';
+    const research = await researchMarketWithInternet(symbol, topics, force);
+    sendJson(res, 200, research);
     return true;
   }
 

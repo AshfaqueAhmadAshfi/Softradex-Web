@@ -107,14 +107,19 @@ export function loadModule(): void {
   }
   function eventImpacts(event, symbols, selected, now, relevant, estimate, contextFor, news) {
     if (!event) return [];
-    const headlines = (news || []).filter(e => e && newsPhase(e, now) === 'context');
+    const headlines = (news || [])
+      .filter(e => e && newsPhase(e, now) === 'context')
+      .sort((a, b) => Number(b.ts) - Number(a.ts));
+    headlines.forEach(h => {
+      if (h && h.title && !h._titleLower) h._titleLower = String(h.title).toLowerCase();
+    });
     return marketList(symbols, selected).filter(symbol => relevant(event, symbol)).map(symbol => {
       const context = contextFor ? contextFor(symbol) || {} : {};
       const market = context.market && canonical(context.market.symbol) === canonical(symbol)
         ? { ...context.market, symbol } : null;
       const quote = context.quote && canonical(context.quote.symbol) === canonical(symbol)
         ? { ...context.quote, symbol } : null;
-      let reading = estimate(event, symbol, { market, quote,
+      let reading = estimate(event, symbol, { market, quote, headlinesPreSorted: true,
         headlines: headlines.filter(e => relevant(e, symbol)) });
       if (reading && reading.market && canonical(reading.market) !== canonical(symbol)) reading = null;
       const side = reading && ['BUY', 'SELL'].includes(reading.side) ? reading.side : '';
@@ -170,23 +175,45 @@ export function loadModule(): void {
       window_start: window.start, window_end: window.end,
       reason: move !== null ? 'Estimated travel from measured D1 ATR; signal strength is not a probability.' : 'Fresh daily candles and quote are required for a price-range estimate.' };
   }
+  const _outlookRowCache = new Map();
+  let _outlookEventsSig = '';
   function outlookAll(events, symbols, selected, now, relevant, estimate, contextFor) {
     const window = tomorrowWindow(now);
-    // Filter the time window once. Hundreds of past headlines should not be
-    // scanned against every market on every live dashboard repaint.
+    const evLen = events ? events.length : 0;
+    const evSig = `${evLen}|${evLen ? (events[0]?.ts || 0) : 0}|${evLen ? (events[evLen - 1]?.ts || 0) : 0}|${window.start}`;
+    if (_outlookEventsSig !== evSig || _outlookRowCache.size > 128) {
+      _outlookRowCache.clear();
+      _outlookEventsSig = evSig;
+    }
+    // Filter & sort the time windows once so 28+ market rows do not re-sort
+    // hundreds of headlines on every evaluation.
     const upcoming = (events || []).filter(e => e && e.kind !== 'headline' &&
       Number(e.ts) >= window.start && Number(e.ts) < window.end);
-    const published = (events || []).filter(e => e && newsPhase(e, now) === 'context');
+    const published = (events || [])
+      .filter(e => e && newsPhase(e, now) === 'context')
+      .sort((a, b) => Number(b.ts) - Number(a.ts));
+    published.forEach(h => {
+      if (h && h.title && !h._titleLower) h._titleLower = String(h.title).toLowerCase();
+    });
+    const timeBucket = Math.floor(now / 20);
     return marketList(symbols, selected).map(symbol => {
       const context = contextFor ? contextFor(symbol) || {} : {};
       // News, quote and candle context must belong to this row, even when the
       // caller supplies the currently selected market's snapshot for every row.
       const market = context.market && canonical(context.market.symbol) === canonical(symbol) ? context.market : null;
       const quote = context.quote && canonical(context.quote.symbol) === canonical(symbol) ? context.quote : null;
+      const mD1 = market && market.fresh && market.reads && market.reads.D1;
+      const qFresh = quote && Number(quote.price) > 0 && now * 1000 - Number(quote.at) <= 15000 ? 1 : 0;
+      const mScore = market && market.fresh && market.vote ? Math.round((Number(market.vote.score) || 0) * 4) : '';
+      const rowKey = `${symbol}|${mD1 && mD1.ready ? Number(mD1.atr || 0).toFixed(4) : ''}|${mScore}|${qFresh}|${timeBucket}`;
+      const cachedRow = _outlookRowCache.get(rowKey);
+      if (cachedRow) return cachedRow;
       const news = upcoming.filter(e => relevant(e, symbol));
       const headlines = news.length ? published.filter(e => relevant(e, symbol)) : [];
-      return outlook(news, symbol, now, relevant,
-        event => estimate(event, symbol, { market, quote, headlines }), market, quote);
+      const row = outlook(news, symbol, now, relevant,
+        event => estimate(event, symbol, { market, quote, headlines, headlinesPreSorted: true }), market, quote);
+      _outlookRowCache.set(rowKey, row);
+      return row;
     });
   }
   const api = { canonical, marketList, impactSeconds, newsKind, newsExpires, newsPhase, selectEvent, eventImpacts, tomorrowWindow, outlook, outlookAll };
@@ -579,10 +606,16 @@ export function loadModule(): void {
     }).join('');
     tabs.innerHTML = rows;
     tabs.dataset.ready = '1';
+    updateActiveTabs._lastKey = '';
     updateActiveTabs();
   }
 
   function updateActiveTabs() {
+    const tabKey = `${currentSymbol}|${currentInterval}|${currentCategory}`;
+    if (updateActiveTabs._lastKey === tabKey) return;
+    const symChanged = updateActiveTabs._lastSym !== currentSymbol;
+    updateActiveTabs._lastKey = tabKey;
+    updateActiveTabs._lastSym = currentSymbol;
     let activeBtn = null;
     document.querySelectorAll('#binance-symbol-tabs .b-tab-btn').forEach(btn => {
       const isAct = btn.dataset.symbol === currentSymbol;
@@ -595,17 +628,20 @@ export function loadModule(): void {
     document.querySelectorAll('#exness-cat-tabs .exness-cat-btn').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.cat === currentCategory);
     });
-    // Bring the active symbol into the tab strip ONLY inside that strip.
-    // scrollIntoView() also scrolled every ancestor - including the page - so
-    // selecting a market yanked the reader back to the top of the dashboard.
-    const strip = document.getElementById('binance-symbol-tabs');
-    if (activeBtn && strip) {
-      try {
-        const left = activeBtn.offsetLeft - (strip.clientWidth - activeBtn.offsetWidth) / 2;
-        strip.scrollTo({ left: Math.max(0, left), behavior: 'smooth' });
-      } catch (e) {
-        try { strip.scrollLeft = Math.max(0, activeBtn.offsetLeft - strip.clientWidth / 2); } catch (e2) {}
-      }
+    // Bring the active symbol into the tab strip ONLY when symbol changes,
+    // deferred past the style writes to avoid forced synchronous reflow.
+    if (symChanged && activeBtn) {
+      const targetBtn = activeBtn;
+      requestAnimationFrame(() => {
+        const strip = document.getElementById('binance-symbol-tabs');
+        if (!strip || !targetBtn.isConnected) return;
+        try {
+          const left = targetBtn.offsetLeft - (strip.clientWidth - targetBtn.offsetWidth) / 2;
+          strip.scrollTo({ left: Math.max(0, left), behavior: 'smooth' });
+        } catch (e) {
+          try { strip.scrollLeft = Math.max(0, targetBtn.offsetLeft - strip.clientWidth / 2); } catch (e2) {}
+        }
+      });
     }
   }
 
@@ -1461,12 +1497,9 @@ export function loadModule(): void {
         ctx.fill();
         ctx.strokeStyle = '#059669';
         ctx.lineWidth = 1.2;
-        ctx.shadowColor = 'rgba(5, 150, 105, 0.35)';
-        ctx.shadowBlur = 7;
         ctx.stroke();
 
         // Badge Text
-        ctx.shadowBlur = 0;
         ctx.fillStyle = '#059669';
         ctx.font = 'bold 8.5px "JetBrains Mono", monospace';
         ctx.textAlign = 'center';
@@ -1492,12 +1525,9 @@ export function loadModule(): void {
         ctx.fill();
         ctx.strokeStyle = '#dc2626';
         ctx.lineWidth = 1.2;
-        ctx.shadowColor = 'rgba(220, 38, 38, 0.3)';
-        ctx.shadowBlur = 7;
         ctx.stroke();
 
         // Badge Text
-        ctx.shadowBlur = 0;
         ctx.fillStyle = '#dc2626';
         ctx.font = 'bold 8.5px "JetBrains Mono", monospace';
         ctx.textAlign = 'center';
@@ -1505,17 +1535,14 @@ export function loadModule(): void {
         ctx.fillText('🐋 SELL', x, badgeY + badgeH / 2);
       }
 
-      // If active candle has live whale trade, draw glowing radar pulse ring
+      // If active candle has live whale trade, draw crisp radar pulse ring
       if (isLast && c.whale.realtime) {
         const pulseY = priceToY(c.close);
         ctx.strokeStyle = isBuy ? '#059669' : '#dc2626';
         ctx.lineWidth = 1.5;
-        ctx.shadowColor = isBuy ? '#059669' : '#dc2626';
-        ctx.shadowBlur = 10;
         ctx.beginPath();
         ctx.arc(x, pulseY, 7, 0, Math.PI * 2);
         ctx.stroke();
-        ctx.shadowBlur = 0;
       }
 
       ctx.restore();
@@ -1581,10 +1608,7 @@ export function loadModule(): void {
       ctx.fill();
       ctx.strokeStyle = '#2563eb';
       ctx.lineWidth = 1.2;
-      ctx.shadowColor = 'rgba(37, 99, 235, 0.3)';
-      ctx.shadowBlur = 8;
       ctx.stroke();
-      ctx.shadowBlur = 0;
 
       ctx.fillStyle = '#2563eb';
       ctx.font = 'bold 9px "JetBrains Mono", monospace';
@@ -1668,11 +1692,8 @@ export function loadModule(): void {
         ctx.fill();
         ctx.strokeStyle = isBuy ? '#059669' : '#dc2626';
         ctx.lineWidth = 1.2;
-        ctx.shadowColor = isBuy ? 'rgba(5, 150, 105, 0.3)' : 'rgba(220, 38, 38, 0.3)';
-        ctx.shadowBlur = 12;
         ctx.stroke();
 
-        ctx.shadowBlur = 0;
         ctx.font = 'bold 9.5px "JetBrains Mono", monospace';
         ctx.fillStyle = isBuy ? (dark ? '#34d399' : '#059669') : (dark ? '#f87171' : '#dc2626');
         ctx.textAlign = 'left';
@@ -1716,11 +1737,8 @@ export function loadModule(): void {
       ctx.fill();
       ctx.strokeStyle = isBuy ? '#059669' : '#dc2626';
       ctx.lineWidth = 1.2;
-      ctx.shadowColor = isBuy ? 'rgba(5, 150, 105, 0.7)' : 'rgba(220, 38, 38, 0.7)';
-      ctx.shadowBlur = 12;
       ctx.stroke();
 
-      ctx.shadowBlur = 0;
       ctx.font = 'bold 9.5px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -1815,15 +1833,18 @@ export function loadModule(): void {
     const box = $('binance-canvas-box');
     if (!box || !canvas) return;
     dpr = window.devicePixelRatio || 1;
-    const bw = box.clientWidth || (box.getBoundingClientRect() && Math.floor(box.getBoundingClientRect().width)) || 0;
-    const bh = box.clientHeight || (box.getBoundingClientRect() && Math.floor(box.getBoundingClientRect().height)) || 0;
-      if (bw > 0 && bh > 0) {
-        canvas.width = Math.floor(bw * dpr);
-        canvas.height = Math.floor(bh * dpr);
-        canvas.style.width = bw + 'px';
-        canvas.style.height = bh + 'px';
-        scheduleChartRender();
-      }
+    const bw = box.clientWidth;
+    const bh = box.clientHeight;
+    if (bw > 0 && bh > 0) {
+      const nextW = Math.floor(bw * dpr);
+      const nextH = Math.floor(bh * dpr);
+      if (canvas.width === nextW && canvas.height === nextH) return;
+      canvas.width = nextW;
+      canvas.height = nextH;
+      canvas.style.width = bw + 'px';
+      canvas.style.height = bh + 'px';
+      scheduleChartRender();
+    }
   }
 
   // --- Interactive Drag-to-Pan, Mouse Wheel Zoom & Touch Navigation ---
@@ -2112,10 +2133,7 @@ export function loadModule(): void {
     if (!canvas) return;
     ctx = canvas.getContext('2d');
 
-    resizeCanvas();
-    setTimeout(resizeCanvas, 60);
-    setTimeout(resizeCanvas, 250);
-    setTimeout(resizeCanvas, 800);
+    requestAnimationFrame(resizeCanvas);
     window.addEventListener('resize', resizeCanvas);
     window.addEventListener('softradex:theme', scheduleChartRender);
     if (window.ResizeObserver) {
@@ -4873,8 +4891,13 @@ function renderBot5(d) {
   // Derive explicit bias & direction from the event, its impacted platform markets, or live dials
   const selectedImpact = ev && workspace && workspace.impactFor ? workspace.impactFor(ev, panelSymbol) : null;
   const swingState = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
+  const swingStruct = window.SwingAI && window.SwingAI.structure ? window.SwingAI.structure() : null;
+  const panelM5Bars = swingStruct && swingStruct.frames && Array.isArray(swingStruct.frames.M5) &&
+    window.DashboardPanels.canonical(swingStruct.symbol || panelSymbol) === window.DashboardPanels.canonical(panelSymbol)
+    ? swingStruct.frames.M5.slice(-64) : undefined;
   const estimateEvent = event => window.NewsDirection && window.NewsDirection.estimate({
     event, symbol: panelSymbol, now: Date.now()/1000, quote: window.SOFT_TV_QUOTE, market: swingState,
+    barsM5: panelM5Bars,
     impact: workspace && workspace.impactFor ? workspace.impactFor(event, panelSymbol) : null,
     headlines: allNewsList.filter(n => n.kind === 'headline') });
   const evEstimate = ev && ((workspace && workspace.directionFor && workspace.directionFor(ev, panelSymbol)) || estimateEvent(ev));
@@ -4967,6 +4990,7 @@ function renderBot5(d) {
           if (window.DashboardPanels.canonical(symbol) === window.DashboardPanels.canonical(panelSymbol) && evEstimate) return evEstimate;
           return window.NewsDirection && window.NewsDirection.estimate({ event, symbol, now,
             market: context.market, quote: context.quote, headlines: context.headlines,
+            headlinesPreSorted: context.headlinesPreSorted,
             impact: workspace && workspace.impactFor ? workspace.impactFor(event, symbol) : null });
         }, symbol => ({ market: swingState && swingState.fresh &&
             window.DashboardPanels.canonical(swingState.symbol) === window.DashboardPanels.canonical(symbol)
@@ -5050,10 +5074,11 @@ function renderBot5(d) {
   // Render filtered news items in #watch-filtered-news-list
   const wFilteredList = $('watch-filtered-news-list');
   if (wFilteredList) {
+    let filtHtml = '';
     if (!matchingNews.length) {
-      wFilteredList.innerHTML = `<div style="text-align:center; padding: 6px; color:#94a3b8; font-size:10px;">No ${curImpactFilter.toUpperCase()} impact events scheduled</div>`;
+      filtHtml = `<div style="text-align:center; padding: 6px; color:#94a3b8; font-size:10px;">No ${curImpactFilter.toUpperCase()} impact events scheduled</div>`;
     } else {
-      wFilteredList.innerHTML = matchingNews.slice(0, 5).map(n => {
+      filtHtml = matchingNews.slice(0, 5).map(n => {
         const side = String(n.side || '').toUpperCase();
         const sideClass = side === 'BUY' ? 'buy' : side === 'SELL' ? 'sell' : '';
         const mins = Number(n.ts) > 0 ? Math.round((Number(n.ts) - Date.now() / 1000) / 60) : Number(n.minutes_to || 0);
@@ -5069,6 +5094,10 @@ function renderBot5(d) {
           </div>
         </div>`;
       }).join('');
+    }
+    if (wFilteredList.__filtHtml !== filtHtml) {
+      wFilteredList.innerHTML = filtHtml;
+      wFilteredList.__filtHtml = filtHtml;
     }
   }
 
@@ -5087,16 +5116,34 @@ function renderBot5(d) {
     const now = Date.now()/1000;
     const dailyData = window.MarketOutlookData;
     if (dailyData) dailyData.ensure(markets, panelSymbol);
-    const list = window.DashboardPanels.outlookAll(marketNews, markets, panelSymbol, now, relevantNews,
-      (event, symbol, context) => window.NewsDirection && window.NewsDirection.estimate({
-        event, symbol, now, market: context.market, quote: context.quote, headlines: context.headlines,
-        impact: workspace && workspace.impactFor ? workspace.impactFor(event, symbol) : null }),
-      symbol => ({ market: swingState && swingState.fresh &&
-          window.DashboardPanels.canonical(swingState.symbol) === window.DashboardPanels.canonical(symbol)
-          ? swingState : dailyData && dailyData.get(symbol), quote: window.SOFT_TV_QUOTE }));
-    const reading = list[0];
+    const scan = dailyData && dailyData.status();
+    const swingSig = swingState && swingState.fresh
+      ? `${swingState.symbol || ''}:${swingState.verdict || ''}:${Math.round(Number(swingState.score || 0) * 10)}`
+      : '';
+    const outCacheKey = [
+      b.news_sig || '',
+      b.feed_updated || 0,
+      panelSymbol,
+      markets.length,
+      marketNews.length,
+      scan ? `${scan.ready}/${scan.total}/${scan.pending}/${scan.unavailable}` : '',
+      swingSig,
+      LANG,
+      Math.floor(now / 20),
+    ].join('|');
     let outHtml = '';
-    {
+    if (renderBot5._outlookCache && renderBot5._outlookCache.key === outCacheKey) {
+      outHtml = renderBot5._outlookCache.html;
+    } else {
+      const list = window.DashboardPanels.outlookAll(marketNews, markets, panelSymbol, now, relevantNews,
+        (event, symbol, context) => window.NewsDirection && window.NewsDirection.estimate({
+          event, symbol, now, market: context.market, quote: context.quote, headlines: context.headlines,
+          headlinesPreSorted: context.headlinesPreSorted,
+          impact: workspace && workspace.impactFor ? workspace.impactFor(event, symbol) : null }),
+        symbol => ({ market: swingState && swingState.fresh &&
+            window.DashboardPanels.canonical(swingState.symbol) === window.DashboardPanels.canonical(symbol)
+            ? swingState : dailyData && dailyData.get(symbol), quote: window.SOFT_TV_QUOTE }));
+      const reading = list[0];
       const pills = list.map(o => {
         const v = String(o.verdict || '').toUpperCase();
         const cls = v === 'BUY' ? 'buy' : v === 'SELL' ? 'sell' : 'mixed';
@@ -5132,9 +5179,9 @@ function renderBot5(d) {
       }).join('');
       const start = new Date(reading.window_start * 1000), end = new Date(reading.window_end * 1000);
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const scan = dailyData && dailyData.status();
       const scanTxt = scan ? ` · D1 ${scan.ready}/${scan.total}${scan.pending ? ' · scanning ' + scan.pending : ''}${scan.unavailable ? ' · unavailable ' + scan.unavailable : ''}` : '';
       outHtml = `<div class="outlook-window">${list.length} ${isBn ? 'মার্কেট' : 'markets'} · ${esc(start.toLocaleDateString([], {day:'numeric',month:'short'}))} · 00:00–00:00 ${esc(end.toLocaleDateString([], {day:'numeric',month:'short'}))} · ${esc(timezone)}${esc(scanTxt)}</div><div class="outlook-date-row">${pills}</div>`;
+      renderBot5._outlookCache = { key: outCacheKey, html: outHtml };
     }
     [outEl, wOutEl].filter(Boolean).forEach(target => {
       if (target.__outlookHtml === outHtml) return;

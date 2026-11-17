@@ -64,6 +64,8 @@ export function estimateNewsInWorker(input: {
   quote: Record<string, any> | null;
   market: Record<string, any> | null;
   headlines: Record<string, any>[];
+  barsM5?: number[][];
+  dxyBarsM5?: number[][];
   items: NewsEstimateInput[];
 }): Promise<{ symbol: string; estimates: Record<string, any> }> {
   return callWorker({ type: 'estimate-news', ...input });

@@ -939,6 +939,7 @@ export function loadModule(): void {
     if (drop > 0) {
       s.trades.splice(0, drop);
       s._dirty = true;
+      totalsDirty = true;
     }
   }
 
@@ -1046,14 +1047,16 @@ export function loadModule(): void {
           render(ex.id, true);
         }
       });
-    }, 5000);
+    }, 8000);
     setInterval(() => {
       if (document.hidden) return;
       EXCHANGES.forEach(ex => render(ex.id, false));
-      totalsDirty = true;
-      updateBoard();
-      const bridge = window.BinanceOrderFlowBridge;
-      if (bridge && typeof bridge.refresh === 'function') bridge.refresh();
+      if (totalsDirty) {
+        totalsDirty = false;
+        updateBoard();
+        const bridge = window.BinanceOrderFlowBridge;
+        if (bridge && typeof bridge.refresh === 'function') bridge.refresh();
+      }
     }, 1000);
   }
 
@@ -1139,10 +1142,20 @@ export function loadModule(): void {
       s.lastPollAt = 0; s.lastError = ''; s.pollBusy = false; s.pendingTrades = []; s.lastTradeAt = 0; s.lastPrice = 0;
       render(ex.id);
       if (!s.pair) return;
-      pollTrades(ex, s.pair);
+      const wsFirst = ex.id === 'coinbase' || ex.id === 'kraken' || ex.id === 'okx';
       if (ex.id === 'coinbase') connectCoinbase(s.pair, ex.id);
       if (ex.id === 'kraken') connectKraken(s.pair, ex.id);
       if (ex.id === 'okx') connectOkx(s.pair, ex.id);
+      if (wsFirst) {
+        const genSnap = marketGeneration, pairSnap = s.pair;
+        setTimeout(() => {
+          if (genSnap === marketGeneration && state(ex.id).pair === pairSnap && !state(ex.id).lastDataAt) {
+            pollTrades(ex, pairSnap);
+          }
+        }, 1800);
+      } else {
+        pollTrades(ex, s.pair);
+      }
     });
     updateBoard();
   }
