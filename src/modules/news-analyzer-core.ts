@@ -60,6 +60,7 @@ export interface NewsEstimateInput {
   barsM5?: number[][];
   dxyBarsM5?: number[][];
   resolveRunning?: boolean;
+  resolveUpcoming?: boolean;
 }
 
 export interface NewsEstimateOutput {
@@ -770,7 +771,7 @@ function computePostEventReactionQuality(
 /**
  * Determine if numeric actual vs forecast/previous indicates an economic surprise.
  */
-function numericSurpriseScore(ev: Record<string, any>, symbol: string): { score: number; hasActual: boolean; inLine: boolean; reason: string } {
+function numericSurpriseScore(ev: Record<string, any>, symbol: string, subtleConsensus = false): { score: number; hasActual: boolean; inLine: boolean; reason: string } {
   const actual = parseCalendarNum(ev.actual);
   const forecast = parseCalendarNum(ev.forecast);
   const previous = parseCalendarNum(ev.previous);
@@ -842,6 +843,16 @@ function numericSurpriseScore(ev: Record<string, any>, symbol: string): { score:
     const denom = Math.max(Math.abs(previous) * 0.12, Math.abs(forecast) * 0.12, 0.15);
     const rel = Math.abs(diff) / denom;
     if (Math.abs(diff) <= 1e-9 || rel < 0.12) {
+      if (subtleConsensus && Math.abs(diff) > 1e-9 && rel >= 0.02) {
+        const subSign = signNum(diff) * invMult * curSign;
+        const subMag = Math.max(0.45, Math.min(1.15, rel * 5.5)) * impMult;
+        return {
+          score: subSign * subMag,
+          hasActual: false,
+          inLine: false,
+          reason: `Mild consensus shift (${ev.forecast} vs ${ev.previous})`,
+        };
+      }
       return { score: 0, hasActual: false, inLine: true, reason: 'Forecast close to previous (neutral consensus)' };
     }
     const preCap = imp === 'high' ? 2.2 : imp === 'medium' ? 1.75 : 0.75;
@@ -882,7 +893,7 @@ export function estimateNewsDirection(input: NewsEstimateInput): NewsEstimateOut
   let basis = 'MODEL BIAS';
 
   // 1. Numeric calendar release surprise
-  const numSup = numericSurpriseScore(ev, symbol);
+  const numSup = numericSurpriseScore(ev, symbol, Boolean(input.resolveUpcoming));
   const hasActual = numSup.hasActual;
   if (numSup.score) {
     releaseScore += numSup.score;
@@ -1191,12 +1202,73 @@ export function estimateNewsDirection(input: NewsEstimateInput): NewsEstimateOut
     evidence.unshift(`Chart reading ${resolvedSide}${rxTag} since release`);
   }
 
+  // Upcoming event / impacted-market resolution: derive directional bias from DXY macro, measured candle structure, live quote flow & consensus
+  if (input.resolveUpcoming && !isRunning && !isHeadline && side === 'WAIT') {
+    let upScore = fundAndTextScore * 1.15;
+    if (dxyRx.ready && usdSign !== 0) {
+      const dxyTrend = dxyRx.impulse30mAtr * 1.1 + dxyRx.slopeAtr * 0.7;
+      if (Math.abs(dxyTrend) >= 0.12) {
+        upScore += clampNum(dxyTrend * usdSign, 1.8);
+        evidence.push(`DXY ${dxyTrend >= 0 ? 'firm' : 'soft'} (${dxyTrend >= 0 ? '+' : ''}${dxyTrend.toFixed(2)} ATR)`);
+      }
+    }
+    if (market && canonicalNewsBase(market.symbol) === symBase && market.fresh) {
+      const s5 = Number(market.reads?.M5?.score || 0);
+      const s15 = Number(market.reads?.M15?.score || 0);
+      const sD1 = Number(market.reads?.D1?.score || 0);
+      const vScore = Number(market.vote?.score || 0);
+      const tech = clampNum((s5 + s15) * 0.14 + sD1 * 0.28 + vScore * 0.04, 2.2);
+      if (Math.abs(tech) >= 0.14) {
+        upScore += tech;
+        evidence.push(sD1 ? 'Daily D1 technical trend' : 'Intraday technical structure');
+      }
+    }
+    if (freshQ) {
+      const chg = Number(freshQ.change_pct);
+      if (Number.isFinite(chg) && Math.abs(chg) >= 0.02) {
+        upScore += clampNum(chg * 1.15, 1.4);
+        evidence.push(`Live session ${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%`);
+      } else {
+        const dir = String(freshQ.direction || '').toUpperCase();
+        if (dir === 'UP') {
+          upScore += 0.35;
+          evidence.push('Live ticker uptick');
+        } else if (dir === 'DOWN') {
+          upScore -= 0.35;
+          evidence.push('Live ticker downtick');
+        }
+      }
+      const bPct = Number(freshQ.buyer_pct);
+      if (Number.isFinite(bPct) && Math.abs(bPct - 50) >= 2) {
+        upScore += clampNum((bPct - 50) * 0.06, 1.1);
+        evidence.push(`Order flow ${Math.round(bPct)}% BUY`);
+      }
+    }
+    if (rx.ready) {
+      const rxSig = clampNum(rx.impulse30mAtr * 0.8 + rx.slopeAtr * 0.55, 1.5);
+      if (Math.abs(rxSig) >= 0.12) {
+        upScore += rxSig;
+        evidence.push(`M5 trend (${rx.impulse30mAtr >= 0 ? '+' : ''}${rx.impulse30mAtr.toFixed(2)} ATR)`);
+      }
+    }
+    if (Math.abs(upScore) >= 0.02 || Math.abs(totalScore) >= 0.02) {
+      const resolvedSide: 'BUY' | 'SELL' = upScore > 0.01 ? 'BUY' : upScore < -0.01 ? 'SELL' : totalScore < 0 ? 'SELL' : 'BUY';
+      side = resolvedSide;
+      conflict = false;
+      basis = Math.abs(fundAndTextScore) >= 0.35 ? 'EVENT + MARKET FLOW' : 'MACRO + STRUCTURE BIAS';
+      const mag = Math.max(1.25, Math.min(5.2, Math.abs(upScore) || Math.abs(totalScore) || 1.25));
+      totalScore = resolvedSide === 'BUY' ? mag : -mag;
+    }
+  }
+
   if (!evidence.length) return null;
 
   const pred = input.prediction || {};
+  const d1Atr = Number(market?.reads?.D1?.atr || 0);
   const atr = rx.atr || m5Atr;
   let move = Math.abs(Number(pred.move_abs != null ? pred.move_abs : pred.move_dollar) || 0);
   if (!move && atr) move = atr * ({ high: 3, medium: 2, low: 1.25 }[String(ev.impact || 'low')] || 1.25);
+  else if (!move && d1Atr > 0) move = d1Atr * ({ high: 0.42, medium: 0.28, low: 0.16 }[String(ev.impact || 'low')] || 0.2);
 
   const absScore = Math.abs(totalScore);
   const strength =

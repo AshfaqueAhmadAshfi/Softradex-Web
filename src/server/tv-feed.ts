@@ -270,6 +270,27 @@ function num(v: any, d = 0): number {
   return Number.isFinite(n) ? n : d;
 }
 
+function isCryptoMarketSymbol(symbol: string, tv = ''): boolean {
+  const upper = String(symbol || '').toUpperCase();
+  return /^(BINANCE|COINBASE|BYBIT|OKX|CRYPTO):/i.test(tv) ||
+    /(?:BTC|ETH|SOL|XRP|DOGE|BNB|ADA|LINK|AVAX|USDT|USDC(?!(?:HF|AD)))/i.test(upper);
+}
+
+function isScheduleMarketOpen(symbol: string, tv: string): boolean {
+  if (isCryptoMarketSymbol(symbol, tv)) return true;
+  const upper = String(symbol || '').toUpperCase();
+  const now = new Date();
+  const day = now.getUTCDay();
+  const hour = now.getUTCHours();
+  const min = now.getUTCMinutes();
+  if (day === 6) return false;
+  if (day === 0 && hour < 21) return false;
+  if (day === 5 && (hour > 21 || (hour === 21 && min >= 55))) return false;
+  const isBreakMarket = /XAU|XAG|GOLD|SILVER|OIL|TEC|US100|NAS|US500|US30|SPX|DJI/i.test(upper);
+  if (isBreakMarket && hour === 21) return false;
+  return true;
+}
+
 function buildQuoteObj(symbol: string, tv: string, raw: {
   price: number; open?: number; high?: number; low?: number; prevClose?: number;
   changePct?: number; changeAbs?: number; volume?: number; rating?: number;
@@ -283,9 +304,14 @@ function buildQuoteObj(symbol: string, tv: string, raw: {
     ? raw.changeAbs : (prevClose > 0 ? price - prevClose : 0);
   const changePct = raw.changePct != null && Number.isFinite(raw.changePct)
     ? raw.changePct : (prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0);
-  const isCrypto = /^(BINANCE|COINBASE|BYBIT|OKX|CRYPTO):/i.test(tv);
+  const isCrypto = isCryptoMarketSymbol(symbol, tv);
   const sess = String(raw.currentSession || (isCrypto ? 'market' : ''));
-  const marketOpen = isCrypto || sess === 'market' || sess === 'pre_market' || sess === 'post_market';
+  // Cash-equity index feeds (NASDAQ:NDX, SP:SPX, DJ:DJI) report out_of_session outside 9:30-16:00 NY
+  // even while broker CFD indices (USTECm/US500m/US30m) trade 23/5 Mon-Fri.
+  const isCfdIndex = /^(NASDAQ|SP|DJ):/i.test(tv) || /^(USTEC|NAS100|US500|US30)/i.test(symbol);
+  const explicitClosed = /^(holidays)$/i.test(sess) ||
+    (!isCfdIndex && /^(out_of_session|closed)$/i.test(sess));
+  const marketOpen = isCrypto ? true : (explicitClosed ? false : isScheduleMarketOpen(symbol, tv));
   const ps = num(raw.pricescale);
   const tvDigits = ps > 1 ? Math.max(0, Math.min(8, Math.round(Math.log10(ps)))) : undefined;
   const out = {
@@ -663,17 +689,33 @@ export async function fetchTvSetups(symbol: string) {
 
 const SEED_PRICES: Record<string, { price: number; change: number; high: number; low: number; rating: number }> = {
   XAUUSDm: { price: 3884.685, change: 0.18, high: 3923.09, low: 3867.67, rating: 0.18 },
+  XAGUSDm: { price: 34.45, change: 0.25, high: 34.90, low: 33.95, rating: 0.15 },
+  XAUEURm: { price: 3524.20, change: 0.22, high: 3560.0, low: 3490.0, rating: 0.18 },
+  XAUGBPm: { price: 2940.10, change: 0.20, high: 2975.0, low: 2912.0, rating: 0.16 },
   BTCUSDTm: { price: 65358.0, change: 1.88, high: 66132.0, low: 62006.0, rating: 0.45 },
   ETHUSDm: { price: 1826.09, change: 3.22, high: 1860.0, low: 1755.0, rating: 0.48 },
+  SOLUSDm: { price: 148.50, change: 2.15, high: 152.0, low: 143.0, rating: 0.35 },
+  XRPUSDm: { price: 2.18, change: 1.40, high: 2.25, low: 2.10, rating: 0.25 },
+  DOGEUSDm: { price: 0.168, change: 1.95, high: 0.175, low: 0.160, rating: 0.28 },
+  BNBUSDm: { price: 598.40, change: 1.12, high: 608.0, low: 586.0, rating: 0.24 },
+  ADAUSDm: { price: 0.695, change: 1.05, high: 0.720, low: 0.675, rating: 0.20 },
+  LINKUSDm: { price: 14.85, change: 1.65, high: 15.30, low: 14.40, rating: 0.26 },
+  AVAXUSDm: { price: 22.40, change: 1.50, high: 23.10, low: 21.70, rating: 0.24 },
   EURUSDm: { price: 1.10216, change: -0.31, high: 1.1073, low: 1.10198, rating: -0.28 },
   GBPUSDm: { price: 1.32126, change: -0.19, high: 1.3260, low: 1.3185, rating: -0.18 },
   USDJPYm: { price: 159.716, change: -0.08, high: 160.20, low: 159.30, rating: -0.10 },
-  AUDUSDm: { price: 0.6773, change: -0.52, high: 0.6820, low: 0.6755, rating: -0.32 },
-  USDCADm: { price: 1.42704, change: 0.09, high: 1.4295, low: 1.4240, rating: 0.12 },
   USDCHFm: { price: 0.83892, change: 0.42, high: 0.8415, low: 0.8350, rating: 0.30 },
+  AUDUSDm: { price: 0.6773, change: -0.52, high: 0.6820, low: 0.6755, rating: -0.32 },
+  NZDUSDm: { price: 0.6115, change: -0.28, high: 0.6160, low: 0.6090, rating: -0.20 },
+  USDCADm: { price: 1.42704, change: 0.09, high: 1.4295, low: 1.4240, rating: 0.12 },
+  EURJPYm: { price: 175.95, change: -0.22, high: 176.60, low: 175.20, rating: -0.18 },
+  GBPJPYm: { price: 210.85, change: -0.18, high: 211.70, low: 209.90, rating: -0.16 },
   USOILm: { price: 88.56, change: -0.20, high: 89.40, low: 87.80, rating: -0.18 },
+  UKOILm: { price: 91.40, change: -0.15, high: 92.20, low: 90.65, rating: -0.14 },
   USTECm: { price: 27943.7, change: -1.22, high: 28350.0, low: 27820.0, rating: -0.38 },
+  US500m: { price: 5982.4, change: -0.35, high: 6025.0, low: 5955.0, rating: -0.20 },
   US30m: { price: 52347.5, change: 0.10, high: 52550.0, low: 52120.0, rating: 0.12 },
+  DXY: { price: 104.85, change: 0.24, high: 105.10, low: 104.35, rating: 0.22 },
 };
 
 const WATCH_SYMBOLS = Object.keys(SEED_PRICES);
@@ -682,7 +724,7 @@ let watchRefreshInflight = false;
 
 function triggerWatchBackgroundRefresh(force = false): void {
   const now = Date.now();
-  if (watchRefreshInflight || (!force && now - lastWatchRefreshAt < 10000)) return;
+  if (watchRefreshInflight || (!force && now - lastWatchRefreshAt < 8500)) return;
   watchRefreshInflight = true;
   lastWatchRefreshAt = now;
   void (async () => {
@@ -690,6 +732,7 @@ function triggerWatchBackgroundRefresh(force = false): void {
       const pairs = WATCH_SYMBOLS.map((sym) => ({ sym, tv: resolveTvSymbol(sym) }));
       const batch = await fetchWsQuotesBatch(pairs.map(p => p.tv), 5000);
       const ts = Date.now();
+      const missingBinance: Array<{ sym: string; tv: string; pair: string }> = [];
       for (const { sym, tv } of pairs) {
         const raw = batch.get(tv);
         if (raw && num(raw.lp) > 0) {
@@ -709,9 +752,45 @@ function triggerWatchBackgroundRefresh(force = false): void {
             lpTime: num(raw.lp_time),
             source: 'TradingView',
           });
-          quoteCache.set(tv, { exp: ts + 4500, data: out });
+          quoteCache.set(tv, { exp: ts + 6500, data: out });
           lastGoodQuoteCache.set(tv, out);
+        } else if (/^BINANCE:([A-Z0-9]+)$/i.test(tv)) {
+          missingBinance.push({ sym, tv, pair: tv.split(':')[1].toUpperCase() });
         }
+      }
+      if (missingBinance.length) {
+        try {
+          const bRes = await fetch(
+            'https://api.binance.com/api/v3/ticker/24hr?symbols=' +
+              encodeURIComponent(JSON.stringify(missingBinance.map((m) => m.pair))),
+            { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(4000) },
+          );
+          if (bRes.ok) {
+            const rows: any[] = await bRes.json();
+            const byPair = new Map((Array.isArray(rows) ? rows : []).map((r) => [String(r.symbol || '').toUpperCase(), r]));
+            const bTs = Date.now();
+            for (const m of missingBinance) {
+              const d = byPair.get(m.pair);
+              const price = num(d?.lastPrice);
+              if (price > 0) {
+                const out = buildQuoteObj(m.sym, m.tv, {
+                  price,
+                  open: num(d?.openPrice, price),
+                  high: num(d?.highPrice, price),
+                  low: num(d?.lowPrice, price),
+                  prevClose: num(d?.prevClosePrice, price),
+                  changePct: num(d?.priceChangePercent),
+                  changeAbs: num(d?.priceChange),
+                  currentSession: 'market',
+                  lpTime: Math.floor(bTs / 1000),
+                  source: 'Binance',
+                });
+                quoteCache.set(m.tv, { exp: bTs + 6500, data: out });
+                lastGoodQuoteCache.set(m.tv, out);
+              }
+            }
+          }
+        } catch {}
       }
     } finally {
       watchRefreshInflight = false;
@@ -731,7 +810,10 @@ function getSnapshotQuote(symbol: string) {
   const high = hit?.high > 0 ? Number(hit.high) : seed.high;
   const low = hit?.low > 0 ? Number(hit.low) : seed.low;
   const rating = hit ? Number(hit.rating || 0) : seed.rating;
-  const marketOpen = hit ? hit.market_open !== false : true;
+  const scheduleOpen = isScheduleMarketOpen(meta.symbol, tv);
+  const marketOpen = isCryptoMarketSymbol(meta.symbol, tv)
+    ? true
+    : (hit?.market_open === false ? false : scheduleOpen);
   return { meta, price, change, high, low, rating, marketOpen, hasLiveHit: !!hit };
 }
 

@@ -506,33 +506,69 @@ export function loadModule(): void {
     if (now < start + win) return (compact ? '' : 'IMPACT LEFT ') + hms(start + win - now);
     return 'COMPLETE';
   }
+  var _mntCache = { rows: [], timers: [], entries: [], dirty: true };
+  function rebuildMntTimerCache() {
+    var rows = [], timers = [], entries = [];
+    document.querySelectorAll('.mnt-row').forEach(function(row) {
+      rows.push({
+        el: row,
+        ts: Number(row.dataset.ts),
+        kind: row.dataset.kind,
+        impact_window_sec: Number(row.dataset.window),
+        headline_window_sec: Number(row.dataset.headlineWindow),
+        phase: row.dataset.phase,
+        runningFallback: row.parentElement && row.parentElement.id === 'running-news-list' && row.dataset.monitoringFallback !== 'true'
+      });
+    });
+    document.querySelectorAll('.mnt-timer').forEach(function(el) {
+      var ts = Number(el.dataset.ts);
+      var win = Number(el.dataset.window);
+      var monExp = Number(el.dataset.monitoringExpires) || (ts + win);
+      timers.push({
+        el: el,
+        ts: ts,
+        impact: el.dataset.impact,
+        win: win,
+        compact: el.dataset.compact === 'true',
+        monitoring: el.dataset.monitoring === 'true',
+        monExp: monExp,
+        phase: el.dataset.phase
+      });
+    });
+    document.querySelectorAll('.mnt-entry-timer').forEach(function(node) {
+      entries.push({ el: node, ts: Number(node.dataset.ts), impact: node.dataset.impact });
+    });
+    _mntCache.rows = rows;
+    _mntCache.timers = timers;
+    _mntCache.entries = entries;
+    _mntCache.dirty = false;
+  }
   function updateMntTimers() {
     if (document.hidden) return;
+    if (_mntCache.dirty) rebuildMntTimerCache();
     var now = Date.now() / 1000;
     updateWindow(now);
-    var rows = document.querySelectorAll('.mnt-row');
+    var rows = _mntCache.rows;
     for (var r = 0; r < rows.length; r++) {
       var row = rows[r];
-      var rowEv = { ts: Number(row.dataset.ts), kind: row.dataset.kind, impact_window_sec: Number(row.dataset.window),
-        headline_window_sec: Number(row.dataset.headlineWindow) };
-      if (phaseFor(rowEv, now) !== row.dataset.phase) { renderNews(); return; }
-      if (rowEv.kind === 'headline' && row.parentElement && row.parentElement.id === 'running-news-list' && row.dataset.monitoringFallback !== 'true' && !recentHeadline(rowEv, now)) { renderNews(); return; }
+      if (!row.el.isConnected) { _mntCache.dirty = true; continue; }
+      if (phaseFor(row, now) !== row.phase) { renderNews(); return; }
+      if (row.kind === 'headline' && row.runningFallback && !recentHeadline(row, now)) { renderNews(); return; }
     }
-    var nodes = document.querySelectorAll('.mnt-timer');
+    var nodes = _mntCache.timers;
     for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      var compact = el.dataset.compact === 'true';
-      var monitoring = el.dataset.monitoring === 'true';
-      var txt = monitoring ? hms((Number(el.dataset.monitoringExpires) || Number(el.dataset.ts) + Number(el.dataset.window)) - now)
-        : timerText(Number(el.dataset.ts), el.dataset.impact, Number(el.dataset.window), compact);
+      var item = nodes[i], el = item.el;
+      if (!el.isConnected) continue;
+      var txt = item.monitoring ? hms(item.monExp - now) : timerText(item.ts, item.impact, item.win, item.compact);
       if (el.textContent !== txt) el.textContent = txt;
-      var shouldLive = (monitoring || el.dataset.phase === 'running') && txt !== 'COMPLETE';
+      var shouldLive = (item.monitoring || item.phase === 'running') && txt !== 'COMPLETE';
       if (el.classList.contains('live') !== shouldLive) el.classList.toggle('live', shouldLive);
     }
-    var entryNodes = document.querySelectorAll('.mnt-entry-timer');
+    var entryNodes = _mntCache.entries;
     for (var j = 0; j < entryNodes.length; j++) {
-      var node = entryNodes[j];
-      var entryTxt = entryTiming({ ts: Number(node.dataset.ts), impact: node.dataset.impact }, now);
+      var ent = entryNodes[j], node = ent.el;
+      if (!node.isConnected) continue;
+      var entryTxt = entryTiming(ent, now);
       if (node.textContent !== entryTxt) node.textContent = entryTxt;
     }
   }
@@ -545,7 +581,7 @@ export function loadModule(): void {
     var qSig = qL ? Math.round(Number(qL.price) / (Number(qL.price) * 0.0005 || 1)) : 0;
     var swL = window.SwingAI && window.SwingAI.state ? window.SwingAI.state() : null;
     var swLSig = swL && swL.fresh ? (swL.verdict || '') + ':' + Math.round((Number(swL.score) || 0) * 10) : '';
-    var sigParts = [symbol, newsMergeGen, workerBatchGen, qSig, swLSig, getLiveM5Bars().length, dxyBarsM5.length, Math.floor(now / 15), rows.length];
+    var sigParts = [symbol, newsMergeGen, workerBatchGen, qSig, swLSig, getLiveM5Bars().length, dxyBarsM5.length, Math.floor(now / 60), rows.length];
     for (var si = 0; si < rows.length; si++) {
       var r0 = rows[si];
       sigParts.push(r0.ts, phaseFor(r0, now), r0.actual || '', r0.impact || '', r0.kind || '');
@@ -616,6 +652,7 @@ export function loadModule(): void {
       list.innerHTML = html;
       if (hadPrev && scroll > 0) list.scrollTop = scroll;
       lastNewsHtml[id] = html;
+      _mntCache.dirty = true;
     }
   }
   function renderNews(force) {
@@ -1657,19 +1694,26 @@ export function loadModule(): void {
         newsRetryTimer = setTimeout(function() { fetchNews(true); }, Math.min(30000, 2000 * Math.pow(2, newsFailures-1)));
       }).finally(function () { clearTimeout(timeout); if (generation === newsRequest) newsBusy = false; });
   }
+  var _lastPressureSig = '';
   function renderPressure() {
     if (document.hidden) return;
     var flow = window.MultiExchangeOrderFlow;
     var t = flow && typeof flow.getOpenTotals === 'function' ? flow.getOpenTotals() : null;
     var buy = Number(t && t.buy) || 0, sell = Number(t && t.sell) || 0, total = buy + sell;
     var pct = total ? Math.round(buy / total * 100) : 50;
+    var pSig = symbol + '|' + pct + '|' + (total > 0 ? 1 : 0);
+    if (pSig === _lastPressureSig) return;
+    _lastPressureSig = pSig;
     var edge = Math.abs(pct - 50) * 2;
     var side = edge < 12 ? 'WAIT' : pct > 50 ? 'BUY' : 'SELL';
     var s = $('vfb-advisory-side'), c = $('vfb-advisory-confidence'), bar = $('vfb-advisory-buy'), reason = $('vfb-advisory-reason');
-    if (s) { s.textContent = side; s.className = side.toLowerCase(); }
-    if (c) c.textContent = edge + '% confidence';
-    if (bar) bar.style.width = pct + '%';
-    if (reason) reason.textContent = total ? ('Verified venue/open-position flow: BUY ' + pct + '% · SELL ' + (100-pct) + '%. Advisory, not a guarantee.') : 'Waiting for verified live flow. Estimates are not trade guarantees.';
+    if (s) { if (s.textContent !== side) s.textContent = side; s.className = side.toLowerCase(); }
+    var edgeTxt = edge + '% confidence';
+    if (c && c.textContent !== edgeTxt) c.textContent = edgeTxt;
+    var wPct = pct + '%';
+    if (bar && bar.style.width !== wPct) bar.style.width = wPct;
+    var rTxt = total ? ('Verified venue/open-position flow: BUY ' + pct + '% · SELL ' + (100-pct) + '%. Advisory, not a guarantee.') : 'Waiting for verified live flow. Estimates are not trade guarantees.';
+    if (reason && reason.textContent !== rTxt) reason.textContent = rTxt;
     window.dispatchEvent(new CustomEvent('chart:pressure', { detail: { symbol: symbol, buyPct: pct, sellPct: 100-pct, side: side, confidence: edge, buy: buy, sell: sell } }));
   }
   function expanded() { return section && section.classList.contains('workspace-expanded'); }

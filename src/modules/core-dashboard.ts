@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { initAccessPortal } from './access-portal';
 /* Consolidated TypeScript module */
 export function loadModule(): void {
   (window as any).SOFTRADEX_PUBLIC_ONLY = true;
@@ -1230,6 +1231,18 @@ export function loadModule(): void {
       if (price > maxPrice) maxPrice = price;
     });
 
+    const ncBound = window.NextCandleAI && typeof window.NextCandleAI.state === 'function' ? window.NextCandleAI.state() : null;
+    if (ncBound && ncBound.tf === currentInterval &&
+        String(ncBound.symbol || '').replace(/m$/i, '').toUpperCase() === String(currentSymbol || '').replace(/m$/i, '').toUpperCase()) {
+      const spanCheck = Math.abs(maxPrice - minPrice) || 1;
+      [Number(ncBound.projLow), Number(ncBound.projHigh)].forEach((lvl) => {
+        if (isFinite(lvl) && lvl > 0 && Math.abs(lvl - (minPrice + maxPrice) * 0.5) <= spanCheck * 1.8) {
+          if (lvl < minPrice) minPrice = lvl;
+          if (lvl > maxPrice) maxPrice = lvl;
+        }
+      });
+    }
+
     // Add 12% price buffer top and bottom to ensure whale badges have clear margin
     const baseRange = Math.max(maxPrice - minPrice, 0.0000001);
     const baseCenter = (minPrice + maxPrice) / 2;
@@ -1566,6 +1579,63 @@ export function loadModule(): void {
         priceWidth: priceWidth,
         symbol: currentSymbol,
       });
+    }
+
+    // 6.95. Next Candle AI transparent projected candle at the next slot
+    if (klines.length > 0 && window.NextCandleAI && typeof window.NextCandleAI.state === 'function') {
+      const nc = window.NextCandleAI.state();
+      if (nc && nc.tf === currentInterval &&
+          String(nc.symbol || '').replace(/m$/i, '').toUpperCase() === String(currentSymbol || '').replace(/m$/i, '').toUpperCase() &&
+          Number(nc.projOpen) > 0 && Number(nc.projClose) > 0 && Number(nc.projHigh) > 0 && Number(nc.projLow) > 0) {
+        const nextX = candleIndexToX(klines.length);
+        if (nextX >= -candleSlot && nextX <= chartW - 6) {
+          const isBuyNc = nc.side === 'BUY';
+          const isWaitNc = nc.quality === 'WAIT';
+          const isDarkNc = document.documentElement.classList.contains('sx-dark');
+          const ncFill = isWaitNc ? 'rgba(245, 158, 11, 0.18)'
+            : isBuyNc ? (isDarkNc ? 'rgba(52, 211, 153, 0.25)' : 'rgba(8, 153, 129, 0.22)')
+            : (isDarkNc ? 'rgba(248, 113, 113, 0.25)' : 'rgba(242, 54, 69, 0.22)');
+          const ncStroke = isWaitNc ? (isDarkNc ? 'rgba(251, 191, 36, 0.78)' : 'rgba(217, 119, 6, 0.78)')
+            : isBuyNc ? (isDarkNc ? 'rgba(52, 211, 153, 0.88)' : 'rgba(8, 153, 129, 0.84)')
+            : (isDarkNc ? 'rgba(248, 113, 113, 0.88)' : 'rgba(242, 54, 69, 0.84)');
+          const yO = priceToY(Number(nc.projOpen));
+          const yC = priceToY(Number(nc.projClose));
+          const yH = priceToY(Number(nc.projHigh));
+          const yL = priceToY(Number(nc.projLow));
+          const ncW = Math.max(3, candleBarW);
+          const ncTop = Math.max(4, Math.min(candleH - 4, Math.min(yO, yC)));
+          const ncBot = Math.max(4, Math.min(candleH - 4, Math.max(yO, yC)));
+          const ncH = Math.max(2, ncBot - ncTop);
+          ctx.save();
+          ctx.strokeStyle = ncStroke;
+          ctx.lineWidth = 1.2;
+          ctx.setLineDash([2, 2]);
+          if (yH < ncTop - 1 && yH <= candleH) {
+            ctx.beginPath(); ctx.moveTo(nextX, Math.max(4, yH)); ctx.lineTo(nextX, ncTop); ctx.stroke();
+          }
+          if (yL > ncBot + 1 && yL >= 0) {
+            ctx.beginPath(); ctx.moveTo(nextX, ncBot); ctx.lineTo(nextX, Math.min(candleH - 4, yL)); ctx.stroke();
+          }
+          ctx.fillStyle = ncFill;
+          ctx.fillRect(nextX - ncW / 2, ncTop, ncW, ncH);
+          ctx.setLineDash([2.5, 2]);
+          ctx.strokeRect(nextX - ncW / 2 + 0.5, ncTop + 0.5, Math.max(1, ncW - 1), Math.max(1, ncH - 1));
+          if (yC >= 4 && yC <= candleH - 4) {
+            ctx.setLineDash([2, 3]);
+            ctx.beginPath(); ctx.moveTo(nextX + ncW / 2, yC); ctx.lineTo(chartW, yC); ctx.stroke();
+          }
+          ctx.setLineDash([]);
+          const ncLbl = (nc.tfLabel || currentInterval.toUpperCase()) + ' ' +
+            (isWaitNc ? 'CHOP ' : (isBuyNc ? '▲ ' : '▼ ')) + (nc.deltaLabel || '') + ' · ' + nc.confidence + '%';
+          const lblY = Math.max(10, Math.min(candleH - 10, isBuyNc ? (Math.max(4, yH) - 10) : (Math.min(candleH - 4, yL) + 10)));
+          ctx.font = '700 9px "JetBrains Mono", monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = ncStroke;
+          ctx.fillText(ncLbl, Math.min(chartW - 44, Math.max(44, nextX)), lblY);
+          ctx.restore();
+        }
+      }
     }
 
     // 7. Draw Current Price Line & Badge
@@ -2136,6 +2206,7 @@ export function loadModule(): void {
     requestAnimationFrame(resizeCanvas);
     window.addEventListener('resize', resizeCanvas);
     window.addEventListener('softradex:theme', scheduleChartRender);
+    window.addEventListener('chart:next-candle-update', scheduleChartRender);
     if (window.ResizeObserver) {
       const box = $('binance-canvas-box');
       if (box) {
@@ -3750,16 +3821,27 @@ function renderStats(d) {
   document.querySelectorAll('#period-seg .seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.period === period));
 }
 
+function leftDrawerOpen() {
+  const dash = $('dash');
+  return !!dash && dash.classList.contains('drawer-left-open');
+}
+function rightActivityOpen() {
+  const dash = $('dash');
+  return !!dash && dash.classList.contains('drawer-right-open') && !!$('view-activity')?.classList.contains('active');
+}
+
 /* -------------------------------------------------------------- positions */
 function renderPositions(d) {
   const body = $('positions-body');
   const list = d.positions || [];
-  $('pos-count').textContent = list.length;
+  setCell($('pos-count'), list.length);
   const total = list.reduce((a, p) => a + Number(p.profit || 0) + Number(p.swap || 0), 0);
   const tot = $('pos-total');
-  tot.textContent = signed(total);
-  tot.className = 'panel-total ' + valClass(total);
-  $('pos-empty').classList.toggle('hidden', list.length > 0);
+  setCell(tot, signed(total));
+  const totCls = 'panel-total ' + valClass(total);
+  if (tot && tot.className !== totCls) tot.className = totCls;
+  $('pos-empty')?.classList.toggle('hidden', list.length > 0);
+  if (!leftDrawerOpen() || !body) return;
 
   const seen = new Set();
   list.forEach((p) => {
@@ -3776,7 +3858,12 @@ function renderPositions(d) {
     const c = tr.children;
     const net = Number(p.profit || 0) + Number(p.swap || 0);
     setCell(c[0], p.symbol || '—');
-    c[1].innerHTML = `<span class="${p.side === 'buy' ? 'side-buy' : 'side-sell'}">${esc((p.side || '').toUpperCase())}</span>`;
+    const sideUpper = String(p.side || '').toUpperCase();
+    const sideKey = `${p.side === 'buy' ? 'b' : 's'}|${sideUpper}`;
+    if (tr.dataset.side !== sideKey) {
+      tr.dataset.side = sideKey;
+      c[1].innerHTML = `<span class="${p.side === 'buy' ? 'side-buy' : 'side-sell'}">${esc(sideUpper)}</span>`;
+    }
     setCell(c[2], nf(p.volume, 2));
     setCell(c[3], fmtPrice(p.price_open));
     setCell(c[4], fmtPrice(p.price_current));
@@ -3801,13 +3888,14 @@ function renderPositions(d) {
 function setCell(node, v) { if (node && node.textContent !== String(v)) node.textContent = v; }
 
 /* ---------------------------------------------------------------- history */
+let _histMetaSig = '';
 function histSince() {
   const nowS = S && S.server_epoch ? S.server_epoch : Math.floor(Date.now() / 1000);
   if (histPeriod === 'today') return (S && S.day_start) || (nowS - 86400);
   if (histPeriod === 'all') return 0;
   return nowS - Number(histPeriod) * 86400;
 }
-function historyRows() {
+function historyRows(skipSort = false) {
   if (!S) return [];
   const map = new Map();
   // a null/0 position_id must not collapse every such row onto one map key
@@ -3824,14 +3912,26 @@ function historyRows() {
     const q = histSearch.toLowerCase();
     rows = rows.filter((r) => String(r.comment || '').toLowerCase().includes(q) || String(r.ticket || '').includes(q) || String(r.position_id).includes(q));
   }
-  rows.sort((a, b) => Number(b.close_time) - Number(a.close_time));
+  if (!skipSort) rows.sort((a, b) => Number(b.close_time) - Number(a.close_time));
   return rows;
 }
 function renderHistory(d) {
-  const rows = historyRows();
-  // header sort: the server sends newest-first; any header click reorders this
-  // local copy (no refetch needed). Ties fall back to close_time desc so the
-  // list never jumps randomly between renders.
+  const histRaw = (d && d.history) || [];
+  const viewActive = leftDrawerOpen() && !!$('view-history')?.classList.contains('active');
+  const firstId = histRaw[0] ? (histRaw[0].position_id || histRaw[0].ticket || '') : '';
+  const metaSig = `${histPeriod}|${histResult}|${histSymbol}|${histSearch}|${histRaw.length}|${extraRows.length}|${firstId}|${d?.history_total || 0}|${Math.floor((d?.day_start || 0) / 60)}`;
+  if (!viewActive && metaSig === _histMetaSig) return;
+
+  const rows = historyRows(!viewActive);
+  if (metaSig !== _histMetaSig) {
+    _histMetaSig = metaSig;
+    setCell($('hist-count'), rows.length);
+    setCell($('rail-hist-count'), rows.length);
+    setCell($('tab-badge-hist'), rows.length);
+    $('hist-empty')?.classList.toggle('hidden', rows.length > 0);
+  }
+  if (!viewActive) return;
+
   const NUMERIC_KEYS = new Set(['close_time', 'open_time', 'volume', 'open_price', 'close_price', 'commission', 'swap', 'net_profit', 'magic']);
   const durOf = (r) => (Number(r.close_time || 0) - Number(r.open_time || 0));
   const valOf = (r) => {
@@ -3851,14 +3951,8 @@ function renderHistory(d) {
     th.classList.toggle('sorted-asc', th.dataset.key === histSortKey && histSortDir === 'asc');
     th.classList.toggle('sorted-desc', th.dataset.key === histSortKey && histSortDir === 'desc');
   });
-  $('hist-count').textContent = rows.length;
-  const rhEl = $('rail-hist-count');
-  if (rhEl) rhEl.textContent = rows.length;
-  const thEl = $('tab-badge-hist');
-  if (thEl) thEl.textContent = rows.length;
-  $('hist-empty').classList.toggle('hidden', rows.length > 0);
 
-  const sig = histPeriod + '|' + histResult + '|' + histSymbol + '|' + histSearch + '|' + histSortKey + '|' + histSortDir + '|' + rows.length + '|' +
+  const sig = metaSig + '|' + histSortKey + '|' + histSortDir + '|' + rows.length + '|' +
     (rows[0] ? rows[0].position_id : '') + '|' + (rows[rows.length - 1] ? rows[rows.length - 1].position_id : '') + '|' +
     rows.reduce((a, r) => a + Number(r.net_profit || 0), 0).toFixed(2);
   if (sig === histSig) return;
@@ -3914,6 +4008,8 @@ function findWatchForSymbol(sym) {
 function getMarketInfo(sym) {
   if (!sym) return { open: false, status: 'CLOSED', reason: 'EMPTY' };
   const sUpper = String(sym).toUpperCase().trim();
+  const is247 = /BTC|ETH|SOL|XRP|DOGE|BNB|ADA|LINK|AVAX|USDT|USDC(?!(?:HF|AD))|CRYPTO|247/.test(sUpper);
+  if (is247) return { open: true, status: 'OPEN', reason: 'CRYPTO_247', message: 'Crypto 24/7' };
   // 1. Check live marketWatches array
   if (marketWatches && marketWatches.length) {
     let w = marketWatches.find(x => String(x.symbol || '').toUpperCase() === sUpper);
@@ -3941,9 +4037,6 @@ function getMarketInfo(sym) {
     }
   }
   // 3. Fallback schedule check
-  const is247 = sUpper.includes('BTC') || sUpper.includes('ETH') || sUpper.includes('CRYPTO') || sUpper.includes('247');
-  if (is247) return { open: true, status: 'OPEN', reason: 'CRYPTO_247', message: 'Crypto 24/7' };
-  if (sUpper === 'DXY' || sUpper.includes('INDEX')) return { open: false, status: 'UNAVAILABLE', reason: 'NOT_FOUND', message: 'Not available' };
 
   const now = new Date();
   const utcDay = now.getUTCDay(); // 0=Sun, 1=Mon, ..., 5=Fri, 6=Sat
@@ -3956,7 +4049,7 @@ function getMarketInfo(sym) {
   if (utcDay === 5 && (utcHour > 21 || (utcHour === 21 && utcMin >= 55))) return { open: false, status: 'CLOSED', reason: 'WEEKEND_CLOSED', message: 'Weekend closure' };
 
   // Daily break: Mon-Thu 21:00 UTC to 22:00 UTC for gold/metals, crude oil, and US indices
-  const isBreakMarket = sUpper.includes('XAU') || sUpper.includes('GOLD') || sUpper.includes('OIL') || sUpper.includes('TEC') || sUpper.includes('US30') || sUpper.includes('100');
+  const isBreakMarket = /XAU|XAG|GOLD|SILVER|OIL|TEC|US100|NAS|US500|US30|SPX|DJI/.test(sUpper);
   if (isBreakMarket && utcHour === 21) {
     return { open: false, status: 'CLOSED', reason: 'SESSION_CLOSED', message: 'Daily break (21:00-22:00 UTC)' };
   }
@@ -4430,72 +4523,84 @@ function renderBot3(d) {
   const plannedEl = $('bot3-planned-trades');
   const planned = b.planned_trades || [];
   if (plannedEl) {
-    if (!planned.length) {
-      plannedEl.innerHTML = `
-        <div class="pt-empty-state">
-          <span class="pt-empty-icon">⏳</span>
-          <span class="pt-empty-text">${LANG === 'bn' ? 'এক্সট্রিম সেটআপ হিসাব হচ্ছে... অপেক্ষা করুন' : 'Calculating extreme setups... Please wait'}</span>
-        </div>
-      `;
-    } else {
-      const isBn = LANG === 'bn';
-      plannedEl.innerHTML = planned.map((p) => {
-        const rank = p.priority_rank || p.id || 1;
-        const rankCls = rank === 1 ? 'rank-1' : (rank === 2 ? 'rank-2' : '');
-        const isBuy = (p.action || '').toUpperCase() === 'BUY';
-        const touchCls = p.is_touch ? ' touching' : '';
-        const statusCls = p.status_cls || (p.is_touch ? 'trigger' : 'pending');
-        const statusTxt = isBn ? (p.status_text_bn || p.status_text || 'অপেক্ষমাণ') : (p.status_text || 'PENDING');
-
-        const distStr = (p.distance !== undefined && p.distance !== null && p.distance !== '') ? `$${fmtPrice(p.distance)} away` : (isBn ? 'লেভেলে আছে' : 'at level');
-        const distPctStr = (p.dist_pct !== undefined && p.dist_pct !== null) ? ` (${p.dist_pct}%)` : '';
-        const distDisplay = distStr + distPctStr;
-        const nearCls = (p.is_touch || (p.dist_pct !== undefined && p.dist_pct <= 0.35)) ? ' near' : '';
-
-        const desc = isBn ? (p.reason_bn || p.reason) : p.reason;
-        const tpValEst = p.est_tp_price ? fmtPrice(p.est_tp_price) : '--';
-        const slValEst = p.est_sl_price ? fmtPrice(p.est_sl_price) : '--';
-        const tpDollar = p.tp ? `$${p.tp}` : `$${nf(b.config ? b.config.tp || 0.5 : 0.5, 2)}`;
-        const slDollar = p.sl ? `$${p.sl}` : `$${nf(b.config ? b.config.sl || 5.0 : 5.0, 2)}`;
-
-        return `
-          <div class="pt-card ${isBuy ? 'buy' : 'sell'}${touchCls}">
-            <div class="pt-card-header">
-              <div class="pt-card-tags">
-                <span class="pt-rank-badge ${rankCls}">#${rank}</span>
-                <span class="pt-badge">${esc(p.action)}</span>
-                <span class="pt-scope-tag">${esc(p.scope || '')}</span>
-              </div>
-              <span class="pt-status-pill status-${statusCls}">${esc(statusTxt)}</span>
-            </div>
-            <div class="pt-card-body">
-              <div class="pt-info">
-                <span class="pt-name">${esc(p.label)}</span>
-                <span class="pt-desc">${esc(desc)}</span>
-              </div>
-              <div class="pt-metrics">
-                <div class="pt-metric-row">
-                  <span class="pt-metric-lbl">${isBn ? 'লেভেল' : 'Level'}:</span>
-                  <span class="pt-price">${fmtPrice(p.price)}</span>
-                </div>
-                <div class="pt-metric-row">
-                  <span class="pt-metric-lbl">${isBn ? 'দূরত্ব' : 'Dist'}:</span>
-                  <span class="pt-dist${nearCls}">${esc(distDisplay)}</span>
-                </div>
-              </div>
-            </div>
-            <div class="pt-card-targets">
-              <span class="pt-target-tag tp">🎯 TP: ${tpValEst} (+${tpDollar})</span>
-              <span class="pt-target-tag sl">🛡️ SL: ${slValEst} (-${slDollar})</span>
-            </div>
+    const planSig = !planned.length
+      ? `empty|${LANG}`
+      : `${LANG}|${b.config ? `${b.config.tp}:${b.config.sl}` : ''}|` + planned.map(p =>
+          `${p.priority_rank || p.id || 1}:${p.action}:${p.status_cls || ''}:${p.is_touch ? 1 : 0}:${p.price}:${p.distance}:${p.dist_pct}:${p.est_tp_price}:${p.est_sl_price}`
+        ).join(';');
+    if (plannedEl.dataset.sig !== planSig) {
+      plannedEl.dataset.sig = planSig;
+      if (!planned.length) {
+        plannedEl.innerHTML = `
+          <div class="pt-empty-state">
+            <span class="pt-empty-icon">⏳</span>
+            <span class="pt-empty-text">${LANG === 'bn' ? 'এক্সট্রিম সেটআপ হিসাব হচ্ছে... অপেক্ষা করুন' : 'Calculating extreme setups... Please wait'}</span>
           </div>
         `;
-      }).join('');
+      } else {
+        const isBn = LANG === 'bn';
+        plannedEl.innerHTML = planned.map((p) => {
+          const rank = p.priority_rank || p.id || 1;
+          const rankCls = rank === 1 ? 'rank-1' : (rank === 2 ? 'rank-2' : '');
+          const isBuy = (p.action || '').toUpperCase() === 'BUY';
+          const touchCls = p.is_touch ? ' touching' : '';
+          const statusCls = p.status_cls || (p.is_touch ? 'trigger' : 'pending');
+          const statusTxt = isBn ? (p.status_text_bn || p.status_text || 'অপেক্ষমাণ') : (p.status_text || 'PENDING');
+
+          const distStr = (p.distance !== undefined && p.distance !== null && p.distance !== '') ? `$${fmtPrice(p.distance)} away` : (isBn ? 'লেভেলে আছে' : 'at level');
+          const distPctStr = (p.dist_pct !== undefined && p.dist_pct !== null) ? ` (${p.dist_pct}%)` : '';
+          const distDisplay = distStr + distPctStr;
+          const nearCls = (p.is_touch || (p.dist_pct !== undefined && p.dist_pct <= 0.35)) ? ' near' : '';
+
+          const desc = isBn ? (p.reason_bn || p.reason) : p.reason;
+          const tpValEst = p.est_tp_price ? fmtPrice(p.est_tp_price) : '--';
+          const slValEst = p.est_sl_price ? fmtPrice(p.est_sl_price) : '--';
+          const tpDollar = p.tp ? `$${p.tp}` : `$${nf(b.config ? b.config.tp || 0.5 : 0.5, 2)}`;
+          const slDollar = p.sl ? `$${p.sl}` : `$${nf(b.config ? b.config.sl || 5.0 : 5.0, 2)}`;
+
+          return `
+            <div class="pt-card ${isBuy ? 'buy' : 'sell'}${touchCls}">
+              <div class="pt-card-header">
+                <div class="pt-card-tags">
+                  <span class="pt-rank-badge ${rankCls}">#${rank}</span>
+                  <span class="pt-badge">${esc(p.action)}</span>
+                  <span class="pt-scope-tag">${esc(p.scope || '')}</span>
+                </div>
+                <span class="pt-status-pill status-${statusCls}">${esc(statusTxt)}</span>
+              </div>
+              <div class="pt-card-body">
+                <div class="pt-info">
+                  <span class="pt-name">${esc(p.label)}</span>
+                  <span class="pt-desc">${esc(desc)}</span>
+                </div>
+                <div class="pt-metrics">
+                  <div class="pt-metric-row">
+                    <span class="pt-metric-lbl">${isBn ? 'লেভেল' : 'Level'}:</span>
+                    <span class="pt-price">${fmtPrice(p.price)}</span>
+                  </div>
+                  <div class="pt-metric-row">
+                    <span class="pt-metric-lbl">${isBn ? 'দূরত্ব' : 'Dist'}:</span>
+                    <span class="pt-dist${nearCls}">${esc(distDisplay)}</span>
+                  </div>
+                </div>
+              </div>
+              <div class="pt-card-targets">
+                <span class="pt-target-tag tp">🎯 TP: ${tpValEst} (+${tpDollar})</span>
+                <span class="pt-target-tag sl">🛡️ SL: ${slValEst} (-${slDollar})</span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
     }
   }
-  window.dispatchEvent(new CustomEvent('bot3:planned-trades', {
-    detail: { symbol: shown, planned: planned }
-  }));
+  const b3DispatchSig = `${shown}|` + planned.map(p => `${p.action}:${p.price}:${p.label}`).join(';');
+  if (renderBot3._lastDispatchSig !== b3DispatchSig) {
+    renderBot3._lastDispatchSig = b3DispatchSig;
+    window.dispatchEvent(new CustomEvent('bot3:planned-trades', {
+      detail: { symbol: shown, planned: planned }
+    }));
+  }
 
   if (b3Panel) {
     const lotEl = $('bot3-lot');
@@ -4509,28 +4614,38 @@ function renderBot3(d) {
 
     // Conditions list
     const isBn = LANG === 'bn';
-    const conds = isBn ? [
-      `<b>১. চরম সীমা লেভেল চেক:</b> আজকের দিন (D1), চলতি সপ্তাহ ওপেনিং (W1) এবং গত সপ্তাহের (Prev W1) সব Higher High (HH) এবং Lower Low (LL) নিয়মিত স্ক্যান করে।`,
-      `<b>২. এক্সট্রিম রেঞ্জ এন্ট্রি:</b> মার্কেট একদম <b>নিচে (LL)</b> নামলে <b>BUY</b> ট্রেড নিবে; মার্কেট একদম <b>উপরে (HH)</b> উঠলে <b>SELL</b> ট্রেড নিবে (TP <b>$${nf(tpVal, 2)}</b>, SL <b>$${nf(slVal, 2)}</b>)।`,
-      `<b>৩. মিডল জোন ফিল্টার:</b> রেঞ্জের মাঝে কোনো ট্রেড নিবে না — শুধুই একদম উপর বা নিচ থেকে হাই-প্রোবাবিলিটি ট্রেড নিবে।`,
-      `<b>৪. রানিং লিমিট:</b> লট <b>${lot}</b> · একসাথে সর্বোচ্চ <b>${maxTrades}</b> টি ট্রেড রানিং থাকবে।`,
-    ] : [
-      `<b>1. Extreme Structure Monitoring:</b> Continuously tracks Today (D1), This Week (W1), and Previous Week (Prev W1) Higher High (HH) and Lower Low (LL) extremes.`,
-      `<b>2. Extreme Sniper Execution:</b> When market is at the absolute <b>bottom (LL)</b> -> Take <b>BUY</b>; when at the absolute <b>top (HH)</b> -> Take <b>SELL</b> (TP <b>$${nf(tpVal, 2)}</b>, SL <b>$${nf(slVal, 2)}</b>).`,
-      `<b>3. Middle Range Filter:</b> Strictly NO TRADES in the middle zone — exclusively snipes extremes.`,
-      `<b>4. Trade Limits:</b> Lot <b>${lot}</b> · Maximum <b>${maxTrades}</b> concurrent trade(s) running at once.`,
-    ];
     const condEl = $('bot3-cond');
-    if (condEl) condEl.innerHTML = conds.map((c) => `<li>${c}</li>`).join('');
+    const condSig = `${isBn ? 1 : 0}|${lot}|${maxTrades}|${tpVal}|${slVal}`;
+    if (condEl && condEl.dataset.sig !== condSig) {
+      condEl.dataset.sig = condSig;
+      const conds = isBn ? [
+        `<b>১. চরম সীমা লেভেল চেক:</b> আজকের দিন (D1), চলতি সপ্তাহ ওপেনিং (W1) এবং গত সপ্তাহের (Prev W1) সব Higher High (HH) এবং Lower Low (LL) নিয়মিত স্ক্যান করে।`,
+        `<b>২. এক্সট্রিম রেঞ্জ এন্ট্রি:</b> মার্কেট একদম <b>নিচে (LL)</b> নামলে <b>BUY</b> ট্রেড নিবে; মার্কেট একদম <b>উপরে (HH)</b> উঠলে <b>SELL</b> ট্রেড নিবে (TP <b>$${nf(tpVal, 2)}</b>, SL <b>$${nf(slVal, 2)}</b>)।`,
+        `<b>৩. মিডল জোন ফিল্টার:</b> রেঞ্জের মাঝে কোনো ট্রেড নিবে না — শুধুই একদম উপর বা নিচ থেকে হাই-প্রোবাবিলিটি ট্রেড নিবে।`,
+        `<b>৪. রানিং লিমিট:</b> লট <b>${lot}</b> · একসাথে সর্বোচ্চ <b>${maxTrades}</b> টি ট্রেড রানিং থাকবে।`,
+      ] : [
+        `<b>1. Extreme Structure Monitoring:</b> Continuously tracks Today (D1), This Week (W1), and Previous Week (Prev W1) Higher High (HH) and Lower Low (LL) extremes.`,
+        `<b>2. Extreme Sniper Execution:</b> When market is at the absolute <b>bottom (LL)</b> -> Take <b>BUY</b>; when at the absolute <b>top (HH)</b> -> Take <b>SELL</b> (TP <b>$${nf(tpVal, 2)}</b>, SL <b>$${nf(slVal, 2)}</b>).`,
+        `<b>3. Middle Range Filter:</b> Strictly NO TRADES in the middle zone — exclusively snipes extremes.`,
+        `<b>4. Trade Limits:</b> Lot <b>${lot}</b> · Maximum <b>${maxTrades}</b> concurrent trade(s) running at once.`,
+      ];
+      condEl.innerHTML = conds.map((c) => `<li>${c}</li>`).join('');
+    }
 
     // Running line & pos
     const pos = b.positions || [];
     const runningCount = b.running_count !== undefined ? b.running_count : pos.length;
     const runEl = $('bot3-running-line');
-    if (runEl) runEl.innerHTML = `<b>${isBn ? 'রানিং ট্রেড' : 'Running Trades'}:</b> <b>${runningCount} / ${maxTrades}</b> (Slot: ${maxTrades - runningCount > 0 ? (maxTrades - runningCount) + ' available' : 'FULL'})`;
+    const runSig = `${isBn ? 1 : 0}|${runningCount}|${maxTrades}`;
+    if (runEl && runEl.dataset.sig !== runSig) {
+      runEl.dataset.sig = runSig;
+      runEl.innerHTML = `<b>${isBn ? 'রানিং ট্রেড' : 'Running Trades'}:</b> <b>${runningCount} / ${maxTrades}</b> (Slot: ${maxTrades - runningCount > 0 ? (maxTrades - runningCount) + ' available' : 'FULL'})`;
+    }
 
     const posEl = $('bot3-pos');
-    if (posEl) {
+    const posSig = `${isBn ? 1 : 0}|` + pos.map(p => `${p.ticket}:${p.net}:${p.volume}`).join(',');
+    if (posEl && posEl.dataset.sig !== posSig) {
+      posEl.dataset.sig = posSig;
       posEl.innerHTML = pos.length
         ? pos.map((p) => {
             const side = (p.side || 'buy').toUpperCase();
@@ -4549,7 +4664,9 @@ function renderBot3(d) {
     const realized = stats.realized !== undefined ? Number(stats.realized).toFixed(2) : '0.00';
     const actionText = b.last_action ? ` · <i>${esc(b.last_action)}</i>` : '';
     const lastEl = $('bot3-last');
-    if (lastEl) {
+    const lastSig = `${LANG}|${shown}|${opened}|${closed}|${realized}|${b.last_action || ''}|${b.last_error || ''}`;
+    if (lastEl && lastEl.dataset.sig !== lastSig) {
+      lastEl.dataset.sig = lastSig;
       lastEl.innerHTML = `${esc(t('botMarketNow'))}: <b>${esc(shown)}</b> · ` +
         `${opened} ${t('botOpened')} / ${closed} ${t('botClosed')} (P/L: $${realized})${actionText}`;
       lastEl.className = 'bot-line' + (b.last_error ? ' warn' : '');
@@ -4896,12 +5013,73 @@ function renderBot5(d) {
     window.DashboardPanels.canonical(swingStruct.symbol || panelSymbol) === window.DashboardPanels.canonical(panelSymbol)
     ? swingStruct.frames.M5.slice(-64) : undefined;
   const dxyM5 = workspace && workspace.getDxyBarsM5 ? workspace.getDxyBarsM5() : undefined;
+  const quoteContextFor = (sym, depth = 0) => {
+    const canon = window.DashboardPanels.canonical;
+    const key = canon(sym);
+    if (!key) return null;
+    if (window.SOFT_TV_QUOTE && canon(window.SOFT_TV_QUOTE.symbol) === key && Number(window.SOFT_TV_QUOTE.price) > 0) {
+      return window.SOFT_TV_QUOTE;
+    }
+    if (Array.isArray(marketWatches)) {
+      const mw = marketWatches.find(w => w && canon(w.symbol) === key && (Number(w.ask) > 0 || Number(w.bid) > 0));
+      if (mw) {
+        return {
+          symbol: sym,
+          price: Number(mw.ask || mw.bid),
+          change_pct: Number(mw.change_pct || 0),
+          direction: mw.direction,
+          buyer_pct: mw.buyer_pct,
+          at: Date.now(),
+        };
+      }
+    }
+    if (_tickerData && _tickerData.size) {
+      const direct = _tickerData.get(tickerSymbol(sym));
+      const hit = direct || Array.from(_tickerData.values()).find(t => t && canon(t.symbol) === key);
+      if (hit && Number(hit.ask || hit.bid) > 0) {
+        return {
+          symbol: sym,
+          price: Number(hit.ask || hit.bid),
+          change_pct: Number(hit.change_pct || 0),
+          direction: hit.direction,
+          at: Date.now(),
+        };
+      }
+    }
+    if (depth === 0 && /^[A-Z]{6}$/.test(key)) {
+      const baseC = key.slice(0, 3), quoteC = key.slice(3);
+      if (baseC !== quoteC) {
+        const legVsUsd = (ccy) => {
+          if (ccy === 'USD') return { usdPerUnit: 1, chg: 0 };
+          const dir = quoteContextFor(ccy + 'USD', 1);
+          if (dir && Number(dir.price) > 0) return { usdPerUnit: Number(dir.price), chg: Number(dir.change_pct || 0) };
+          const inv = quoteContextFor('USD' + ccy, 1);
+          if (inv && Number(inv.price) > 0) return { usdPerUnit: 1 / Number(inv.price), chg: -Number(inv.change_pct || 0) };
+          return null;
+        };
+        const legB = legVsUsd(baseC), legQ = legVsUsd(quoteC);
+        if (legB && legQ && legQ.usdPerUnit > 0) {
+          const netChg = Number((legB.chg - legQ.chg).toFixed(3));
+          return {
+            symbol: sym,
+            price: legB.usdPerUnit / legQ.usdPerUnit,
+            change_pct: netChg,
+            direction: netChg > 0 ? 'UP' : netChg < 0 ? 'DOWN' : 'FLAT',
+            at: Date.now(),
+          };
+        }
+      }
+    }
+    return null;
+  };
   const estimateEvent = event => window.NewsDirection && window.NewsDirection.estimate({
-    event, symbol: panelSymbol, now: Date.now()/1000, quote: window.SOFT_TV_QUOTE, market: swingState,
+    event, symbol: panelSymbol, now: Date.now()/1000, quote: quoteContextFor(panelSymbol) || window.SOFT_TV_QUOTE, market: swingState,
     barsM5: panelM5Bars, dxyBarsM5: dxyM5 && dxyM5.length >= 4 ? dxyM5 : undefined,
     impact: workspace && workspace.impactFor ? workspace.impactFor(event, panelSymbol) : null,
-    headlines: allNewsList.filter(n => n.kind === 'headline') });
-  const evEstimate = ev && ((workspace && workspace.directionFor && workspace.directionFor(ev, panelSymbol)) || estimateEvent(ev));
+    headlines: allNewsList.filter(n => n.kind === 'headline'),
+    resolveUpcoming: true });
+  const wsDirEst = ev && workspace && workspace.directionFor ? workspace.directionFor(ev, panelSymbol) : null;
+  const evEstimate = ev && (wsDirEst && (wsDirEst.side === 'BUY' || wsDirEst.side === 'SELL') ? wsDirEst : (estimateEvent(ev) || wsDirEst));
   const bias = { side: evEstimate ? evEstimate.side : selectedImpact ? selectedImpact.side : '',
     reason: evEstimate ? evEstimate.reason : selectedImpact ? selectedImpact.reason : 'No supported market-direction evidence yet',
     confident: !!(evEstimate && evEstimate.strength >= 60) };
@@ -4980,10 +5158,11 @@ function renderBot5(d) {
     const catalogue = terminal && terminal.getMarkets ? terminal.getMarkets() : [];
     const impactSymbols = catalogue.length ? catalogue : b.symbol_options || [panelSymbol];
     const daily = window.MarketOutlookData;
+    if (daily && daily.ensure) daily.ensure(impactSymbols, panelSymbol);
     const now = Date.now()/1000;
     const impactKey = JSON.stringify([ev.title, ev.ts, ev.currency, ev.impact,
       ev.actual, ev.forecast, ev.previous, ev.impacted_markets, panelSymbol, impactSymbols, b.feed_updated,
-      marketNews.length, daily && daily.status().ready, evEstimate && evEstimate.side]);
+      marketNews.length, daily && daily.status().ready, marketWatches.length, dxyM5 ? dxyM5.length : 0, evEstimate && evEstimate.side]);
     let impactCache = renderBot5.eventImpactCache;
     if (!impactCache || impactCache.key !== impactKey || now - impactCache.at >= 10) {
       const rows = window.DashboardPanels.eventImpacts(ev, impactSymbols, panelSymbol, now, relevantNews,
@@ -4993,10 +5172,11 @@ function renderBot5(d) {
             market: context.market, quote: context.quote, headlines: context.headlines,
             dxyBarsM5: dxyM5 && dxyM5.length >= 4 ? dxyM5 : undefined,
             headlinesPreSorted: context.headlinesPreSorted,
+            resolveUpcoming: true,
             impact: workspace && workspace.impactFor ? workspace.impactFor(event, symbol) : null });
         }, symbol => ({ market: swingState && swingState.fresh &&
             window.DashboardPanels.canonical(swingState.symbol) === window.DashboardPanels.canonical(symbol)
-            ? swingState : daily && daily.get(symbol), quote: window.SOFT_TV_QUOTE }), marketNews);
+            ? swingState : daily && daily.get(symbol), quote: quoteContextFor(symbol) }), marketNews);
       impactCache = renderBot5.eventImpactCache = { key: impactKey, at: now, rows };
     }
     const impacts = impactCache.rows;
@@ -5005,10 +5185,10 @@ function renderBot5(d) {
     if (impacts.length) {
       chipsHtml = impacts.map(m => {
         const isBuy = m.side === 'BUY', hasSide = !!m.side;
-        const direction = isBuy ? '▲ BUY · UP' : hasSide ? '▼ SELL · DOWN' : (isBn ? 'দিক অনিশ্চিত' : 'NO SIGNAL');
+        const direction = isBuy ? '▲ BUY · UP' : hasSide ? '▼ SELL · DOWN' : (isBn ? 'দিক অনিশ্চিত' : 'SCANNING');
         const move = m.move_abs > 0 ? (isBuy ? '+' : '−') + m.move_abs.toFixed(m.move_abs >= 1 ? 2 : 5) + ' · ' : '';
         const detail = hasSide ? `${move}${m.strength}% ${isBn ? 'সিগন্যাল · অনুমান' : 'strength · estimate'}`
-          : (isBn ? 'দিক নির্ধারণের তথ্য নেই' : 'Directional evidence unavailable');
+          : (isBn ? 'মার্কেট ডেটা লোড হচ্ছে' : 'Loading live market direction…');
         return `<div class="imp-market-pill ${isBuy ? 'buy' : hasSide ? 'sell' : 'uncertain'}" data-market="${esc(m.market)}" title="${esc(m.reason)}">
           <span class="imp-sym">${esc(m.market)}</span>
           <span class="imp-dir">${direction}</span>
@@ -6305,6 +6485,10 @@ function initFlowUI() {
     if (histTab) histTab.classList.toggle('active', !isPos);
     if (posView) posView.classList.toggle('active', isPos);
     if (histView) histView.classList.toggle('active', !isPos);
+    if (S && leftDrawerOpen()) {
+      if (isPos) renderPositions(S);
+      else renderHistory(S);
+    }
   };
   window.__switchLeftDrawerTab = switchLeftDrawerTab;
 
@@ -6318,8 +6502,10 @@ function initFlowUI() {
     if (actTab) actTab.classList.toggle('active', !isBots);
     if (botsView) botsView.classList.toggle('active', isBots);
     if (actView) actView.classList.toggle('active', !isBots);
-    if (!isBots) $('bot5-news')?.__renderer?.pause();
-    else if ((typeof botsDrawerOpen === 'function' ? botsDrawerOpen() : !!dash?.classList?.contains('drawer-right-open')) && typeof renderBot5 === 'function') { renderBot5(S || window.__lastPollData || {}); $('bot5-news')?.__renderer?.resume(); }
+    if (!isBots) {
+      $('bot5-news')?.__renderer?.pause();
+      if (S) renderFeed(S);
+    } else if ((typeof botsDrawerOpen === 'function' ? botsDrawerOpen() : !!dash?.classList?.contains('drawer-right-open')) && typeof renderBot5 === 'function') { renderBot5(S || window.__lastPollData || {}); $('bot5-news')?.__renderer?.resume(); }
   };
   window.__switchRightDrawerTab = switchRightDrawerTab;
 
@@ -6351,11 +6537,13 @@ function initFlowUI() {
       $('bot5-news')?.__renderer?.resume();
     }
 
-    if (side === 'left' && tab) {
-      switchLeftDrawerTab(tab);
+    if (side === 'left') {
+      if (tab) switchLeftDrawerTab(tab);
+      else if (S) { renderPositions(S); renderHistory(S); }
     }
-    if (side === 'right' && tab) {
-      switchRightDrawerTab(tab);
+    if (side === 'right') {
+      if (tab) switchRightDrawerTab(tab);
+      else if (S) renderFeed(S);
     }
   };
   window.__setFlowDrawer = setDrawer;
@@ -7096,8 +7284,8 @@ function renderFeed(d) {
   setCell(tabBadgeEl, cntStr);
   setCell(railFeedEl, cntStr);
 
-  // Re-render feed list only when visible items or active speaker changes
-  if (feedEl) {
+  // Re-render feed list only when drawer activity view is open and content changed
+  if (feedEl && rightActivityOpen()) {
     const top40 = evs.slice(0, 40);
     const feedSig = `${currentSpeakingKey || ''}|${top40.map(e => `${e.ts}_${e.kind}_${e.message}`).join('|')}`;
     if (feedEl.dataset.sig !== feedSig) {
@@ -7467,6 +7655,7 @@ async function fetchMarketWatch(force = false) {
     marketWatches = data.watches;
     applyMarketWatchState();
     updateMarketTickerTape(marketWatches);
+    if (window.__lastPollData) renderBot5(window.__lastPollData);
   } catch (e) {
     // silent fail - the live WebSocket stream keeps the dials updated
   }
@@ -7539,7 +7728,7 @@ function queueWatchFrame(frame) {
   if (!frame || !Array.isArray(frame.watches) || !frame.watches.length) return;
   _watchFramePending = frame;
   const elapsed = Date.now() - _watchFrameLast;
-  if (elapsed >= 100) {
+  if (elapsed >= 220) {
     _watchFrameLast = Date.now();
     const f = _watchFramePending;
     _watchFramePending = null;
@@ -7553,7 +7742,7 @@ function queueWatchFrame(frame) {
     const f = _watchFramePending;
     _watchFramePending = null;
     if (f) applyMarketWatchFrame(f);
-  }, 100 - elapsed);
+  }, 220 - elapsed);
 }
 
 /* Structure changed (boot / different symbol set) -> full machine rebuild. */
@@ -7579,7 +7768,7 @@ function applyMarketWatchState() {
 /* In-place live patch - keeps the CSS transitions (needle sweep, VU fade) intact. */
 function updateMarketWatchDials() {
   const grid = $('market-watch-grid');
-  if (!grid) return;
+  if (!grid || grid.offsetParent === null) return;
   const activeSym = flowSymbol().toUpperCase();
   const bySym = new Map(marketWatches.map((w) => [String(w.symbol || '').toUpperCase(), w]));
   // one formatted clock per distinct reading - a frame carries the same stamp for every dial
@@ -8282,6 +8471,7 @@ function updatePriceCurves() {
     const sym = getBotSelectedSymbol(botKey);
     if (!sym) return;
     const card = $(`${botKey}-curve-card`);
+    if (card && card.offsetParent === null) return;
     if (!card || card.dataset.sym !== sym) {
       setBotCurveSymbol(botKey, sym);
     } else {
@@ -8304,37 +8494,56 @@ window.addEventListener('softradex:theme', () => {
 */
 const DEFAULT_TICKER_MARKETS = [
   { symbol: 'XAUUSD', displayName: 'XAU/USD (Gold)', digits: 2 },
+  { symbol: 'XAGUSD', displayName: 'XAG/USD (Silver)', digits: 3 },
+  { symbol: 'XAUEUR', displayName: 'XAU/EUR', digits: 2 },
+  { symbol: 'XAUGBP', displayName: 'XAU/GBP', digits: 2 },
+  { symbol: 'BTCUSDT', displayName: 'BTC/USDT', digits: 2 },
+  { symbol: 'ETHUSD', displayName: 'ETH/USD', digits: 2 },
+  { symbol: 'SOLUSD', displayName: 'SOL/USD', digits: 2 },
+  { symbol: 'XRPUSD', displayName: 'XRP/USD', digits: 4 },
+  { symbol: 'DOGEUSD', displayName: 'DOGE/USD', digits: 5 },
+  { symbol: 'BNBUSD', displayName: 'BNB/USD', digits: 2 },
+  { symbol: 'ADAUSD', displayName: 'ADA/USD', digits: 4 },
+  { symbol: 'LINKUSD', displayName: 'LINK/USD', digits: 3 },
+  { symbol: 'AVAXUSD', displayName: 'AVAX/USD', digits: 2 },
   { symbol: 'EURUSD', displayName: 'EUR/USD', digits: 5 },
-  { symbol: 'BTCUSD', displayName: 'BTC/USD (Bitcoin)', digits: 2 },
   { symbol: 'GBPUSD', displayName: 'GBP/USD', digits: 5 },
   { symbol: 'USDJPY', displayName: 'USD/JPY', digits: 3 },
-  { symbol: 'USOIL', displayName: 'US OIL (Crude)', digits: 2 },
-  { symbol: 'USTEC', displayName: 'NAS100 (Tech)', digits: 2 },
-  { symbol: 'US30', displayName: 'US30 (Dow Jones)', digits: 2 },
-  { symbol: 'ETHUSD', displayName: 'ETH/USD (Ethereum)', digits: 2 },
+  { symbol: 'USDCHF', displayName: 'USD/CHF', digits: 5 },
   { symbol: 'AUDUSD', displayName: 'AUD/USD', digits: 5 },
+  { symbol: 'NZDUSD', displayName: 'NZD/USD', digits: 5 },
+  { symbol: 'USDCAD', displayName: 'USD/CAD', digits: 5 },
+  { symbol: 'EURJPY', displayName: 'EUR/JPY', digits: 3 },
   { symbol: 'GBPJPY', displayName: 'GBP/JPY', digits: 3 },
-  { symbol: 'DXY', displayName: 'USD INDEX', digits: 2 },
+  { symbol: 'USOIL', displayName: 'US OIL (WTI)', digits: 2 },
+  { symbol: 'UKOIL', displayName: 'UK OIL (Brent)', digits: 2 },
+  { symbol: 'USTEC', displayName: 'NAS100 (Tech)', digits: 2 },
+  { symbol: 'US500', displayName: 'S&P 500', digits: 2 },
+  { symbol: 'US30', displayName: 'US30 (Dow Jones)', digits: 2 },
+  { symbol: 'DXY', displayName: 'USD INDEX (DXY)', digits: 3 },
 ];
 
 const _tickerData = new Map();
 let _tickerInitialized = false;
 let _microTicksTimer = null;
+let _tickerLastDomAt = 0;
 
 function tickerSymbol(value) {
-  const symbol = String(value || '').trim().replace(/m$/, '').toUpperCase();
+  const symbol = String(value || '').trim().replace(/m$/i, '').toUpperCase();
   return symbol === 'BTCUSD' ? 'BTCUSDT' : symbol;
 }
 
 function symbolDefaultDigits(sym) {
   const s = String(sym || '').toUpperCase();
-  if (s.includes('JPY')) return 3;
-  if (s.includes('BTC') || s.includes('XAU') || s.includes('GOLD') || s.includes('OIL') || s.includes('US30') || s.includes('100') || s.includes('TEC') || s.includes('DXY')) return 2;
+  if (s.includes('DOGE')) return 5;
+  if (s.includes('XRP') || s.includes('ADA')) return 4;
+  if (s.includes('JPY') || s.includes('XAG') || s.includes('LINK') || s.includes('DXY')) return 3;
+  if (s.includes('BTC') || s.includes('ETH') || s.includes('SOL') || s.includes('BNB') || s.includes('AVAX') || s.includes('XAU') || s.includes('GOLD') || s.includes('OIL') || s.includes('US30') || s.includes('US500') || s.includes('100') || s.includes('TEC')) return 2;
   return 5;
 }
 
 function buildTickerItemHtml(w, copyId, isCompact = false) {
-  const sym = String(w.symbol || '').toUpperCase();
+  const sym = tickerSymbol(w.symbol || '');
   const name = w.displayName || sym;
   const digits = Number(w.digits !== undefined ? w.digits : symbolDefaultDigits(sym));
   const priceVal = Number(w.ask || w.bid || 0);
@@ -8375,7 +8584,8 @@ function initMarketTickerTape() {
   _tickerInitialized = true;
 
   DEFAULT_TICKER_MARKETS.forEach(m => {
-    _tickerData.set(tickerSymbol(m.symbol), { ...m });
+    const sym = tickerSymbol(m.symbol);
+    _tickerData.set(sym, { ...m, symbol: sym });
   });
 
   renderMarketTickerDom(true);
@@ -8422,6 +8632,12 @@ function updateMarketTickerTape(watches) {
     }
   });
 
+  const nowTs = Date.now();
+  const patchDom = hasNew || nowTs - _tickerLastDomAt >= 450;
+  if (patchDom) _tickerLastDomAt = nowTs;
+  const connectEl = $('connect-view');
+  const loginVisible = !!(connectEl && !connectEl.classList.contains('hidden'));
+
   watches.forEach(w => {
     if (!w || !w.symbol) return;
     const sym = tickerSymbol(w.symbol);
@@ -8439,7 +8655,7 @@ function updateMarketTickerTape(watches) {
       ...(existing || {}),
       ...w,
       symbol: sym,
-      displayName: w.displayName || (existing ? existing.displayName : sym),
+      displayName: (existing && existing.displayName) || w.displayName || sym,
       ask: newPrice,
       bid: newPrice > 0 ? Number(w.bid) || newPrice : 0,
       digits,
@@ -8447,23 +8663,28 @@ function updateMarketTickerTape(watches) {
       change_pct: w.change_pct !== undefined ? w.change_pct : (existing ? existing.change_pct : 0),
     });
 
-    {
+    if (patchDom && !hasNew) {
       const priceStr = newPrice > 0 ? nf(newPrice, digits) : '—';
       const chg = Number(w.change_pct !== undefined ? w.change_pct : (existing ? existing.change_pct : 0));
       const chgStr = newPrice > 0 ? `${chg > 0 ? '+' : ''}${chg.toFixed(2)}%` : '—';
       const dir = String(w.direction || (priceDir === 'up' ? 'UP' : (priceDir === 'down' ? 'DOWN' : (existing ? existing.direction : 'FLAT')))).toUpperCase();
       const dirCls = dir === 'UP' ? 'up' : (dir === 'DOWN' ? 'down' : 'flat');
       const dirIcon = dir === 'UP' ? '▲' : (dir === 'DOWN' ? '▼' : '►');
+      const openNow = (typeof isMarketOpen === 'function') ? isMarketOpen(sym) : true;
 
       ['a', 'b'].forEach(copyId => {
         const pEl = $(`tk-price-${sym}-${copyId}`);
         if (pEl) {
           if (pEl.textContent !== priceStr) pEl.textContent = priceStr;
-          if (priceDir) {
-            pEl.classList.remove('tick-up', 'tick-down');
-            pEl.classList.add(priceDir === 'up' ? 'tick-up' : 'tick-down');
-            if (pEl._tkTimer) clearTimeout(pEl._tkTimer);
-            pEl._tkTimer = setTimeout(() => { pEl.classList.remove('tick-up', 'tick-down'); }, 700);
+          const cardEl = pEl.closest('.ticker-item');
+          if (cardEl) {
+            cardEl.classList.toggle('ticker-off', !openNow);
+            const pill = cardEl.querySelector('.ticker-off-pill');
+            if (openNow) {
+              if (pill) pill.remove();
+            } else if (!pill) {
+              cardEl.querySelector('.ticker-sym')?.insertAdjacentHTML('beforeend', '<span class="ticker-off-pill">OFF</span>');
+            }
           }
         }
         const cEl = $(`tk-chg-${sym}-${copyId}`);
@@ -8474,27 +8695,21 @@ function updateMarketTickerTape(watches) {
           if (cEl.textContent !== wantTxt) cEl.textContent = wantTxt;
         }
 
-        const lpEl = $(`login-tk-price-${sym}-${copyId}`);
-        if (lpEl) {
-          if (lpEl.textContent !== priceStr) lpEl.textContent = priceStr;
-          if (priceDir) {
-            lpEl.style.color = priceDir === 'up' ? '#4ade80' : '#f87171';
-            if (lpEl._tkTimer) clearTimeout(lpEl._tkTimer);
-            lpEl._tkTimer = setTimeout(() => { lpEl.style.color = '#38bdf8'; }, 700);
+        if (loginVisible) {
+          const lpEl = $(`login-tk-price-${sym}-${copyId}`);
+          if (lpEl && lpEl.textContent !== priceStr) lpEl.textContent = priceStr;
+          const lcEl = $(`login-tk-chg-${sym}-${copyId}`);
+          if (lcEl) {
+            const wantLCls = `login-ticker-chg ${dirCls}`;
+            const wantLTxt = `${dirIcon} ${chgStr}`;
+            if (lcEl.className !== wantLCls) lcEl.className = wantLCls;
+            if (lcEl.textContent !== wantLTxt) lcEl.textContent = wantLTxt;
           }
-        }
-        const lcEl = $(`login-tk-chg-${sym}-${copyId}`);
-        if (lcEl) {
-          const wantLCls = `login-ticker-chg ${dirCls}`;
-          const wantLTxt = `${dirIcon} ${chgStr}`;
-          if (lcEl.className !== wantLCls) lcEl.className = wantLCls;
-          if (lcEl.textContent !== wantLTxt) lcEl.textContent = wantLTxt;
         }
       });
     }
   });
 
-  const topTrack = $('market-ticker-track');
   if (hasNew) {
     renderMarketTickerDom(true);
   }
@@ -8677,14 +8892,25 @@ function init3DTiltEngine() {
   let tiltRectAt = 0;
   let tiltRaf = 0;
   let lastTiltEv = null;
-  window.addEventListener('scroll', () => { tiltRect = null; }, { passive: true });
+  let lastScrollAt = 0;
+  let lastTiltKey = '';
+  window.addEventListener('scroll', () => {
+    tiltRect = null;
+    lastScrollAt = performance.now();
+    if (currentTiltEl) {
+      resetTilt(currentTiltEl);
+      currentTiltEl = null;
+    }
+  }, { passive: true });
 
   document.addEventListener('pointerover', (e) => {
+    if (performance.now() - lastScrollAt < 180) return;
     const target = e.target && e.target.closest ? e.target.closest(tiltSelector) : null;
     if (target) {
       if (currentTiltEl && currentTiltEl !== target) resetTilt(currentTiltEl);
       currentTiltEl = target;
       tiltRect = null;
+      lastTiltKey = '';
       target.classList.add('is-hovered-3d');
     }
   }, { passive: true });
@@ -8694,6 +8920,7 @@ function init3DTiltEngine() {
       resetTilt(currentTiltEl);
       currentTiltEl = null;
       tiltRect = null;
+      lastTiltKey = '';
     }
   }, { passive: true });
 
@@ -8703,8 +8930,8 @@ function init3DTiltEngine() {
     if (tiltRaf) return;
     tiltRaf = requestAnimationFrame(() => {
       tiltRaf = 0;
-      if (!currentTiltEl || !lastTiltEv) return;
       const now = performance.now();
+      if (!currentTiltEl || !lastTiltEv || now - lastScrollAt < 180) return;
       if (!tiltRect || now - tiltRectAt > 300) {
         tiltRect = currentTiltEl.getBoundingClientRect();
         tiltRectAt = now;
@@ -8712,13 +8939,16 @@ function init3DTiltEngine() {
       if (!tiltRect.width || !tiltRect.height) return;
       const relX = Math.max(0, Math.min(1, (lastTiltEv.clientX - tiltRect.left) / tiltRect.width));
       const relY = Math.max(0, Math.min(1, (lastTiltEv.clientY - tiltRect.top) / tiltRect.height));
-      const tiltX = (relY - 0.5) * -12;
-      const tiltY = (relX - 0.5) * 12;
+      const tiltX = ((relY - 0.5) * -12).toFixed(1);
+      const tiltY = ((relX - 0.5) * 12).toFixed(1);
       const mx = Math.round(relX * 100);
       const my = Math.round(relY * 100);
+      const key = `${tiltX}|${tiltY}|${mx}|${my}`;
+      if (key === lastTiltKey) return;
+      lastTiltKey = key;
 
-      currentTiltEl.style.setProperty('--rx', `${tiltX.toFixed(2)}deg`);
-      currentTiltEl.style.setProperty('--ry', `${tiltY.toFixed(2)}deg`);
+      currentTiltEl.style.setProperty('--rx', `${tiltX}deg`);
+      currentTiltEl.style.setProperty('--ry', `${tiltY}deg`);
       currentTiltEl.style.setProperty('--mx', `${mx}%`);
       currentTiltEl.style.setProperty('--my', `${my}%`);
     });
@@ -8752,6 +8982,21 @@ function initDashboard() {
   setInterval(() => { if (!wsAlive && !httpPollTimer) void loadInitial(); }, 3000);
 
   setInterval(() => { if (wsAlive) { try { ws.send(JSON.stringify({ type: 'ping' })); } catch (e) {} } }, 20000);
+  // Enforce automatic 30d/60d subscription expiration while dashboard is open.
+  const verifySubscriptionSession = async () => {
+    try {
+      const res = await fetch('/api/user/session');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && data.authenticated === false) {
+        window.location.replace('/access?expired=1');
+      }
+    } catch (e) {}
+  };
+  setInterval(() => { void verifySubscriptionSession(); }, 30000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') void verifySubscriptionSession();
+  });
   // Half-dead socket watchdog: a sleeping machine / dropped NAT entry does not
   // fire onclose, so a socket silent for several ping cycles is recycled.
   setInterval(() => {
@@ -8789,13 +9034,16 @@ function initDashboard() {
   // live trade flow balance: our side rides the engine ticks, the whole world
   // (Binance public data) refreshes every 10 s
   void pollFlowBalanceWorld();
-  setInterval(pollFlowBalanceWorld, 10000);
+  setInterval(() => { if (!document.hidden) void pollFlowBalanceWorld(); }, 10000);
   // Market Pressure Watch Dials: NO timer. The live WebSocket state snapshot
   // (every engine tick) patches the dials in place. No setInterval needed.
   /* ==========================================================================
      ORDER FLOW BRIDGE: 02 MARKET PRESSURE WATCH DIALS
      Streams live order tape buyer vs seller pressure directly to Stage 05 Dials.
      ========================================================================== */
+  const _watchDialRefs = new WeakMap();
+  const _dialSetTxt = (el, v) => { if (el && el.textContent !== v) el.textContent = v; };
+  const _dialSetCls = (el, v) => { if (el && el.className !== v) el.className = v; };
   window.applyOrderFlowToWatchDials = function(stats) {
     if (!stats) return;
     const sym = String(stats.symbol || flowSymbol() || 'GOLD').trim();
@@ -8824,91 +9072,90 @@ function initDashboard() {
       w.live = true;
     }
 
-    // Direct DOM Patch for instantaneous 60fps needle, VU-meter, and pressure readouts
+    // Direct DOM Patch for instantaneous needle, VU-meter, and pressure readouts
     const grid = $('market-watch-grid');
-    if (grid) {
-      const card = grid.querySelector('.watch-card');
-      if (card && w && String(card.dataset.sym || '').toUpperCase() === String(w.symbol || '').toUpperCase()) {
-        // 1. Rotate Needle
-        const wrap = card.querySelector('.watch-hand-wrap');
-        if (wrap) wrap.style.transform = `rotate(${needleDeg}deg)`;
-        const lance = card.querySelector('.watch-hand-lance');
-        if (lance) lance.className = `watch-hand-lance ${domCls}`;
+    if (!grid || grid.offsetParent === null) return;
+    const card = grid.querySelector('.watch-card');
+    if (card && w && String(card.dataset.sym || '').toUpperCase() === String(w.symbol || '').toUpperCase()) {
+      const clockText = watchClockText(Date.now() / 1000);
+      const priceFixed = stats.lastPrice > 0 ? Number(stats.lastPrice).toFixed(2) : '';
+      const dialSig = `${w.symbol}|${buyPct}|${priceFixed}|${clockText}|${LANG}`;
+      if (card.dataset.ofSig === dialSig) return;
+      card.dataset.ofSig = dialSig;
 
-        // 2. Annunciator Lamp & Text
-        const ann = card.querySelector('.watch-annunciator');
-        const annTxt = card.querySelector('.annunciator-text');
-        if (ann) ann.className = `watch-annunciator ${domCls}`;
-        if (annTxt) {
-          annTxt.textContent = buyPct >= 72
-            ? (LANG === 'bn' ? 'তীব্র বায়ার চাপ (BUY FLOW)' : 'STRONG BUYER FLOW')
-            : (buyPct >= 55
-              ? (LANG === 'bn' ? `বায়ার চাপ ${buyPct}%` : `BUYER PRESSURE ${buyPct}%`)
-              : (sellPct >= 72
-                ? (LANG === 'bn' ? 'তীব্র সেলার চাপ (SELL FLOW)' : 'STRONG SELLER FLOW')
-                : (sellPct >= 55
-                  ? (LANG === 'bn' ? `সেলার চাপ ${sellPct}%` : `SELLER PRESSURE ${sellPct}%`)
-                  : (LANG === 'bn' ? 'অর্ডার ফ্লো ব্যালান্সড ৫০%' : 'ORDER FLOW BALANCED 50%'))));
-        }
-
-        // 3. Live Price Display
-        if (stats.lastPrice > 0) {
-          const priceEl = card.querySelector('.watch-price-display');
-          if (priceEl) priceEl.textContent = Number(stats.lastPrice).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-          const bidEl = card.querySelector('.spec-bid');
-          if (bidEl) bidEl.textContent = Number(stats.lastPrice).toFixed(2);
-        }
-
-        // 4. Pressure Split Header Labels
-        const buyLabel = card.querySelector('.pressure-label.buyer b');
-        const sellLabel = card.querySelector('.pressure-label.seller b');
-        if (buyLabel) buyLabel.textContent = `${buyPct}%`;
-        if (sellLabel) sellLabel.textContent = `${sellPct}%`;
-
-        // 5. Dual 16-Segment LED VU-Meter
+      let refs = _watchDialRefs.get(card);
+      if (!refs) {
         const rack = card.querySelector('.vu-meter-rack');
-        if (rack) {
-          rack.title = `Buyer: ${buyPct}% · Seller: ${sellPct}%`;
-          if (typeof patchVuSegments === 'function') {
-            patchVuSegments(rack.querySelector('.vu-buy'), buyPct, 'buy');
-            patchVuSegments(rack.querySelector('.vu-sell'), sellPct, 'sell');
-          }
-        }
+        refs = {
+          wrap: card.querySelector('.watch-hand-wrap'),
+          lance: card.querySelector('.watch-hand-lance'),
+          ann: card.querySelector('.watch-annunciator'),
+          annTxt: card.querySelector('.annunciator-text'),
+          priceEl: card.querySelector('.watch-price-display'),
+          bidEl: card.querySelector('.spec-bid'),
+          buyLabel: card.querySelector('.pressure-label.buyer b'),
+          sellLabel: card.querySelector('.pressure-label.seller b'),
+          rack,
+          vuBuy: rack ? rack.querySelector('.vu-buy') : null,
+          vuSell: rack ? rack.querySelector('.vu-sell') : null,
+          bBig: card.querySelector('.wpb-buyer .wpb-val'),
+          sBig: card.querySelector('.wpb-seller .wpb-val'),
+          bigRack: card.querySelector('.watch-pressure-bigrack'),
+          flowEl: card.querySelector('.spec-flow'),
+          dirEl: card.querySelector('.spec-direction'),
+          clockEl: card.querySelector('.machine-clock'),
+        };
+        _watchDialRefs.set(card, refs);
+      }
 
-        // 6. Big Buyer vs Seller Readout Box
-        const bBig = card.querySelector('.wpb-buyer .wpb-val');
-        const sBig = card.querySelector('.wpb-seller .wpb-val');
-        if (bBig) bBig.textContent = `${buyPct}%`;
-        if (sBig) sBig.textContent = `${sellPct}%`;
+      if (refs.wrap) {
+        const rot = `rotate(${needleDeg}deg)`;
+        if (refs.wrap.style.transform !== rot) refs.wrap.style.transform = rot;
+      }
+      _dialSetCls(refs.lance, `watch-hand-lance ${domCls}`);
+      _dialSetCls(refs.ann, `watch-annunciator ${domCls}`);
+      _dialSetTxt(
+        refs.annTxt,
+        buyPct >= 72
+          ? (LANG === 'bn' ? 'তীব্র বায়ার চাপ (BUY FLOW)' : 'STRONG BUYER FLOW')
+          : (buyPct >= 55
+            ? (LANG === 'bn' ? `বায়ার চাপ ${buyPct}%` : `BUYER PRESSURE ${buyPct}%`)
+            : (sellPct >= 72
+              ? (LANG === 'bn' ? 'তীব্র সেলার চাপ (SELL FLOW)' : 'STRONG SELLER FLOW')
+              : (sellPct >= 55
+                ? (LANG === 'bn' ? `সেলার চাপ ${sellPct}%` : `SELLER PRESSURE ${sellPct}%`)
+                : (LANG === 'bn' ? 'অর্ডার ফ্লো ব্যালান্সড ৫০%' : 'ORDER FLOW BALANCED 50%'))))
+      );
 
-        const bigRack = card.querySelector('.watch-pressure-bigrack');
-        if (bigRack) {
-          bigRack.title = `Buyer: ${buyPct}% · Seller: ${sellPct}%`;
-          bigRack.classList.toggle('buyer-lead', dominant === 'BUYER');
-          bigRack.classList.toggle('seller-lead', dominant === 'SELLER');
-        }
+      if (stats.lastPrice > 0) {
+        _dialSetTxt(refs.priceEl, Number(stats.lastPrice).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+        _dialSetTxt(refs.bidEl, priceFixed);
+      }
+      _dialSetTxt(refs.buyLabel, `${buyPct}%`);
+      _dialSetTxt(refs.sellLabel, `${sellPct}%`);
 
-        // 7. Direction and Flow Specs
-        const flowEl = card.querySelector('.spec-flow');
-        if (flowEl) {
-          const arrow = buyPct >= 50 ? '▲' : '▼';
-          flowEl.className = `spec-v flow-val spec-flow ${flow}`;
-          flowEl.textContent = `${arrow} ${flow.toUpperCase()}`;
-        }
-        const dirEl = card.querySelector('.spec-direction');
-        if (dirEl) {
-          const dir = buyPct >= 50 ? 'UP' : 'DOWN';
-          dirEl.className = `spec-v spec-direction ${dir.toLowerCase()}`;
-          dirEl.textContent = `${dir === 'UP' ? '▲' : '▼'} ${dir}`;
-        }
-
-        // 8. Live Clock on Machine Face
-        const clockEl = card.querySelector('.machine-clock');
-        if (clockEl) {
-          clockEl.textContent = watchClockText(Date.now() / 1000);
-          clockEl.classList.remove('sim');
+      if (refs.rack) {
+        const titleStr = `Buyer: ${buyPct}% · Seller: ${sellPct}%`;
+        if (refs.rack.title !== titleStr) refs.rack.title = titleStr;
+        if (typeof patchVuSegments === 'function') {
+          patchVuSegments(refs.vuBuy, buyPct, 'buy');
+          patchVuSegments(refs.vuSell, sellPct, 'sell');
         }
       }
+      _dialSetTxt(refs.bBig, `${buyPct}%`);
+      _dialSetTxt(refs.sBig, `${sellPct}%`);
+      if (refs.bigRack) {
+        refs.bigRack.classList.toggle('buyer-lead', dominant === 'BUYER');
+        refs.bigRack.classList.toggle('seller-lead', dominant === 'SELLER');
+      }
+      const flowArrow = buyPct >= 50 ? '▲' : '▼';
+      _dialSetCls(refs.flowEl, `spec-v flow-val spec-flow ${flow}`);
+      _dialSetTxt(refs.flowEl, `${flowArrow} ${flow.toUpperCase()}`);
+      const dir = buyPct >= 50 ? 'UP' : 'DOWN';
+      _dialSetCls(refs.dirEl, `spec-v spec-direction ${dir.toLowerCase()}`);
+      _dialSetTxt(refs.dirEl, `${dir === 'UP' ? '▲' : '▼'} ${dir}`);
+      _dialSetTxt(refs.clockEl, clockText);
+      if (refs.clockEl) refs.clockEl.classList.remove('sim');
     }
 
     // 9. Update Summary Pill in Stage 05 Header
@@ -9017,6 +9264,16 @@ function initDashboard() {
       level_down: levelDown
     };
 
+    // Check stage visibility + change signature before touching DOM
+    const aiStageEl = $('stage-ai');
+    if (aiStageEl && aiStageEl.offsetParent === null) return;
+    const priceStr = price.toFixed(digits);
+    const deltaRounded = Math.round(stats.netDelta || 0);
+    const speedStr = String(stats.speed || '0.0');
+    const aiOfSig = `${sym}|${buyPct}|${priceStr}|${confidence}|${sideClass}|${aiBoard.timeframe || 'M5'}|${deltaRounded}|${speedStr}|${LANG}`;
+    if (window.applyOrderFlowToAiMarket._lastSig === aiOfSig) return;
+    window.applyOrderFlowToAiMarket._lastSig = aiOfSig;
+
     // 1. Update #ai-verdict (The prominent one-line AI answer)
     const verEl = $('ai-verdict');
     if (verEl) {
@@ -9026,9 +9283,9 @@ function initDashboard() {
         <span class="ai-side ${sideClass}">${arrow} ${sideText}</span>
         <b>${confidence}%</b> ${LANG === 'bn' ? 'কনফিডেন্স' : 'Confidence'} · 
         ${LANG === 'bn' ? 'অর্ডার ফ্লো' : 'Order Flow'} <b>${buyPct}% BUY / ${sellPct}% SELL</b> · 
-        ${LANG === 'bn' ? 'প্রাইস' : 'Price Now'} <b>${price.toFixed(digits)}</b>
+        ${LANG === 'bn' ? 'প্রাইস' : 'Price Now'} <b>${priceStr}</b>
         <span class="ai-why" title="Traders Order Flow Terminal Auto-Analysis">
-          ${LANG === 'bn' ? 'কারণ' : 'Why'}: ${stats.speed} tx/s · Delta ${deltaStr}
+          ${LANG === 'bn' ? 'কারণ' : 'Why'}: ${speedStr} tx/s · Delta ${deltaStr}
         </span>
       `;
     }
@@ -9038,20 +9295,24 @@ function initDashboard() {
     if (tgtEl) {
       const upRole = sideClass === 'buy' ? (LANG === 'bn' ? 'টার্গেট' : 'Target') : (LANG === 'bn' ? 'রিস্ক' : 'Risk');
       const downRole = sideClass === 'sell' ? (LANG === 'bn' ? 'টার্গেট' : 'Target') : (LANG === 'bn' ? 'রিস্ক' : 'Risk');
-      tgtEl.innerHTML = `
-        <span class="ai-target up" title="${LANG === 'bn' ? 'আপ টার্গেট' : 'Up Target'}">
-          <b>▲ ${LANG === 'bn' ? 'আপ' : 'UP'} ${upPrice.toFixed(digits)}</b>
-          <small>+$${Math.abs(upMoney).toFixed(1)} · ${upRole}</small>
-        </span>
-        <span class="ai-target down" title="${LANG === 'bn' ? 'ডাউন টার্গেট' : 'Down Target'}">
-          <b>▼ ${LANG === 'bn' ? 'ডাউন' : 'DOWN'} ${downPrice.toFixed(digits)}</b>
-          <small>-$${Math.abs(downMoney).toFixed(1)} · ${downRole}</small>
-        </span>
-        <span class="ai-target level">
-          <b>${LANG === 'bn' ? 'লেভেলস' : 'Levels'}</b>
-          <small>${levelUp.toFixed(digits)} / ${levelDown.toFixed(digits)}</small>
-        </span>
-      `;
+      const tgtSig = `${sideClass}|${upPrice.toFixed(digits)}|${downPrice.toFixed(digits)}|${upMoney.toFixed(1)}|${downMoney.toFixed(1)}|${levelUp.toFixed(digits)}|${levelDown.toFixed(digits)}|${LANG}`;
+      if (tgtEl.dataset.ofSig !== tgtSig) {
+        tgtEl.dataset.ofSig = tgtSig;
+        tgtEl.innerHTML = `
+          <span class="ai-target up" title="${LANG === 'bn' ? 'আপ টার্গেট' : 'Up Target'}">
+            <b>▲ ${LANG === 'bn' ? 'আপ' : 'UP'} ${upPrice.toFixed(digits)}</b>
+            <small>+$${Math.abs(upMoney).toFixed(1)} · ${upRole}</small>
+          </span>
+          <span class="ai-target down" title="${LANG === 'bn' ? 'ডাউন টার্গেট' : 'Down Target'}">
+            <b>▼ ${LANG === 'bn' ? 'ডাউন' : 'DOWN'} ${downPrice.toFixed(digits)}</b>
+            <small>-$${Math.abs(downMoney).toFixed(1)} · ${downRole}</small>
+          </span>
+          <span class="ai-target level">
+            <b>${LANG === 'bn' ? 'লেভেলস' : 'Levels'}</b>
+            <small>${levelUp.toFixed(digits)} / ${levelDown.toFixed(digits)}</small>
+          </span>
+        `;
+      }
     }
 
     // 3. Update #ai-tf-tabs (Timeframe buttons: 1m, 5m, 15m, 1h, 4h, 1Day)
@@ -9065,20 +9326,25 @@ function initDashboard() {
         { k: 'H4', lbl: '4h', v: buyPct >= 62 ? 'BUY' : (sellPct >= 62 ? 'SELL' : 'MIXED') },
         { k: 'D1', lbl: '1Day', v: buyPct >= 65 ? 'BUY' : (sellPct >= 65 ? 'SELL' : 'MIXED') }
       ];
-      tabs.innerHTML = TFS.map(item => {
-        const itemArrow = item.v === 'BUY' ? '▲' : (item.v === 'SELL' ? '▼' : '◆');
-        const itemSide = item.v === 'BUY' ? 'buy' : (item.v === 'SELL' ? 'sell' : 'mixed');
-        const on = (aiBoard.timeframe || 'M5') === item.k ? ' sel' : '';
-        return `<span class="ai-tab ${itemSide}${on}" data-tf="${item.k}">${item.lbl} ${itemArrow}</span>`;
-      }).join('');
+      const tabsSig = `${aiBoard.timeframe || 'M5'}|` + TFS.map(x => `${x.k}:${x.v}`).join(',');
+      if (tabs.dataset.ofSig !== tabsSig) {
+        tabs.dataset.ofSig = tabsSig;
+        tabs.innerHTML = TFS.map(item => {
+          const itemArrow = item.v === 'BUY' ? '▲' : (item.v === 'SELL' ? '▼' : '◆');
+          const itemSide = item.v === 'BUY' ? 'buy' : (item.v === 'SELL' ? 'sell' : 'mixed');
+          const on = (aiBoard.timeframe || 'M5') === item.k ? ' sel' : '';
+          return `<span class="ai-tab ${itemSide}${on}" data-tf="${item.k}">${item.lbl} ${itemArrow}</span>`;
+        }).join('');
+      }
     }
 
     // 4. Update #ai-updated status age
     const updEl = $('ai-updated');
     if (updEl) {
-      updEl.textContent = LANG === 'bn'
+      const updTxt = LANG === 'bn'
         ? `আপডেট: ০ সেকেন্ড আগে · TRADERS ORDER FLOW টার্মিনাল লাইভ অটো-আপডেট`
         : `Updated: 0s ago · TRADERS ORDER FLOW TERMINAL Live Auto-Update`;
+      if (updEl.textContent !== updTxt) updEl.textContent = updTxt;
     }
 
     // 5. Update Timeframe Detail Grid (#ai-grid)
@@ -9105,7 +9371,7 @@ function initDashboard() {
             </div>
             <div class="ai-row-mid">
               <span>Order Flow</span>
-              <span>Speed ${stats.speed || '0.0'} tx/s</span>
+              <span>Speed ${speedStr} tx/s</span>
               <span>Delta ${stats.netDelta >= 0 ? '+' : ''}$${Math.abs(stats.netDelta || 0).toFixed(0)}</span>
             </div>
             <div class="ai-row-up">▲ UP ${upPrice.toFixed(digits)} <small>+$${Math.abs(upMoney).toFixed(1)}</small></div>
@@ -9115,23 +9381,50 @@ function initDashboard() {
         `;
       }).join('');
     } else if (grid) {
+      const tfVerdict = sideClass === 'buy' ? 'BUY' : (sideClass === 'sell' ? 'SELL' : 'MIXED');
+      const tfArrow = sideClass === 'buy' ? '▲' : (sideClass === 'sell' ? '▼' : '◆');
+      const upMain = `▲ UP ${upPrice.toFixed(digits)} `;
+      const upSub = `+$${Math.abs(upMoney).toFixed(1)}`;
+      const downMain = `▼ DOWN ${downPrice.toFixed(digits)} `;
+      const downSub = `-$${Math.abs(downMoney).toFixed(1)}`;
+      const noteTxt = `Traders Order Flow: ${buyPct}% Buyers / ${sellPct}% Sellers · Live`;
       grid.querySelectorAll('.ai-row').forEach(rowEl => {
-        const tfVerdict = sideClass === 'buy' ? 'BUY' : (sideClass === 'sell' ? 'SELL' : 'MIXED');
-        const tfArrow = sideClass === 'buy' ? '▲' : (sideClass === 'sell' ? '▼' : '◆');
-        rowEl.className = `ai-row ${sideClass}${rowEl.classList.contains('sel') ? ' sel' : ''}`;
+        const cls = `ai-row ${sideClass}${rowEl.classList.contains('sel') ? ' sel' : ''}`;
+        if (rowEl.className !== cls) rowEl.className = cls;
         const verdEl = rowEl.querySelector('.sess-verdict');
         if (verdEl) {
-          verdEl.className = `sess-verdict ${sideClass}`;
-          verdEl.textContent = `${tfArrow} ${tfVerdict}`;
+          const vCls = `sess-verdict ${sideClass}`;
+          if (verdEl.className !== vCls) verdEl.className = vCls;
+          const vTxt = `${tfArrow} ${tfVerdict}`;
+          if (verdEl.textContent !== vTxt) verdEl.textContent = vTxt;
         }
         const confEl = rowEl.querySelector('.ai-conf');
-        if (confEl) confEl.textContent = `${confidence}%`;
+        if (confEl) {
+          const cTxt = `${confidence}%`;
+          if (confEl.textContent !== cTxt) confEl.textContent = cTxt;
+        }
         const upEl = rowEl.querySelector('.ai-row-up');
-        if (upEl) upEl.innerHTML = `▲ UP ${upPrice.toFixed(digits)} <small>+$${Math.abs(upMoney).toFixed(1)}</small>`;
+        if (upEl) {
+          const sm = upEl.querySelector('small');
+          if (sm && upEl.firstChild && upEl.firstChild.nodeType === 3) {
+            if (upEl.firstChild.nodeValue !== upMain) upEl.firstChild.nodeValue = upMain;
+            if (sm.textContent !== upSub) sm.textContent = upSub;
+          } else {
+            upEl.innerHTML = `${upMain}<small>${upSub}</small>`;
+          }
+        }
         const downEl = rowEl.querySelector('.ai-row-down');
-        if (downEl) downEl.innerHTML = `▼ DOWN ${downPrice.toFixed(digits)} <small>-$${Math.abs(downMoney).toFixed(1)}</small>`;
+        if (downEl) {
+          const sm = downEl.querySelector('small');
+          if (sm && downEl.firstChild && downEl.firstChild.nodeType === 3) {
+            if (downEl.firstChild.nodeValue !== downMain) downEl.firstChild.nodeValue = downMain;
+            if (sm.textContent !== downSub) sm.textContent = downSub;
+          } else {
+            downEl.innerHTML = `${downMain}<small>${downSub}</small>`;
+          }
+        }
         const noteEl = rowEl.querySelector('.ai-row-note');
-        if (noteEl) noteEl.textContent = `Traders Order Flow: ${buyPct}% Buyers / ${sellPct}% Sellers · Live`;
+        if (noteEl && noteEl.textContent !== noteTxt) noteEl.textContent = noteTxt;
       });
     }
   };
@@ -9238,6 +9531,7 @@ else initDashboard();
 
 }
 export function loadAccessModule(): void {
+  initAccessPortal();
 
 (function () {
   if (window.__sxAboutMeBound) return;

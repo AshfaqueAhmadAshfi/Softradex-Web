@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { PORTAL_ADMIN_PASS, PORTAL_ADMIN_USERNAME } from './subscriptions';
 
 const SESSION_COOKIE = 'sx_sess';
 const CSRF_COOKIE = 'sx_csrf';
 const LOCK_COOKIE = 'sx_lock';
+const USER_COOKIE = 'sx_user';
+const PORTAL_ADMIN_COOKIE = 'sx_admin';
 const SESSION_TTL_SEC = 12 * 3600;
 const PROOF_SKEW_SEC = 120;
 const RATE_WINDOW_MS = 60_000;
@@ -128,6 +131,78 @@ export function clearAdminLockCookie(req: IncomingMessage, res: ServerResponse):
   appendSetCookie(res, `${LOCK_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`);
 }
 
+export function issueUserSessionCookie(req: IncomingMessage, res: ServerResponse, userId: string): void {
+  const tsStr = String(Math.floor(Date.now() / 1000));
+  const b64Id = Buffer.from(String(userId), 'utf8').toString('base64url');
+  const nonce = crypto.randomBytes(10).toString('hex');
+  const sig = hmacHex(`user|${tsStr}|${b64Id}|${nonce}`);
+  const secure = isHttpsReq(req) ? '; Secure' : '';
+  appendSetCookie(
+    res,
+    `${USER_COOKIE}=${encodeURIComponent(`${tsStr}.${b64Id}.${nonce}.${sig}`)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_SEC}${secure}`
+  );
+}
+
+export function getUserSessionFromReq(req: IncomingMessage): { id: string } | null {
+  const cookies = parseCookies(req);
+  const raw = cookies[USER_COOKIE] || '';
+  const parts = raw.split('.');
+  if (parts.length !== 4) return null;
+  const [tsStr, b64Id, nonce, sig] = parts;
+  const ts = Number(tsStr);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(ts) || nowSec - ts > SESSION_TTL_SEC || ts - nowSec > 30) return null;
+  if (!safeEq(sig, hmacHex(`user|${tsStr}|${b64Id}|${nonce}`))) return null;
+  try {
+    const id = Buffer.from(b64Id, 'base64url').toString('utf8');
+    return id ? { id } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearUserSessionCookie(req: IncomingMessage, res: ServerResponse): void {
+  const secure = isHttpsReq(req) ? '; Secure' : '';
+  appendSetCookie(res, `${USER_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`);
+}
+
+export function issuePortalAdminCookie(
+  req: IncomingMessage,
+  res: ServerResponse,
+  username: string,
+  password: string
+): boolean {
+  const userMatch = safeEq(sha256Hex(String(username || '').trim()), sha256Hex(PORTAL_ADMIN_USERNAME));
+  const passMatch = safeEq(sha256Hex(String(password || '')), sha256Hex(PORTAL_ADMIN_PASS));
+  if (!userMatch || !passMatch) return false;
+  const tsStr = String(Math.floor(Date.now() / 1000));
+  const nonce = crypto.randomBytes(10).toString('hex');
+  const sig = hmacHex(`portal_admin|${tsStr}|${nonce}|${sha256Hex(PORTAL_ADMIN_USERNAME)}`);
+  const secure = isHttpsReq(req) ? '; Secure' : '';
+  appendSetCookie(
+    res,
+    `${PORTAL_ADMIN_COOKIE}=${encodeURIComponent(`${tsStr}.${nonce}.${sig}`)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_TTL_SEC}${secure}`
+  );
+  return true;
+}
+
+export function isPortalAdminAuthed(req: IncomingMessage): boolean {
+  const cookies = parseCookies(req);
+  const raw = cookies[PORTAL_ADMIN_COOKIE] || '';
+  const parts = raw.split('.');
+  if (parts.length !== 3) return false;
+  const [tsStr, nonce, sig] = parts;
+  const ts = Number(tsStr);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(ts) || nowSec - ts > SESSION_TTL_SEC || ts - nowSec > 30) return false;
+  return safeEq(sig, hmacHex(`portal_admin|${tsStr}|${nonce}|${sha256Hex(PORTAL_ADMIN_USERNAME)}`));
+}
+
+export function clearPortalAdminCookie(req: IncomingMessage, res: ServerResponse): void {
+  const secure = isHttpsReq(req) ? '; Secure' : '';
+  appendSetCookie(res, `${PORTAL_ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`);
+}
+
 /**
  * Mint signed HttpOnly session + CSRF cookies ONLY on genuine same-site document requests.
  * Returns true if request was the synthetic `?_sx_init=1` handshake and already ended.
@@ -136,7 +211,8 @@ export function applyDocumentSessionMiddleware(req: IncomingMessage, res: Server
   const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
   const pathname = urlObj.pathname;
   const method = (req.method || 'GET').toUpperCase();
-  const isDocRoute = pathname === '/' || pathname === '/index.html' || pathname === '/access';
+  const normalizedPath = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  const isDocRoute = normalizedPath === '/' || normalizedPath === '/index.html' || normalizedPath === '/access' || normalizedPath === '/dashboard' || normalizedPath === '/admin';
   const isInitPing = urlObj.searchParams.get('_sx_init') === '1' && isDocRoute && method === 'HEAD';
 
   if (method !== 'GET' && method !== 'HEAD') return false;
@@ -317,7 +393,15 @@ export function enforceApiLock(req: IncomingMessage, res: ServerResponse, pathna
   }
 
   // 4. Optional admin lock key (if SOFTRADEX_LOCK_KEY env var is set)
-  if (isAdminKeyRequired() && pathname !== '/api/login' && pathname !== '/api/auth' && pathname !== '/api/logout' && pathname !== '/api/config') {
+  if (
+    isAdminKeyRequired() &&
+    pathname !== '/api/login' &&
+    pathname !== '/api/auth' &&
+    pathname !== '/api/logout' &&
+    pathname !== '/api/config' &&
+    !pathname.startsWith('/api/user/') &&
+    !pathname.startsWith('/api/admin/')
+  ) {
     if (!isAdminAuthed(req)) {
       rejectLocked(res, 401, 'API locked: password authentication required.');
       return false;

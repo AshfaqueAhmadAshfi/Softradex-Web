@@ -1920,22 +1920,38 @@ export function loadModule(): void {
       var layer = ensureLayer(b);
       if (!layer) return;
       if (!visible) {
-        if (layer.childElementCount) layer.innerHTML = '';
+        if (layer.childElementCount) { layer.innerHTML = ''; layer.dataset.sig = ''; }
         return;
       }
       var height = Number(range.height) || b.clientHeight || 1;
-      var html = setups.slice(0, 5).map(function (setup) {
+      var visRows = [];
+      var listSigParts = [];
+      for (var i = 0; i < setups.length && visRows.length < 5; i++) {
+        var setup = setups[i];
         var price = Number(setup.price);
-        if (!isFinite(price) || price <= 0) return '';
+        if (!isFinite(price) || price <= 0) continue;
         var y = (range.max - price) / (range.max - range.min) * height;
-        if (y < -8 || y > height + 8) return '';
+        if (y < -8 || y > height + 8) continue;
         var isBuy = String(setup.action || '').toUpperCase() === 'BUY';
         var side = isBuy ? 'BUY' : 'SELL';
-        return '<div class="extreme-price-line ' + (isBuy ? 'buy' : 'sell') + '" style="top:' + y.toFixed(2) + 'px">' +
-          '<span class="extreme-price-label">' + side + ' · ' + priceText(price) + '</span>' +
+        visRows.push({ y: y, cls: 'extreme-price-line ' + (isBuy ? 'buy' : 'sell'), label: side + ' · ' + priceText(price) });
+        listSigParts.push((isBuy ? '1' : '0') + ':' + price);
+      }
+      var structSig = listSigParts.join('|');
+      if (layer.dataset.sig === structSig && layer.childElementCount === visRows.length) {
+        for (var k = 0; k < visRows.length; k++) {
+          var rowEl = layer.children[k];
+          var topPx = visRows[k].y.toFixed(2) + 'px';
+          if (rowEl && rowEl.style.top !== topPx) rowEl.style.top = topPx;
+        }
+        return;
+      }
+      layer.dataset.sig = structSig;
+      layer.innerHTML = visRows.map(function (r) {
+        return '<div class="' + r.cls + '" style="top:' + r.y.toFixed(2) + 'px">' +
+          '<span class="extreme-price-label">' + r.label + '</span>' +
           '</div>';
       }).join('');
-      layer.innerHTML = html;
     });
   }
 
@@ -2450,6 +2466,7 @@ export function loadModule(): void {
       if (st.plans && st.plans[side]) candidates.push(st.plans[side]);
       candidates.forEach(function (p) {
         if (!p || !p.running || p.hit || p.doneAt) return;
+        if (!(Number(p.confidence) > 65)) return;
         var entry = Number(p.observedEntry || p.entry);
         var tp = Number(p.target);
         var sl = Number(p.stop);
@@ -2475,35 +2492,6 @@ export function loadModule(): void {
         });
       });
     });
-    if (Array.isArray(st.savedZones)) {
-      st.savedZones.forEach(function (z) {
-        if (!z) return;
-        var side = z.side === 'BUY' ? 'BUY' : z.side === 'SELL' ? 'SELL' : '';
-        var entry = Number(z.entry);
-        var tp = Number(z.tp);
-        var sl = Number(z.sl);
-        if (!side || !(entry > 0) || !(tp > 0) || !(sl > 0)) return;
-        if (side === 'BUY' && !(tp > entry && sl < entry)) return;
-        if (side === 'SELL' && !(tp < entry && sl > entry)) return;
-        var scale = String(z.scale || '');
-        var dedupKey = side + '|' + scale + '|' + entry.toFixed(4) + '|' + tp.toFixed(4) + '|' + sl.toFixed(4);
-        if (seen[dedupKey]) return;
-        seen[dedupKey] = true;
-        var risk = Math.max(1e-9, Math.abs(entry - sl));
-        out.push({
-          side: side,
-          scale: scale,
-          tfLabel: String(z.tfLabel || ''),
-          entry: entry,
-          tp: tp,
-          sl: sl,
-          startAt: Number(z.startAt || z.savedAt || 0),
-          rr: Math.abs(tp - entry) / risk,
-          saved: true,
-          savedStatus: String(z.status || 'OPEN')
-        });
-      });
-    }
     return out;
   }
 
@@ -2876,6 +2864,7 @@ export function loadModule(): void {
           livePrice = bars[bars.length - 1].c;
           livePriceAt = 0;
         }
+        window.dispatchEvent(new CustomEvent('chart:bars-loaded', { detail: { symbol: symbol, tf: tf } }));
         schedule();
       })
       .catch(function () {
@@ -3334,6 +3323,15 @@ export function loadModule(): void {
           }
         });
       });
+      var ncProj = collectNextCandleProjection();
+      if (ncProj) {
+        [ncProj.projLow, ncProj.projHigh].forEach(function (lvl) {
+          if (isFinite(lvl) && lvl > 0 && Math.abs(lvl - (min + max) * 0.5) <= barSpan * 1.8) {
+            min = Math.min(min, lvl);
+            max = Math.max(max, lvl);
+          }
+        });
+      }
     }
     if (!isFinite(min) || !isFinite(max) || max <= min) {
       min = isFinite(min) ? min * 0.999 : 0;
@@ -3424,11 +3422,136 @@ export function loadModule(): void {
       c.moveTo(x, yH);
       c.lineTo(x, yL);
       c.stroke();
-      var top = Math.min(yO, yC);
+    var top = Math.min(yO, yC);
       var height = Math.max(1, Math.abs(yC - yO));
       c.fillStyle = up ? 'rgba(8, 153, 129, 0.9)' : 'rgba(242, 54, 69, 0.9)';
       c.fillRect(x - barW / 2, top, barW, height);
     }
+  }
+
+  function collectNextCandleProjection() {
+    var api = window.NextCandleAI;
+    var nc = api && typeof api.state === 'function' ? api.state() : null;
+    if (!nc || !sameMarket(nc.symbol, dataSymbol) || String(nc.tf || '') !== String(dataTf || '')) return null;
+    var o = Number(nc.projOpen);
+    var cl = Number(nc.projClose);
+    var hi = Number(nc.projHigh);
+    var lo = Number(nc.projLow);
+    if (!(o > 0) || !(cl > 0) || !(hi > 0) || !(lo > 0) ||
+        !isFinite(o) || !isFinite(cl) || !isFinite(hi) || !isFinite(lo)) return null;
+    return nc;
+  }
+
+  function nextCandleSig() {
+    var nc = collectNextCandleProjection();
+    if (!nc) return '0';
+    return [
+      nc.tf, nc.side, nc.quality, nc.confidence,
+      Number(nc.projOpen).toFixed(4),
+      Number(nc.projClose).toFixed(4),
+      Number(nc.projHigh).toFixed(4),
+      Number(nc.projLow).toFixed(4)
+    ].join(':');
+  }
+
+  function drawNextCandleProjection(c, v, digits) {
+    var nc = collectNextCandleProjection();
+    if (!nc || !bars.length) return;
+    var nextX = v.xAt(bars.length);
+    if (nextX < -v.slot || nextX > v.chartW - 6) return;
+
+    var isBuy = nc.side === 'BUY';
+    var isWait = nc.quality === 'WAIT';
+    var isDark = document.documentElement.classList.contains('sx-dark');
+    var fillCol = isWait
+      ? 'rgba(245, 158, 11, 0.18)'
+      : isBuy
+        ? (isDark ? 'rgba(52, 211, 153, 0.25)' : 'rgba(8, 153, 129, 0.22)')
+        : (isDark ? 'rgba(248, 113, 113, 0.25)' : 'rgba(242, 54, 69, 0.22)');
+    var pillFillCol = isWait
+      ? (isDark ? 'rgba(217, 119, 6, 0.34)' : 'rgba(245, 158, 11, 0.26)')
+      : isBuy
+        ? (isDark ? 'rgba(16, 185, 129, 0.34)' : 'rgba(8, 153, 129, 0.24)')
+        : (isDark ? 'rgba(239, 68, 68, 0.34)' : 'rgba(242, 54, 69, 0.24)');
+    var strokeCol = isWait
+      ? (isDark ? 'rgba(251, 191, 36, 0.78)' : 'rgba(217, 119, 6, 0.78)')
+      : isBuy
+        ? (isDark ? 'rgba(52, 211, 153, 0.88)' : 'rgba(8, 153, 129, 0.84)')
+        : (isDark ? 'rgba(248, 113, 113, 0.88)' : 'rgba(242, 54, 69, 0.84)');
+
+    var topB = v.padT;
+    var botB = v.padT + v.plotH;
+    var yO = v.yOf(nc.projOpen);
+    var yC = v.yOf(nc.projClose);
+    var yH = v.yOf(nc.projHigh);
+    var yL = v.yOf(nc.projLow);
+    if (![yO, yC, yH, yL].every(isFinite)) return;
+
+    var barW = Math.max(3, Math.min(9, v.slot * 0.66));
+    var bodyTop = Math.min(yO, yC);
+    var bodyBot = Math.max(yO, yC);
+    var clampTop = Math.max(topB, Math.min(botB, bodyTop));
+    var clampBot = Math.max(topB, Math.min(botB, bodyBot));
+    var bodyH = Math.max(2, clampBot - clampTop);
+
+    c.save();
+    // Projected dashed upper & lower wicks
+    c.strokeStyle = strokeCol;
+    c.lineWidth = 1.15;
+    c.setLineDash([2, 2]);
+    if (yH < clampTop - 1 && yH <= botB) {
+      c.beginPath();
+      c.moveTo(nextX, Math.max(topB, yH));
+      c.lineTo(nextX, clampTop);
+      c.stroke();
+    }
+    if (yL > clampBot + 1 && yL >= topB) {
+      c.beginPath();
+      c.moveTo(nextX, clampBot);
+      c.lineTo(nextX, Math.min(botB, yL));
+      c.stroke();
+    }
+
+    // Transparent ghost candle body extending to projected target close
+    if (clampBot >= topB && clampTop <= botB) {
+      c.fillStyle = fillCol;
+      c.fillRect(nextX - barW / 2, clampTop, barW, bodyH);
+      c.setLineDash([2.5, 2]);
+      c.strokeRect(nextX - barW / 2 + 0.5, clampTop + 0.5, Math.max(1, barW - 1), Math.max(1, bodyH - 1));
+    }
+
+    // Dotted projection guide line to right price axis + collision-free transparent target pill
+    if (yC >= topB && yC <= botB) {
+      line(c, nextX + barW / 2, yC, v.chartW, yC, strokeCol, 1, [2, 3]);
+      var pillY = yC;
+      if (livePrice > 0) {
+        var yLivePx = v.yOf(livePrice);
+        if (isFinite(yLivePx) && Math.abs(pillY - yLivePx) < 17) {
+          pillY = isBuy ? yLivePx - 17 : yLivePx + 17;
+        }
+      }
+      pillY = Math.max(topB + 8, Math.min(botB - 8, pillY));
+      c.setLineDash([]);
+      c.fillStyle = pillFillCol;
+      c.fillRect(v.chartW, pillY - 8, v.axisW, 16);
+      c.strokeStyle = strokeCol;
+      c.lineWidth = 1;
+      c.strokeRect(v.chartW + 0.5, pillY - 7.5, Math.max(1, v.axisW - 1), 15);
+      c.font = '700 8.5px "JetBrains Mono", monospace';
+      c.textAlign = 'left';
+      c.textBaseline = 'middle';
+      c.fillStyle = isDark ? '#f8fafc' : '#0f172a';
+      c.fillText(formatChartPx(nc.projClose, digits), v.chartW + 4, pillY);
+    }
+
+    // Clean haloed dollar/point move tag next to the projected candle tip
+    var deltaTxt = nc.deltaLabel || ((isBuy ? '+' : '-') + Math.abs(nc.projClose - nc.projOpen).toFixed(digits));
+    var lbl = (nc.tfLabel || String(dataTf || '5M').toUpperCase()) + ' ' +
+      (isWait ? 'CHOP ' : (isBuy ? '▲ ' : '▼ ')) + deltaTxt + ' · ' + nc.confidence + '%';
+    var rawLblY = isBuy ? (Math.max(topB, yH) - 10) : (Math.min(botB, yL) + 10);
+    var lblY = Math.max(topB + 8, Math.min(botB - 8, rawLblY));
+    tag(c, lbl, nextX, lblY, strokeCol, 'center', v.chartW);
+    c.restore();
   }
 
   function drawLivePrice(c, v, digits) {
@@ -3878,7 +4001,7 @@ export function loadModule(): void {
       }
     ].filter(function (m) { return isFinite(m.price) && m.price > 0; });
 
-    var baseX = Math.max(24, Math.min(v.chartW - 14, v.rightEdgeX + Math.max(11, v.slot * 1.35)));
+    var baseX = Math.max(24, Math.min(v.chartW - 14, v.rightEdgeX + Math.max(20, v.slot * 2.2)));
     var minY = v.padT + 10, maxY = v.padT + v.plotH - 10;
     var items = raw.map(function (m) {
       var rawY = v.yOf(m.price);
@@ -4691,6 +4814,7 @@ export function loadModule(): void {
     var swingBoxes = drawSwingPositionsBack(c, v);
     if (holder) paneSwingBoxes.set(holder, swingBoxes);
     drawCandles(c, v);
+    drawNextCandleProjection(c, v, digits);
     if (id === 'msb') drawMSB(c, v);
     else if (id === 'killzones') drawKillzones(c, v);
     var smcTargets = drawSmartMoneyZones(c, v, digits, holder);
@@ -4721,7 +4845,7 @@ export function loadModule(): void {
     var rKey = seriesKey(bars) + '|' + bars.length + '|' + livePrice + '|' + view.bars + '|' + view.offset.toFixed(2) + '|' +
       view.yZoom.toFixed(3) + '|' + view.yPan.toFixed(4) + '|' +
       activeMask + '|' + (firstSize ? firstSize.width + 'x' + firstSize.height : '') + '|' +
-      radarSignature() + '|' + liveSignalSig() + '|' + swingPositionSig() + '|' + hoverSig + '|' + themeSig + '|' +
+      radarSignature() + '|' + liveSignalSig() + '|' + swingPositionSig() + '|' + nextCandleSig() + '|' + hoverSig + '|' + themeSig + '|' +
       (loading ? 'L' : '') + (historyLoading ? 'H' : '') + '|' + (dataError || '');
     if (rKey === lastRenderKey) return;
     lastRenderKey = rKey;
@@ -4828,6 +4952,10 @@ export function loadModule(): void {
     lastRenderKey = '';
     if (anyEnabled()) schedule();
   });
+  window.addEventListener('chart:next-candle-update', function () {
+    lastRenderKey = '';
+    if (anyEnabled()) schedule();
+  });
 
   window.addEventListener('chart:price-range', function (ev) {
     if (!geometry) return;
@@ -4906,6 +5034,10 @@ export function loadModule(): void {
 
   window.ChartIndicators = {
     list: function () { return INDICATORS.slice(); },
+    recentBars: function (sym, tf) {
+      if (!bars.length || !sameMarket(sym, dataSymbol) || String(tf || '') !== String(dataTf || '')) return [];
+      return bars.slice(-140).map(function (b) { return [b.t, b.o, b.h, b.l, b.c, b.v || 0]; });
+    },
     active: function () {
       return INDICATORS.filter(function (ind) { return enabled[ind.id]; })
         .map(function (ind) { return ind.id; });
@@ -4990,6 +5122,7 @@ export function loadModule(): void {
           };
         })() : null,
         swingPositions: holder && paneSwingBoxes.get(holder) ? paneSwingBoxes.get(holder) : [],
+        nextCandle: collectNextCandleProjection(),
         hoveredRadar: holder ? (paneHover.get(holder) || '') : ''
       };
     },

@@ -22,11 +22,30 @@ import {
 } from './news-feed';
 import {
   clearAdminLockCookie,
+  clearPortalAdminCookie,
+  clearUserSessionCookie,
   enforceApiLock,
+  getUserSessionFromReq,
   isAdminAuthed,
   isAdminKeyRequired,
+  isPortalAdminAuthed,
   issueAdminLockCookie,
+  issuePortalAdminCookie,
+  issueUserSessionCookie,
 } from './api-security';
+import {
+  authenticatePortalLogin,
+  calculateSubscriptionPricing,
+  findActiveSubscriberById,
+  loadSyncedUsers,
+  performAdminUserAction,
+  PLANS,
+  PORTAL_ADMIN_PASS,
+  PORTAL_ADMIN_USERNAME,
+  submitPaymentRequest,
+  type AdminUserAction,
+  type PlanId,
+} from './subscriptions';
 
 let sessionMarket = 'XAUUSDm';
 let aiMarket = 'XAUUSDm';
@@ -344,7 +363,178 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 
   if (pathname === '/api/logout') {
     clearAdminLockCookie(req, res);
-    sendJson(res, 200, { ok: true, auth_required: isAdminKeyRequired(), authed: false, ttl_sec: 43200 });
+    clearUserSessionCookie(req, res);
+    sendJson(res, 200, { ok: true, auth_required: isAdminKeyRequired(), authed: false, authenticated: false, ttl_sec: 43200 });
+    return true;
+  }
+
+  if (pathname === '/api/user/session') {
+    const sess = getUserSessionFromReq(req);
+    const activeUser = sess ? findActiveSubscriberById(sess.id) : null;
+    if (sess && !activeUser) {
+      clearUserSessionCookie(req, res);
+    }
+    const adminAuthed = isPortalAdminAuthed(req);
+    sendJson(res, 200, {
+      ok: true,
+      authenticated: Boolean(activeUser),
+      adminAuthed,
+      user: activeUser
+        ? {
+            id: activeUser.id,
+            name: activeUser.name,
+            plan: activeUser.plan,
+            activatedAt: activeUser.activatedAt,
+            expiresAt: activeUser.expiresAt,
+          }
+        : null,
+    });
+    return true;
+  }
+
+  if (pathname === '/api/user/register-payment' && method === 'POST') {
+    const body = await readBody(req);
+    const result = submitPaymentRequest({
+      name: String(body?.name || ''),
+      phoneNumber: String(body?.phoneNumber || ''),
+      password: String(body?.password || ''),
+      confirmPassword: String(body?.confirmPassword || ''),
+      plan: String(body?.plan || ''),
+      payMethod: String(body?.payMethod || ''),
+      promoCode: String(body?.promoCode || ''),
+    });
+    if ('error' in result) {
+      sendJson(res, result.status, { ok: false, error: result.error });
+      return true;
+    }
+    const u = result.user;
+    sendJson(res, 200, {
+      ok: true,
+      message: 'Payment details submitted! Please send your screenshot on WhatsApp (01531817299) to activate your account.',
+      user: {
+        id: u.id,
+        name: u.name,
+        phoneNumber: u.phoneNumber,
+        plan: u.plan,
+        payMethod: u.payMethod,
+        promoCode: u.promoCode,
+        baseUsd: u.baseUsd,
+        discountUsd: u.discountUsd,
+        finalUsd: u.finalUsd,
+        amountBdt: u.amountBdt,
+        status: u.status,
+        createdAt: u.createdAt,
+      },
+    });
+    return true;
+  }
+
+  if (pathname === '/api/user/validate-promo' && method === 'POST') {
+    const body = await readBody(req);
+    const planKey = PLANS[String(body?.plan || '') as PlanId] ? String(body.plan) : '30d';
+    const pricing = calculateSubscriptionPricing(planKey, String(body?.promoCode || ''));
+    sendJson(res, 200, {
+      ok: true,
+      valid: pricing.promoApplied,
+      finalUsd: pricing.finalUsd,
+      amountBdt: pricing.amountBdt,
+    });
+    return true;
+  }
+
+  if (pathname === '/api/user/login' && method === 'POST') {
+    const body = await readBody(req);
+    const result = authenticatePortalLogin(String(body?.name || ''), String(body?.password || ''));
+    if ('error' in result) {
+      sendJson(res, result.status, { ok: false, error: result.error });
+      return true;
+    }
+    if (result.kind === 'admin') {
+      issuePortalAdminCookie(req, res, PORTAL_ADMIN_USERNAME, PORTAL_ADMIN_PASS);
+      sendJson(res, 200, {
+        ok: true,
+        role: 'admin',
+        redirect: '/admin',
+      });
+      return true;
+    }
+    issueUserSessionCookie(req, res, result.user.id);
+    sendJson(res, 200, {
+      ok: true,
+      role: 'dashboard',
+      redirect: '/dashboard',
+      user: {
+        id: result.user.id,
+        name: result.user.name,
+        plan: result.user.plan,
+        activatedAt: result.user.activatedAt,
+        expiresAt: result.user.expiresAt,
+      },
+    });
+    return true;
+  }
+
+  if (pathname === '/api/admin/session') {
+    sendJson(res, 200, {
+      ok: true,
+      authed: isPortalAdminAuthed(req),
+      username: isPortalAdminAuthed(req) ? PORTAL_ADMIN_USERNAME : null,
+    });
+    return true;
+  }
+
+  if (pathname === '/api/admin/login' && method === 'POST') {
+    const body = await readBody(req);
+    const ok = issuePortalAdminCookie(req, res, String(body?.name || ''), String(body?.password || ''));
+    if (!ok) {
+      sendJson(res, 401, { ok: false, authed: false, error: 'Invalid Admin Name or Password.' });
+      return true;
+    }
+    sendJson(res, 200, { ok: true, authed: true, username: PORTAL_ADMIN_USERNAME });
+    return true;
+  }
+
+  if (pathname === '/api/admin/logout' && method === 'POST') {
+    clearPortalAdminCookie(req, res);
+    sendJson(res, 200, { ok: true, authed: false });
+    return true;
+  }
+
+  if (pathname === '/api/admin/users' && method === 'GET') {
+    if (!isPortalAdminAuthed(req)) {
+      sendJson(res, 401, { ok: false, error: 'Admin authentication required.' });
+      return true;
+    }
+    const users = loadSyncedUsers();
+    sendJson(res, 200, { ok: true, users });
+    return true;
+  }
+
+  if (pathname === '/api/admin/users/action' && method === 'POST') {
+    if (!isPortalAdminAuthed(req)) {
+      sendJson(res, 401, { ok: false, error: 'Admin authentication required.' });
+      return true;
+    }
+    const body = await readBody(req);
+    const action = String(body?.action || '') as AdminUserAction;
+    const validActions: AdminUserAction[] = [
+      'activate_default',
+      'activate_30d',
+      'activate_60d',
+      'activate_90d',
+      'deactivate',
+      'delete',
+    ];
+    if (!validActions.includes(action)) {
+      sendJson(res, 400, { ok: false, error: 'Invalid admin action.' });
+      return true;
+    }
+    const result = performAdminUserAction(String(body?.userId || ''), action);
+    if ('error' in result) {
+      sendJson(res, result.status, { ok: false, error: result.error });
+      return true;
+    }
+    sendJson(res, 200, { ok: true, users: result.users, target: result.target || null });
     return true;
   }
 

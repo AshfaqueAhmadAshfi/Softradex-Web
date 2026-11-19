@@ -34,6 +34,11 @@ export function loadModule(): void {
   var ATR_MOMENTUM = 0.22, EMA_TOL = 0.04, RSI_BULL = 56, RSI_BEAR = 44;
   var SIDE_SCORE = 2, MIN_BARS = 55, MIN_BARS_HTF = 40;
   var MIN_RR = 1.25, PRIMARY_CONF_MIN = 40, SECONDARY_CONF_MIN = 22;
+  // Swing AI engines keep running at all strengths; strictly > 65% signal strength is required to draw or save TP/SL on the chart
+  var MIN_CHART_SWING_STRENGTH = 65;
+  function meetsMinSwingStrength(conf) {
+    return Number(conf) > MIN_CHART_SWING_STRENGTH;
+  }
   var CALCULATION_VERSION = 6, ENTRY_TOLERANCE_ATR = 0.06;
   var BASE_MS = 5 * 60 * 1000;
   var CANDLES_MS = 25000;
@@ -918,108 +923,40 @@ export function loadModule(): void {
   }
 
   function loadSavedZones() {
-    try {
-      var raw = JSON.parse(localStorage.getItem(SAVED_ZONES_KEY + symbol) || '[]');
-      savedChartZones = Array.isArray(raw) ? raw.filter(function (z) {
-        return z && z.symbol === symbol && (z.side === 'BUY' || z.side === 'SELL') &&
-          Number(z.entry) > 0 && Number(z.tp) > 0 && Number(z.sl) > 0;
-      }).slice(-MAX_SAVED_ZONES) : [];
-    } catch (e) { savedChartZones = []; }
+    savedChartZones = [];
+    try { localStorage.removeItem(SAVED_ZONES_KEY + symbol); } catch (e) {}
   }
 
   function persistSavedZones() {
-    try { localStorage.setItem(SAVED_ZONES_KEY + symbol, JSON.stringify(savedChartZones.slice(-MAX_SAVED_ZONES))); } catch (e) {}
+    savedChartZones = [];
+    try { localStorage.removeItem(SAVED_ZONES_KEY + symbol); } catch (e) {}
   }
 
-  function isPlanSavedOnChart(p) {
-    if (!p) return false;
-    var key = savedZoneKey({
-      side: p.side,
-      scale: p.scale || 'SHORT',
-      entry: Number(p.observedEntry || p.entry),
-      tp: Number(p.target),
-      sl: Number(p.stop)
-    });
-    return savedChartZones.some(function (z) { return savedZoneKey(z) === key; });
+  function isPlanSavedOnChart(_p) {
+    return false;
   }
 
-  function savePlanToChart(p, reason, now) {
-    if (!p) return false;
-    now = now || Date.now();
-    var entry = Number(p.observedEntry || p.entry);
-    var tp = Number(p.target);
-    var sl = Number(p.stop);
-    if (!(entry > 0) || !(tp > 0) || !(sl > 0)) return false;
-    var item = {
-      id: (p.signalId || (p.side + '|' + entry)) + '|' + Math.round(p.startAt || now),
-      symbol: symbol,
-      tvSymbol: p.tvSymbol || instrument(),
-      side: p.side,
-      scale: p.scale || 'SHORT',
-      tfLabel: p.tfLabel || '',
-      entry: entry,
-      tp: tp,
-      sl: sl,
-      rr: Number(p.observedRR || p.rr) || Math.abs(tp - entry) / Math.max(1e-9, Math.abs(entry - sl)),
-      startAt: Number(p.startAt || p.created || now),
-      savedAt: now,
-      reason: reason || 'manual',
-      status: 'OPEN',
-      hitAt: 0,
-      hitPrice: 0
-    };
-    var key = savedZoneKey(item);
-    var existing = savedChartZones.find(function (z) { return savedZoneKey(z) === key; });
-    if (existing) {
-      if (reason === 'manual') { existing.reason = 'manual'; persistSavedZones(); }
-      return false;
-    }
-    savedChartZones.push(item);
-    if (savedChartZones.length > MAX_SAVED_ZONES) savedChartZones = savedChartZones.slice(-MAX_SAVED_ZONES);
-    persistSavedZones();
-    return true;
+  function savePlanToChart(_p, _reason, _now) {
+    // Saved chart TP/SL overlays are intentionally disabled; live >65% setups draw dynamically.
+    return false;
   }
 
-  function clearSavedZones(sideOrAll) {
-    if (!sideOrAll || sideOrAll === 'ALL') {
-      savedChartZones = [];
-    } else {
-      savedChartZones = savedChartZones.filter(function (z) { return z.side !== sideOrAll; });
-    }
+  function clearSavedZones(_sideOrAll) {
+    savedChartZones = [];
     persistSavedZones();
     lastFactorHtmlByBoard = Object.create(null);
     paint(Date.now());
   }
 
-  function updateSavedZonesStatus(now) {
-    if (!savedChartZones.length || !quoteFresh(now) || !(price > 0)) return;
-    var changed = false;
-    savedChartZones.forEach(function (z) {
-      if (!z || z.status !== 'OPEN') return;
-      var buy = z.side === 'BUY';
-      if (buy ? price >= z.tp : price <= z.tp) {
-        z.status = 'TP_HIT';
-        z.hitAt = now;
-        z.hitPrice = price;
-        changed = true;
-      } else if (buy ? price <= z.sl : price >= z.sl) {
-        z.status = 'SL_HIT';
-        z.hitAt = now;
-        z.hitPrice = price;
-        changed = true;
-      }
-    });
-    if (changed) persistSavedZones();
-  }
+  function updateSavedZonesStatus(_now) {}
 
   function hydrateRestoredPlan(p, now) {
     p.rr = Math.abs(p.target - p.entry) / Math.max(1e-9, Math.abs(p.stop - p.entry));
     if (p.running && Number.isFinite(p.observedEntry)) {
       p.observedRR = Math.abs(p.target - p.observedEntry) / Math.max(1e-9, Math.abs(p.stop - p.observedEntry));
     }
-    // Enforce fixed duration across reloads: archive timed-out running swing to chart so its TP/SL stays drawn, then find a fresh swing
+    // Enforce fixed duration across reloads without saving TP/SL zones to chart
     if (p.endAt <= now) {
-      if (p.running) savePlanToChart(p, 'timeout', now);
       if (p.signalId) recentExpiredSignals[p.signalId] = now;
       return null;
     }
@@ -1387,6 +1324,17 @@ export function loadModule(): void {
     savePlan(side);
   }
 
+  function liveConfidenceForPlan(p, side) {
+    if (!p || !bootCandlesReady || !vote || !(vote.coverage > 0) || !vote.models || !vote.models[side]) {
+      return Number(p && p.confidence) || 0;
+    }
+    var baseConf = Number(vote.models[side].confidence);
+    if (!Number.isFinite(baseConf) || baseConf <= 0) return Number(p.confidence) || 0;
+    var fams = Array.isArray(p.families) ? p.families : [];
+    var scaleBoost = fams.length >= 3 ? 6 : fams.length >= 2 ? 3 : 0;
+    return Math.round(clamp(baseConf + scaleBoost, 24, 95));
+  }
+
   function stepPlanLifecycleForPlan(p, side, now) {
     if (!p || p.hit || p.doneAt) return false;
     var buy = side === 'BUY';
@@ -1404,8 +1352,6 @@ export function loadModule(): void {
     if (now >= p.endAt) {
       if (p.signalId) recentExpiredSignals[p.signalId] = now;
       if (p.running) {
-        // Save drawn Entry/TP/SL permanently on chart before closing and scanning for a new swing
-        savePlanToChart(p, 'timeout', now);
         p.doneAt = now;
         p.outcome = 'timeout';
         p.exitPrice = price > 0 ? price : p.entry;
@@ -1496,6 +1442,13 @@ export function loadModule(): void {
     var changed = false;
     var newlyStarted = [];
     tracked.forEach(function (sp) {
+      if (!sp.hit && !sp.doneAt) {
+        var liveConf = liveConfidenceForPlan(sp, side);
+        if (liveConf > 0 && liveConf !== sp.confidence) {
+          sp.confidence = liveConf;
+          changed = true;
+        }
+      }
       var wasRunning = !!sp.running;
       if (sp._justStartedNow) delete sp._justStartedNow;
       if (stepPlanLifecycleForPlan(sp, side, now)) changed = true;
@@ -1619,23 +1572,6 @@ export function loadModule(): void {
       '<i>AI</i>' + (mode === 'AUTO' ? 'AUTO S+M' : 'RESET AUTO') + '</button>'
     );
 
-    var pinnedOnChart = !!(plan && isPlanSavedOnChart(plan));
-    if (plan && !plan.hit && !plan.doneAt) {
-      scaleChips.push(
-        '<button type="button" class="sai-chip save-btn' + (pinnedOnChart ? ' is-saved' : '') +
-        '" data-board-side="' + side + '" data-save-action="pin" title="Save this TP / SL permanently on chart">' +
-        '<i>CHART</i>' + (pinnedOnChart ? '✓ SAVED' : '📌 SAVE TP/SL') + '</button>'
-      );
-    }
-    var sideSavedCount = savedChartZones.filter(function (z) { return z && z.side === side; }).length;
-    if (sideSavedCount > 0) {
-      scaleChips.push(
-        '<button type="button" class="sai-chip clear-btn" data-board-side="' + side +
-        '" data-save-action="clear" title="Clear saved ' + side + ' TP / SL overlays from chart">' +
-        '<i>SAVED ' + sideSavedCount + '</i>CLEAR ×</button>'
-      );
-    }
-
     var m5 = fallbackBaseFrame();
     var chips = [];
     if (m5 && m5.ready) {
@@ -1686,7 +1622,7 @@ export function loadModule(): void {
 
   var lastSwingEventSig = '';
   function scaleSigPart(p) {
-    return p ? [!!p.running, !!p.hit, !!p.doneAt, p.observedEntry || p.entry, p.target, p.stop, p.startAt].join(':') : '';
+    return p ? [!!p.running, !!p.hit, !!p.doneAt, meetsMinSwingStrength(p.confidence) ? 1 : 0, p.observedEntry || p.entry, p.target, p.stop, p.startAt].join(':') : '';
   }
   function notifySwingState() {
     var savedPart = savedChartZones.map(function (z) {
@@ -1837,7 +1773,7 @@ export function loadModule(): void {
       setClock(clock(p.hitAt - p.startAt));
       setBar(1);
     } else if (p.doneAt) {
-      setPhase(p.outcome === 'timeout' ? 'TIME UP · SAVED TO CHART · NEXT SWING'
+      setPhase(p.outcome === 'timeout' ? 'TIME UP · NEXT SWING'
         : p.outcome === 'expired' ? 'WATCH EXPIRED · RE-SCANNING'
           : p.outcome === 'invalidated' ? 'STRUCTURE SHIFT · RE-SCANNING'
             : 'STOPPED OUT · RE-CALCULATING', 'fail', p.outcome === 'timeout' ? 'SCAN NEXT' : (p.outcome ? 'EXPIRED' : 'FAILED'));
@@ -2109,22 +2045,6 @@ export function loadModule(): void {
       var el = $(board.id);
       if (!el) return;
       el.addEventListener('click', function (ev) {
-        var saveBtn = ev.target && ev.target.closest ? ev.target.closest('button[data-save-action]') : null;
-        if (saveBtn) {
-          var sSide = saveBtn.getAttribute('data-board-side') || board.side;
-          var act = saveBtn.getAttribute('data-save-action');
-          if (act === 'pin') {
-            var p = plans[sSide] || lockedScales[sSide].SHORT || lockedScales[sSide].MAJOR;
-            if (p) {
-              savePlanToChart(p, 'manual', Date.now());
-              lastFactorHtmlByBoard = Object.create(null);
-              paint(Date.now());
-            }
-          } else if (act === 'clear') {
-            clearSavedZones(sSide);
-          }
-          return;
-        }
         var btn = ev.target && ev.target.closest ? ev.target.closest('button.scale-btn[data-scale]') : null;
         if (!btn) return;
         var bSide = btn.getAttribute('data-board-side') || board.side;
@@ -2198,20 +2118,20 @@ export function loadModule(): void {
     structure: function () {
       var inst = instrument();
       var key = symbol + '|' + structureAt + '|' + inst + '|' +
-        (candleInstruments.M5 === inst ? (candleBars.M5 || []).length : 0) + '|' +
-        (candleInstruments.M15 === inst ? (candleBars.M15 || []).length : 0) + '|' +
-        (candleInstruments.H1 === inst ? (candleBars.H1 || []).length : 0);
+        TFS.map(function (tf) {
+          return candleInstruments[tf.key] === inst ? (candleBars[tf.key] || []).length : 0;
+        }).join('|');
       if (cachedStructureObj && cachedStructureKey === key) return cachedStructureObj;
       cachedStructureKey = key;
+      var framesObj = {};
+      TFS.forEach(function (tf) {
+        framesObj[tf.key] = (candleInstruments[tf.key] === inst ? candleBars[tf.key] || [] : []).map(function (b) { return b.slice(); });
+      });
       cachedStructureObj = {
         symbol: symbol,
         at: structureAt,
         source: 'TradingView',
-        frames: {
-          M5: (candleInstruments.M5 === inst ? candleBars.M5 || [] : []).map(function (b) { return b.slice(); }),
-          M15: (candleInstruments.M15 === inst ? candleBars.M15 || [] : []).map(function (b) { return b.slice(); }),
-          H1: (candleInstruments.H1 === inst ? candleBars.H1 || [] : []).map(function (b) { return b.slice(); })
-        }
+        frames: framesObj
       };
       return cachedStructureObj;
     },

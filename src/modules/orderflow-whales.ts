@@ -120,6 +120,7 @@ export function loadModule(): void {
     };
     const empty='<div class="tt-divider-row">No recent verified executions for '+esc(activeSymbol||'this market')+'.</div>';
     document.querySelectorAll('.tt-tape-body').forEach(e=>{
+      if(e.offsetParent===null)return;
       if(window.LiveTapeRenderer)window.LiveTapeRenderer.render(e,visible,t=>activeSymbol+'|'+t.id,rowHtml,empty);
       else e.innerHTML=visible.length?visible.map(rowHtml).join(''):empty;
     });
@@ -376,7 +377,7 @@ export function loadModule(): void {
     setText('bof-buy-pct', `${buyPct}%`);
     setText('bof-sell-pct', `${sellPct}%`);
     const body = $('bof-tape');
-    if (!body || paused) return;
+    if (!body || paused || body.offsetParent === null) return;
     const rows = [];
     for (let i = state.trades.length - 1; i >= 0 && rows.length < 80; i--) {
       const tr = state.trades[i];
@@ -885,15 +886,24 @@ export function loadModule(): void {
     const s = state(id);
     pruneLiveTrades(s);
     recalculate(s);
-    set(`mof-${id}-buy`, compact(s.buy));
-    set(`mof-${id}-sell`, compact(s.sell));
     const live = (sockets[id] && sockets[id].readyState === 1) || Date.now() - (s.lastPollAt || 0) < 15000;
-    set(`mof-${id}-status`, !s.pair ? 'NO PAIR' : live ? (s.trades.length ? 'CONNECTED' : 'QUIET') : s.lastError ? 'UNAVAILABLE' : 'CONNECTING');
+    const stTxt = !s.pair ? 'NO PAIR' : live ? (s.trades.length ? 'CONNECTED' : 'QUIET') : s.lastError ? 'UNAVAILABLE' : 'CONNECTING';
     const total = s.buy + s.sell;
-    set(`mof-${id}-buy-pct`, total ? Math.round(s.buy / total * 100) + '%' : '0%');
-    set(`mof-${id}-sell-pct`, total ? Math.round(s.sell / total * 100) + '%' : '0%');
+    const buyPctTxt = total ? Math.round(s.buy / total * 100) + '%' : '0%';
+    const sellPctTxt = total ? Math.round(s.sell / total * 100) + '%' : '0%';
+    const buyStr = compact(s.buy);
+    const sellStr = compact(s.sell);
+    const uiKey = `${s.pair}|${stTxt}|${buyStr}|${sellStr}|${buyPctTxt}|${sellPctTxt}`;
+    if (uiKey !== s.lastUiKey) {
+      s.lastUiKey = uiKey;
+      set(`mof-${id}-buy`, buyStr);
+      set(`mof-${id}-sell`, sellStr);
+      set(`mof-${id}-status`, stTxt);
+      set(`mof-${id}-buy-pct`, buyPctTxt);
+      set(`mof-${id}-sell-pct`, sellPctTxt);
+    }
     const tape = $(`mof-${id}-tape`);
-    if (tape && withTape) {
+    if (tape && withTape && tape.offsetParent !== null) {
       const len = s.trades.length;
       const first = len ? s.trades[0] : null;
       const last = len ? s.trades[len - 1] : null;
